@@ -2,7 +2,7 @@
 name = "ullis"
 version = "0.5.0"
 edition = "2021"
-description = "Ullis AI Engine v0.5 — visual reasoning ternary KAN in Rust (Candle + Metal)"
+description = "Ullis AI Engine — reasoning ternary KAN in Rust (Candle + Metal)"
 license = "MIT-only"
 default-run = "ullis"
 rust-version = "1.80"
