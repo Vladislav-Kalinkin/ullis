@@ -39,7 +39,7 @@ pub struct TrainArgs {
     pub seq_len: usize,
     #[arg(long, default_value_t = 4)]
     pub batch_size: usize,
-    #[arg(long, default_value_t = 4096)]
+    #[arg(long, default_value_t = 8192)]
     pub vocab: u32,
     #[arg(long, default_value = "shift")]
     pub mixer: String,

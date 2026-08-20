@@ -1,7 +1,7 @@
 use ullis::device::SovereignDevice;
 use ullis::gauss::solve_square;
 use ullis::kan::TernaryKanLinear;
-use ullis::quant::{pack_ternary, ste_gate, unpack_ternary};
+use ullis::quant::{pack_i8_rows, pack_ternary, ste_gate, unpack_i8_rows, unpack_ternary};
 
 #[test]
 fn ste_grad_hardtanh_gate() {
@@ -18,6 +18,19 @@ fn pack_roundtrip_tensor() {
     let p = pack_ternary(&t);
     let u = unpack_ternary(&p, t.len());
     assert_eq!(u, t);
+}
+
+#[test]
+fn i8_embed_roundtrip() {
+    let w: Vec<f32> = (0..64).map(|i| (i as f32 - 32.0) / 32.0).collect();
+    let (codes, scale) = pack_i8_rows(&w, 8, 8);
+    let back = unpack_i8_rows(&codes, &scale, 8, 8);
+    let err: f32 = w
+        .iter()
+        .zip(back.iter())
+        .map(|(a, b)| (a - b).abs())
+        .fold(0.0, f32::max);
+    assert!(err < 1.0 / 64.0, "max abs err {err}");
 }
 
 #[test]

@@ -1,11 +1,19 @@
-//! Byte-level BPE with code-seeded merges. No tiktoken / HuggingFace dependency.
+//! Byte-fallback WordPiece (language-agnostic). No tiktoken / HuggingFace.
+//!
+//! Layout:
+//! - ids `0..3`     specials `<pad> <bos> <eos> <unk>`
+//! - ids `4..259`   raw UTF-8 bytes (`BYTE_OFFSET + b`)
+//! - ids `260..V-1` WordPiece atoms (whole words / syntax) then trained pieces
+//!
+//! Encode is greedy longest-match over the piece table. Unmapped UTF-8, including
+//! incomplete multi-byte sequences, falls back to raw byte ids in-stream and
+//! never panics. Default scale is `V = 8192`.
 
 use std::collections::HashMap;
 use std::path::Path;
 use std::sync::LazyLock;
 
 use anyhow::{bail, Context, Result};
-use regex::Regex;
 use serde::{Deserialize, Serialize};
 
 pub const PAD: &str = "<pad>";
@@ -13,7 +21,9 @@ pub const BOS: &str = "<bos>";
 pub const EOS: &str = "<eos>";
 pub const UNK: &str = "<unk>";
 pub const N_SPECIAL: u32 = 4;
-pub const BYTE_OFFSET: u32 = N_SPECIAL; // ids 4..259 are raw UTF-8 bytes
+/// ids `4..259` are raw UTF-8 bytes. Byte *values* are still `0..=255`.
+pub const BYTE_OFFSET: u32 = N_SPECIAL;
+pub const DEFAULT_VOCAB: u32 = 8192;
 
 pub const CODE_SEEDS: &[&str] = &[
     "def ",
@@ -87,22 +97,444 @@ pub const CODE_SEEDS: &[&str] = &[
     "<|output|>",
 ];
 
-static CODE_SPLIT: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(
-        r#"'(?:\\.|[^'\\])*'|"(?:\\.|[^"\\])*"|[A-Za-z_][A-Za-z0-9_]*|\d+\.\d+|\d+|[ \t]+|\r?\n|."#,
-    )
-    .expect("code-split regex")
-});
+/// High-frequency English / Russian function words and syntax identifiers.
+/// Each occupies a single token id when `V` has room (WordPiece atoms).
+pub const LANG_SEEDS: &[&str] = &[
+    "the ",
+    "of ",
+    "and ",
+    "to ",
+    "in ",
+    "is ",
+    "you ",
+    "that ",
+    "it ",
+    "he ",
+    "was ",
+    "for ",
+    "on ",
+    "are ",
+    "as ",
+    "with ",
+    "his ",
+    "they ",
+    "at ",
+    "be ",
+    "this ",
+    "have ",
+    "from ",
+    "or ",
+    "one ",
+    "had ",
+    "by ",
+    "but ",
+    "not ",
+    "what ",
+    "all ",
+    "were ",
+    "we ",
+    "when ",
+    "your ",
+    "can ",
+    "said ",
+    "there ",
+    "use ",
+    "an ",
+    "each ",
+    "which ",
+    "she ",
+    "do ",
+    "how ",
+    "their ",
+    "if ",
+    "will ",
+    "up ",
+    "other ",
+    "about ",
+    "out ",
+    "many ",
+    "then ",
+    "them ",
+    "these ",
+    "so ",
+    "some ",
+    "her ",
+    "would ",
+    "make ",
+    "like ",
+    "him ",
+    "into ",
+    "time ",
+    "has ",
+    "look ",
+    "two ",
+    "more ",
+    "write ",
+    "go ",
+    "see ",
+    "no ",
+    "way ",
+    "could ",
+    "people ",
+    "my ",
+    "than ",
+    "first ",
+    "been ",
+    "who ",
+    "its ",
+    "now ",
+    "find ",
+    "long ",
+    "down ",
+    "day ",
+    "did ",
+    "get ",
+    "come ",
+    "made ",
+    "may ",
+    "part ",
+    "function ",
+    "class",
+    "import",
+    "struct",
+    "enum",
+    "trait",
+    "const",
+    "async",
+    "await",
+    "while",
+    "break",
+    "continue",
+    "yield",
+    "where",
+    "type",
+    "mod ",
+    "true",
+    "false",
+    "null",
+    "error",
+    "result",
+    "option",
+    "string",
+    "vector",
+    "list",
+    "dict",
+    "file",
+    "open",
+    "read",
+    "write",
+    "load",
+    "save",
+    "train",
+    "model",
+    "token",
+    "layer",
+    "weight",
+    "tensor",
+    "kernel",
+    "buffer",
+    "device",
+    "metal",
+    "rust",
+    "python",
+    "bash",
+    "json",
+    "data",
+    "code",
+    "main",
+    "test",
+    "assert",
+    "debug",
+    "info",
+    "warn",
+    "panic",
+    "unwrap",
+    "clone",
+    "copy",
+    "drop",
+    "default",
+    "spawn",
+    "thread",
+    "process",
+    "config",
+    "vocab",
+    "embed",
+    "logit",
+    "softmax",
+    "loss",
+    "grad",
+    "scale",
+    "pack",
+    "quant",
+    "ternary",
+    "spline",
+    "knot",
+    "grid",
+    "expert",
+    "router",
+    "think",
+    "output",
+    "system",
+    "user",
+    "the",
+    "and",
+    "that",
+    "with",
+    "from",
+    "this",
+    "function",
+    "return",
+    "и ",
+    "в ",
+    "не ",
+    "на ",
+    "что ",
+    "я ",
+    "он ",
+    "с ",
+    "как ",
+    "а ",
+    "то ",
+    "все ",
+    "она ",
+    "так ",
+    "его ",
+    "но ",
+    "да ",
+    "ты ",
+    "к ",
+    "у ",
+    "же ",
+    "вы ",
+    "за ",
+    "бы ",
+    "по ",
+    "только ",
+    "мне ",
+    "было ",
+    "вот ",
+    "от ",
+    "меня ",
+    "ещё ",
+    "нет ",
+    "о ",
+    "из ",
+    "ему ",
+    "теперь ",
+    "когда ",
+    "даже ",
+    "ну ",
+    "вдруг ",
+    "ли ",
+    "если ",
+    "уже ",
+    "или ",
+    "ни ",
+    "быть ",
+    "был ",
+    "до ",
+    "вас ",
+    "опять ",
+    "вам ",
+    "ведь ",
+    "там ",
+    "потом ",
+    "себя ",
+    "ничего ",
+    "ей ",
+    "может ",
+    "они ",
+    "тут ",
+    "где ",
+    "есть ",
+    "надо ",
+    "для ",
+    "мы ",
+    "тебя ",
+    "их ",
+    "чем ",
+    "была ",
+    "сам ",
+    "чтоб ",
+    "без ",
+    "будто ",
+    "чего ",
+    "раз ",
+    "тоже ",
+    "себе ",
+    "под ",
+    "будет ",
+    "тогда ",
+    "кто ",
+    "этот ",
+    "того ",
+    "потому ",
+    "этого ",
+    "какой ",
+    "совсем ",
+    "ним ",
+    "здесь ",
+    "этом ",
+    "один ",
+    "почти ",
+    "мой ",
+    "тем ",
+    "чтобы ",
+    "кажется ",
+    "сейчас ",
+    "были ",
+    "куда ",
+    "зачем ",
+    "сказать ",
+    "никогда ",
+    "можно ",
+    "при ",
+    "наконец ",
+    "два ",
+    "об ",
+    "другой ",
+    "хоть ",
+    "после ",
+    "над ",
+    "больше ",
+    "тот ",
+    "через ",
+    "эти ",
+    "нас ",
+    "про ",
+    "всего ",
+    "них ",
+    "какая ",
+    "много ",
+    "разве ",
+    "три ",
+    "эту ",
+    "моя ",
+    "впрочем ",
+    "хорошо ",
+    "свою ",
+    "этой ",
+    "перед ",
+    "иногда ",
+    "лучше ",
+    "чуть ",
+    "том ",
+    "нельзя ",
+    "такой ",
+    "им ",
+    "более ",
+    "всегда ",
+    "конечно ",
+    "всю ",
+    "между ",
+    "функция ",
+    "вернуть ",
+    "результат ",
+    "модель ",
+    "токен ",
+    "слой ",
+    "вес ",
+    "ошибка ",
+    "файл ",
+    "данные ",
+    "код ",
+    "привет ",
+    "мир ",
+    "и",
+    "в",
+    "не",
+    "на",
+    "что",
+    "я",
+    "он",
+    "как",
+    "это",
+    "для",
+    "или",
+    "если",
+    "при",
+    "self.",
+    "Self::",
+    "std::",
+    "let mut ",
+    "pub fn ",
+    "pub struct ",
+    "pub enum ",
+    "pub trait ",
+    "impl ",
+    "async fn ",
+    "-> Result",
+    "unwrap()",
+    "to_string()",
+    "into()",
+    "as_str()",
+    "as_slice()",
+    "to_vec()",
+    "len()",
+    "is_empty()",
+    "push(",
+    "pop()",
+    "insert(",
+    "remove(",
+    "HashMap",
+    "VecDeque",
+    "Option<",
+    "Result<",
+    "String",
+    "usize",
+    "i32",
+    "i64",
+    "u32",
+    "u64",
+    "f32",
+    "f64",
+    "bool",
+    "def ",
+    "lambda ",
+    "None",
+    "True",
+    "False",
+    "print(",
+    "len(",
+    "range(",
+    "enumerate(",
+    "zip(",
+    "open(",
+    "read()",
+    "write(",
+    "os.path",
+    "pathlib",
+    "numpy",
+    "torch",
+    "return",
+    "#!/bin/bash",
+    "set -euo",
+    "pipefail",
+    "local ",
+    "then",
+    "fi",
+    "done",
+    "esac",
+    "echo ",
+    "export ",
+    "source ",
+    "[[ ",
+    "]]",
+];
 
-static SEEDS_SORTED: LazyLock<Vec<&'static str>> = LazyLock::new(|| {
-    let mut v = CODE_SEEDS.to_vec();
+static ATOMS_SORTED: LazyLock<Vec<&'static str>> = LazyLock::new(|| {
+    let mut v: Vec<&'static str> = CODE_SEEDS
+        .iter()
+        .chain(LANG_SEEDS.iter())
+        .copied()
+        .collect();
     v.sort_by_key(|s| std::cmp::Reverse(s.len()));
     v.dedup();
     v
 });
 
 pub fn byte_id(b: u8) -> u32 {
-    BYTE_OFFSET + b as u32
+    BYTE_OFFSET + u32::from(b)
 }
 
 pub fn apply_merge(seq: &[u32], left: u32, right: u32, new_id: u32) -> Vec<u32> {
@@ -125,6 +557,14 @@ pub struct TokenizerJson {
     pub vocab_size: u32,
     pub merges: Vec<[u32; 2]>,
     pub specials: Vec<String>,
+    #[serde(default)]
+    pub atoms: Vec<String>,
+    #[serde(default = "wordpiece_model")]
+    pub model: String,
+}
+
+fn wordpiece_model() -> String {
+    "wordpiece".into()
 }
 
 #[derive(Clone, Debug)]
@@ -136,9 +576,10 @@ pub struct BpeTokenizer {
     pub eos_id: u32,
     pub unk_id: u32,
     pub merges: Vec<(u32, u32)>,
-    pair_to_id: HashMap<(u32, u32), u32>,
-    pair_rank: HashMap<(u32, u32), u32>,
+    pub atoms: Vec<String>,
     id_to_bytes: Vec<Vec<u8>>,
+    piece_to_id: HashMap<Vec<u8>, u32>,
+    max_piece_len: usize,
     encode_cache: HashMap<Vec<u8>, Vec<u32>>,
 }
 
@@ -146,6 +587,15 @@ impl BpeTokenizer {
     pub fn new(
         vocab_size: u32,
         merges: Vec<(u32, u32)>,
+        specials: Option<Vec<String>>,
+    ) -> Result<Self> {
+        Self::new_with_atoms(vocab_size, merges, Vec::new(), specials)
+    }
+
+    pub fn new_with_atoms(
+        vocab_size: u32,
+        merges: Vec<(u32, u32)>,
+        atoms: Vec<String>,
         specials: Option<Vec<String>>,
     ) -> Result<Self> {
         if vocab_size < BYTE_OFFSET + 256 {
@@ -167,9 +617,10 @@ impl BpeTokenizer {
             eos_id: 2,
             unk_id: 3,
             merges,
-            pair_to_id: HashMap::new(),
-            pair_rank: HashMap::new(),
+            atoms,
             id_to_bytes: vec![Vec::new(); vocab_size as usize],
+            piece_to_id: HashMap::new(),
+            max_piece_len: 1,
             encode_cache: HashMap::new(),
         };
         tok.rebuild();
@@ -177,51 +628,89 @@ impl BpeTokenizer {
     }
 
     fn rebuild(&mut self) {
-        self.pair_to_id.clear();
-        self.pair_rank.clear();
+        self.piece_to_id.clear();
         self.encode_cache.clear();
         self.id_to_bytes = vec![Vec::new(); self.vocab_size as usize];
+        self.max_piece_len = 1;
         for b in 0..=255u8 {
-            self.id_to_bytes[byte_id(b) as usize] = vec![b];
+            let id = byte_id(b);
+            let bytes = vec![b];
+            self.id_to_bytes[id as usize] = bytes.clone();
+            self.piece_to_id.insert(bytes, id);
         }
-        let mut kept = Vec::new();
-        for (rank, &(left, right)) in self.merges.iter().enumerate() {
-            let next_id = BYTE_OFFSET + 256 + rank as u32;
+        let mut next_id = BYTE_OFFSET + 256;
+        let mut kept_atoms = Vec::new();
+        for atom in &self.atoms {
             if next_id >= self.vocab_size {
                 break;
             }
-            self.pair_to_id.insert((left, right), next_id);
-            self.pair_rank.insert((left, right), rank as u32);
-            let mut bytes = self.id_to_bytes[left as usize].clone();
-            bytes.extend_from_slice(&self.id_to_bytes[right as usize]);
+            let bytes = atom.as_bytes().to_vec();
+            if bytes.is_empty() {
+                continue;
+            }
+            if self.piece_to_id.contains_key(&bytes) {
+                continue;
+            }
+            self.id_to_bytes[next_id as usize] = bytes.clone();
+            self.max_piece_len = self.max_piece_len.max(bytes.len());
+            self.piece_to_id.insert(bytes, next_id);
+            kept_atoms.push(atom.clone());
+            next_id += 1;
+        }
+        self.atoms = kept_atoms;
+        let mut kept = Vec::new();
+        for &(left, right) in &self.merges {
+            if next_id >= self.vocab_size {
+                break;
+            }
+            let lu = left as usize;
+            let ru = right as usize;
+            if lu >= self.id_to_bytes.len() || ru >= self.id_to_bytes.len() {
+                continue;
+            }
+            let mut bytes = self.id_to_bytes[lu].clone();
+            bytes.extend_from_slice(&self.id_to_bytes[ru]);
+            if !bytes.is_empty() {
+                self.piece_to_id.entry(bytes.clone()).or_insert(next_id);
+                self.max_piece_len = self.max_piece_len.max(bytes.len());
+            }
             self.id_to_bytes[next_id as usize] = bytes;
             kept.push((left, right));
+            next_id += 1;
         }
         self.merges = kept;
     }
 
+    /// Greedy longest-match WordPiece. Unknown bytes become `byte_id(b)`.
     pub fn encode_bytes(&mut self, data: &[u8]) -> Vec<u32> {
         if let Some(cached) = self.encode_cache.get(data) {
             return cached.clone();
         }
-        let mut ids: Vec<u32> = data.iter().copied().map(byte_id).collect();
-        while ids.len() > 1 {
-            let mut min_rank: Option<u32> = None;
-            let mut min_i = 0usize;
-            for i in 0..ids.len() - 1 {
-                if let Some(&r) = self.pair_rank.get(&(ids[i], ids[i + 1])) {
-                    if min_rank.map(|m| r < m).unwrap_or(true) {
-                        min_rank = Some(r);
-                        min_i = i;
-                    }
-                }
-            }
-            let Some(_) = min_rank else { break };
-            let nid = self.pair_to_id[&(ids[min_i], ids[min_i + 1])];
-            ids.splice(min_i..min_i + 2, [nid]);
-        }
+        let ids = self.encode_bytes_uncached(data);
         if self.encode_cache.len() < 8192 {
             self.encode_cache.insert(data.to_vec(), ids.clone());
+        }
+        ids
+    }
+
+    fn encode_bytes_uncached(&self, data: &[u8]) -> Vec<u32> {
+        let mut ids = Vec::with_capacity(data.len());
+        let mut i = 0;
+        while i < data.len() {
+            let max_l = self.max_piece_len.min(data.len() - i);
+            let mut matched = false;
+            for len in (1..=max_l).rev() {
+                if let Some(&id) = self.piece_to_id.get(&data[i..i + len]) {
+                    ids.push(id);
+                    i += len;
+                    matched = true;
+                    break;
+                }
+            }
+            if !matched {
+                ids.push(byte_id(data[i]));
+                i += 1;
+            }
         }
         ids
     }
@@ -231,46 +720,11 @@ impl BpeTokenizer {
         if add_bos {
             ids.push(self.bos_id);
         }
-        ids.extend(self.encode_text(text));
+        ids.extend(self.encode_bytes(text.as_bytes()));
         if add_eos {
             ids.push(self.eos_id);
         }
         ids
-    }
-
-    fn encode_text(&mut self, text: &str) -> Vec<u32> {
-        let mut out = Vec::new();
-        let mut i = 0;
-        let n = text.len();
-        while i < n {
-            let mut matched = false;
-            for seed in SEEDS_SORTED.iter() {
-                if text[i..].starts_with(*seed) {
-                    let ids = self.encode_bytes(seed.as_bytes());
-                    out.extend(ids);
-                    i += seed.len();
-                    matched = true;
-                    break;
-                }
-            }
-            if matched {
-                continue;
-            }
-            if let Some(m) = CODE_SPLIT.find_at(text, i) {
-                if m.start() == i {
-                    let ids = self.encode_bytes(m.as_str().as_bytes());
-                    out.extend(ids);
-                    i = m.end();
-                    continue;
-                }
-            }
-            let ch = text[i..].chars().next().unwrap();
-            let mut buf = [0u8; 4];
-            let s = ch.encode_utf8(&mut buf);
-            out.extend(self.encode_bytes(s.as_bytes()));
-            i += ch.len_utf8();
-        }
-        out
     }
 
     pub fn decode(&self, ids: &[u32]) -> String {
@@ -303,12 +757,19 @@ impl BpeTokenizer {
                 .map(|&(left, right)| [left, right])
                 .collect(),
             specials: self.specials.clone(),
+            atoms: self.atoms.clone(),
+            model: "wordpiece".into(),
         }
     }
 
     pub fn from_json(data: &TokenizerJson) -> Result<Self> {
         let merges = data.merges.iter().map(|p| (p[0], p[1])).collect();
-        Self::new(data.vocab_size, merges, Some(data.specials.clone()))
+        Self::new_with_atoms(
+            data.vocab_size,
+            merges,
+            data.atoms.clone(),
+            Some(data.specials.clone()),
+        )
     }
 
     pub fn save(&self, path: impl AsRef<Path>) -> Result<()> {
@@ -329,7 +790,11 @@ impl BpeTokenizer {
 
     pub fn load_default() -> Result<Self> {
         let data: TokenizerJson = serde_json::from_str(DEFAULT_TOKENIZER_JSON)?;
-        Self::from_json(&data)
+        let tok = Self::from_json(&data)?;
+        if tok.vocab_size == DEFAULT_VOCAB {
+            return Ok(tok);
+        }
+        train_wordpiece(&[], DEFAULT_VOCAB, 7)
     }
 }
 
@@ -364,7 +829,6 @@ impl<'a> StreamDecoder<'a> {
                 let valid = err.valid_up_to();
                 if valid == 0 {
                     if err.error_len().is_some() {
-                        // invalid sequence — skip one byte
                         let out = String::from_utf8_lossy(&self.buf[..1]).into_owned();
                         self.buf.drain(..1);
                         return out;
@@ -389,62 +853,46 @@ impl<'a> StreamDecoder<'a> {
     }
 }
 
-fn left_fold_seed(
-    ids: &[u32],
-    pair_to_id: &mut HashMap<(u32, u32), u32>,
-    mut next_id: u32,
-    vocab_size: u32,
-) -> (Vec<(u32, u32)>, u32) {
-    let mut merges = Vec::new();
-    let mut seq = ids.to_vec();
-    while seq.len() > 1 && next_id < vocab_size {
-        let a = seq[0];
-        let b = seq[1];
-        let nid = if let Some(&id) = pair_to_id.get(&(a, b)) {
-            id
-        } else {
-            pair_to_id.insert((a, b), next_id);
-            merges.push((a, b));
-            let id = next_id;
-            next_id += 1;
-            id
-        };
-        seq = std::iter::once(nid)
-            .chain(seq.iter().copied().skip(2))
-            .collect();
+fn collect_atoms(vocab_size: u32) -> Vec<String> {
+    let mut atoms = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    let budget = vocab_size.saturating_sub(BYTE_OFFSET + 256) as usize;
+    for s in ATOMS_SORTED.iter() {
+        if atoms.len() >= budget {
+            break;
+        }
+        let b = s.as_bytes();
+        if b.is_empty() || !seen.insert(b.to_vec()) {
+            continue;
+        }
+        atoms.push((*s).to_string());
     }
-    (merges, next_id)
+    atoms
 }
 
-pub fn train_bpe(texts: &[String], vocab_size: u32, seed: u64) -> Result<BpeTokenizer> {
+/// Byte-fallback WordPiece trainer. Seeds occupy single ids; remaining slots
+/// are filled by frequency pair-merges on the corpus.
+pub fn train_wordpiece(texts: &[String], vocab_size: u32, seed: u64) -> Result<BpeTokenizer> {
     use rand::seq::SliceRandom;
 
     let mut rng = crate::device::rng_from_seed(seed);
-    let mut corpus: Vec<&str> = texts
-        .iter()
-        .map(|s| s.as_str())
-        .filter(|t| !t.is_empty())
-        .collect();
+    let atoms = collect_atoms(vocab_size);
+    let mut corpus: Vec<String> = texts.iter().filter(|t| !t.is_empty()).cloned().collect();
     if corpus.is_empty() {
-        corpus.push("def main():\n    return 0\n");
+        corpus.push(ATOMS_SORTED.join(""));
+        corpus.push(
+            "The function returns a result from the model. Hello world.\n\
+             Привет мир. Это тестовый текст для словаря. Функция возвращает результат.\n\
+             def load(path):\n    return path\nfn main() {}\n"
+                .into(),
+        );
     }
     corpus.shuffle(&mut rng);
 
+    let proto = BpeTokenizer::new_with_atoms(vocab_size, Vec::new(), atoms.clone(), None)?;
+    let mut next_id = BYTE_OFFSET + 256 + proto.atoms.len() as u32;
     let mut pair_to_id: HashMap<(u32, u32), u32> = HashMap::new();
     let mut merges: Vec<(u32, u32)> = Vec::new();
-    let mut next_id = BYTE_OFFSET + 256;
-
-    for s in CODE_SEEDS {
-        let ids: Vec<u32> = s.bytes().map(byte_id).collect();
-        let (new_merges, n) = left_fold_seed(&ids, &mut pair_to_id, next_id, vocab_size);
-        merges.extend(new_merges);
-        next_id = n;
-        if next_id >= vocab_size {
-            break;
-        }
-    }
-
-    let proto = BpeTokenizer::new(vocab_size, merges.clone(), None)?;
     let mut seqs: Vec<Vec<u32>> = Vec::new();
     {
         let mut p = proto;
@@ -480,7 +928,11 @@ pub fn train_bpe(texts: &[String], vocab_size: u32, seed: u64) -> Result<BpeToke
         next_id += 1;
     }
 
-    BpeTokenizer::new(vocab_size, merges, None)
+    BpeTokenizer::new_with_atoms(vocab_size, merges, atoms, None)
+}
+
+pub fn train_bpe(texts: &[String], vocab_size: u32, seed: u64) -> Result<BpeTokenizer> {
+    train_wordpiece(texts, vocab_size, seed)
 }
 
 pub fn load_or_train(
@@ -495,6 +947,9 @@ pub fn load_or_train(
             candidates.push(p.to_path_buf());
         }
     }
+    candidates.push(Path::new("assets/tokenizer-8192.json").to_path_buf());
+    candidates.push(Path::new("ullis/assets/tokenizer-8192.json").to_path_buf());
+    candidates.push(Path::new("assets/tokenizer-4096.json").to_path_buf());
     candidates.push(Path::new("ullis/assets/tokenizer-4096.json").to_path_buf());
     candidates.push(Path::new("ullis-core/assets/tokenizer-4096.json").to_path_buf());
     for cand in candidates {
@@ -505,12 +960,19 @@ pub fn load_or_train(
             }
         }
     }
-    if vocab_size == 4096 {
-        if let Ok(tok) = BpeTokenizer::load_default() {
+    if vocab_size == DEFAULT_VOCAB {
+        if let Ok(tok) = train_wordpiece(texts, vocab_size, seed) {
             return Ok(tok);
         }
     }
-    train_bpe(texts, vocab_size, seed)
+    if vocab_size == 4096 {
+        if let Ok(tok) = BpeTokenizer::load_default() {
+            if tok.vocab_size == 4096 {
+                return Ok(tok);
+            }
+        }
+    }
+    train_wordpiece(texts, vocab_size, seed)
 }
 
 #[cfg(test)]
@@ -519,15 +981,45 @@ mod tests {
 
     #[test]
     fn default_vocab() {
-        let tok = BpeTokenizer::load_default().unwrap();
-        assert_eq!(tok.vocab_size, 4096);
-        assert_eq!(tok.merges.len(), 1772);
+        let tok = train_wordpiece(&[], DEFAULT_VOCAB, 7).unwrap();
+        assert_eq!(tok.vocab_size, 8192);
+        assert!(!tok.atoms.is_empty());
+        assert!(tok.merges.len() + tok.atoms.len() >= 256);
     }
 
     #[test]
     fn roundtrip_ascii() {
-        let mut tok = BpeTokenizer::load_default().unwrap();
+        let mut tok = train_wordpiece(&[], 1024, 1).unwrap();
         let s = "def load(path):\n    return path\n";
+        let ids = tok.encode(s, false, false);
+        assert_eq!(tok.decode(&ids), s);
+    }
+
+    #[test]
+    fn seeds_are_single_tokens() {
+        let mut tok = train_wordpiece(&[], 2048, 1).unwrap();
+        for atom in ["def ", "fn ", "return", "<|system|>", "the ", "и "] {
+            let ids = tok.encode(atom, false, false);
+            assert_eq!(ids.len(), 1, "{atom:?} -> {ids:?}");
+        }
+    }
+
+    #[test]
+    fn byte_fallback_never_panics() {
+        let mut tok = train_wordpiece(&[], 320, 0).unwrap();
+        let junk: Vec<u8> = (0u8..=255).chain([0xFF, 0xFE, 0x80, 0xC0, 0xC1]).collect();
+        let ids = tok.encode_bytes(&junk);
+        assert!(!ids.is_empty());
+        for &id in &ids {
+            assert!(id < tok.vocab_size);
+        }
+        let _ = tok.decode(&ids);
+    }
+
+    #[test]
+    fn bilingual_roundtrip() {
+        let mut tok = train_wordpiece(&[], 2048, 2).unwrap();
+        let s = "Hello мир fn main()";
         let ids = tok.encode(s, false, false);
         assert_eq!(tok.decode(&ids), s);
     }

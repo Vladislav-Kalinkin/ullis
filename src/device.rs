@@ -6,8 +6,9 @@
 
 #![allow(unsafe_code)]
 
+use std::alloc::{alloc_zeroed, dealloc, Layout};
 use std::mem::size_of;
-use std::ptr;
+use std::ptr::{self, NonNull};
 
 use anyhow::{bail, Context, Result};
 use rand::rngs::StdRng;
@@ -38,7 +39,101 @@ struct MetalInner {
     device: metal::Device,
     queue: metal::CommandQueue,
     pipeline: metal::ComputePipelineState,
+    embed_i8: metal::ComputePipelineState,
+    logits_i8: metal::ComputePipelineState,
     dummy: metal::Buffer,
+}
+
+/// Page-aligned host slab used as a no-copy Metal Shared backing store.
+#[derive(Debug)]
+pub struct PageSlab {
+    ptr: NonNull<u8>,
+    layout: Layout,
+    bytes: usize,
+}
+
+// Exclusive owner of the allocation.
+unsafe impl Send for PageSlab {}
+
+impl PageSlab {
+    /// `bytes` is rounded up to a 16 KiB Apple-Silicon page.
+    pub fn new(bytes: usize) -> Result<Self> {
+        let align = 16_384usize;
+        let size = bytes.max(align);
+        let size = size.div_ceil(align) * align;
+        let layout = Layout::from_size_align(size, align)
+            .map_err(|e| anyhow::anyhow!("page layout: {e}"))?;
+        let raw = unsafe { alloc_zeroed(layout) };
+        let ptr = NonNull::new(raw).ok_or_else(|| anyhow::anyhow!("page alloc failed"))?;
+        Ok(Self {
+            ptr,
+            layout,
+            bytes: size,
+        })
+    }
+
+    pub fn len(&self) -> usize {
+        self.bytes
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.bytes == 0
+    }
+
+    pub fn as_bytes(&self) -> &[u8] {
+        unsafe { std::slice::from_raw_parts(self.ptr.as_ptr(), self.bytes) }
+    }
+
+    pub fn as_bytes_mut(&mut self) -> &mut [u8] {
+        unsafe { std::slice::from_raw_parts_mut(self.ptr.as_ptr(), self.bytes) }
+    }
+
+    #[allow(clippy::cast_ptr_alignment)]
+    pub fn u32_at(&self, byte_off: usize, n: usize) -> Result<&[u32]> {
+        let need = byte_off
+            .checked_add(n.saturating_mul(4))
+            .ok_or_else(|| anyhow::anyhow!("u32 slice overflow"))?;
+        if need > self.bytes {
+            bail!("u32 slice {byte_off}+{n} overruns {} byte slab", self.bytes);
+        }
+        if byte_off % 4 != 0 {
+            bail!("u32 slice offset {byte_off} is not 4-byte aligned");
+        }
+        Ok(unsafe { std::slice::from_raw_parts(self.ptr.as_ptr().add(byte_off).cast::<u32>(), n) })
+    }
+
+    #[allow(clippy::cast_ptr_alignment)]
+    pub fn u32_at_mut(&mut self, byte_off: usize, n: usize) -> Result<&mut [u32]> {
+        let need = byte_off
+            .checked_add(n.saturating_mul(4))
+            .ok_or_else(|| anyhow::anyhow!("u32 slice overflow"))?;
+        if need > self.bytes {
+            bail!("u32 slice {byte_off}+{n} overruns {} byte slab", self.bytes);
+        }
+        if byte_off % 4 != 0 {
+            bail!("u32 slice offset {byte_off} is not 4-byte aligned");
+        }
+        Ok(unsafe {
+            std::slice::from_raw_parts_mut(self.ptr.as_ptr().add(byte_off).cast::<u32>(), n)
+        })
+    }
+}
+
+impl Drop for PageSlab {
+    fn drop(&mut self) {
+        unsafe {
+            dealloc(self.ptr.as_ptr(), self.layout);
+        }
+    }
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+struct I8GemmSpec {
+    n: u32,
+    d: u32,
+    v: u32,
+    pad: u32,
 }
 
 impl std::fmt::Debug for SovereignDevice {
@@ -175,6 +270,107 @@ impl SovereignDevice {
             Ok(())
         })
     }
+
+    /// Unpack packed-i8 embedding rows for `ids` into `y` (`[n, d]`).
+    #[cfg(target_os = "macos")]
+    pub fn dispatch_i8_embed_lookup(
+        &self,
+        codes: &metal::Buffer,
+        scale: &metal::Buffer,
+        ids: &metal::Buffer,
+        y: &metal::Buffer,
+        n: u32,
+        d: u32,
+        v: u32,
+    ) -> Result<()> {
+        let inner = self
+            .metal
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("dispatch on CPU device"))?;
+        let spec = I8GemmSpec { n, d, v, pad: 0 };
+        with_autorelease(|| {
+            let cmd = inner.queue.new_command_buffer();
+            cmd.set_label("ullis.embed.i8");
+            let enc = cmd.new_compute_command_encoder();
+            enc.set_compute_pipeline_state(&inner.embed_i8);
+            enc.set_buffer(0, Some(codes), 0);
+            enc.set_buffer(1, Some(scale), 0);
+            enc.set_buffer(2, Some(ids), 0);
+            enc.set_buffer(3, Some(y), 0);
+            enc.set_bytes(
+                4,
+                size_of::<I8GemmSpec>() as u64,
+                ptr::from_ref(&spec).cast(),
+            );
+            let tpg = inner
+                .embed_i8
+                .thread_execution_width()
+                .max(1)
+                .min(n.max(1) as u64);
+            enc.dispatch_threads(
+                metal::MTLSize::new(u64::from(n.max(1)), 1, 1),
+                metal::MTLSize::new(tpg, 1, 1),
+            );
+            enc.end_encoding();
+            cmd.commit();
+            cmd.wait_until_completed();
+            if cmd.status() != metal::MTLCommandBufferStatus::Completed {
+                bail!("i8 embed command status {:?}", cmd.status());
+            }
+            Ok(())
+        })
+    }
+
+    /// Tied logits: `y[n, V] = hidden[n, D] @ (i8_codes[V, D] * scale[V])ᵀ`.
+    #[cfg(target_os = "macos")]
+    pub fn dispatch_i8_tied_logits(
+        &self,
+        hidden: &metal::Buffer,
+        codes: &metal::Buffer,
+        scale: &metal::Buffer,
+        logits: &metal::Buffer,
+        n: u32,
+        d: u32,
+        v: u32,
+    ) -> Result<()> {
+        let inner = self
+            .metal
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("dispatch on CPU device"))?;
+        let spec = I8GemmSpec { n, d, v, pad: 0 };
+        let tpg = inner
+            .logits_i8
+            .thread_execution_width()
+            .max(1)
+            .min(u64::from(v.max(1)));
+        let groups_x = u64::from(v).div_ceil(tpg).max(1);
+        with_autorelease(|| {
+            let cmd = inner.queue.new_command_buffer();
+            cmd.set_label("ullis.logits.i8");
+            let enc = cmd.new_compute_command_encoder();
+            enc.set_compute_pipeline_state(&inner.logits_i8);
+            enc.set_buffer(0, Some(hidden), 0);
+            enc.set_buffer(1, Some(codes), 0);
+            enc.set_buffer(2, Some(scale), 0);
+            enc.set_buffer(3, Some(logits), 0);
+            enc.set_bytes(
+                4,
+                size_of::<I8GemmSpec>() as u64,
+                ptr::from_ref(&spec).cast(),
+            );
+            enc.dispatch_thread_groups(
+                metal::MTLSize::new(groups_x, u64::from(n.max(1)), 1),
+                metal::MTLSize::new(tpg, 1, 1),
+            );
+            enc.end_encoding();
+            cmd.commit();
+            cmd.wait_until_completed();
+            if cmd.status() != metal::MTLCommandBufferStatus::Completed {
+                bail!("i8 logits command status {:?}", cmd.status());
+            }
+            Ok(())
+        })
+    }
 }
 
 #[cfg(target_os = "macos")]
@@ -202,11 +398,25 @@ fn compile_metal() -> Result<MetalInner> {
         let pipeline = device
             .new_compute_pipeline_state_with_function(&function)
             .map_err(|e| anyhow::anyhow!("PSO: {e}"))?;
+        let embed_fn = library
+            .get_function("ullis_i8_embed_lookup", None)
+            .map_err(|e| anyhow::anyhow!("MSL embed i8: {e}"))?;
+        let embed_i8 = device
+            .new_compute_pipeline_state_with_function(&embed_fn)
+            .map_err(|e| anyhow::anyhow!("PSO embed i8: {e}"))?;
+        let logits_fn = library
+            .get_function("ullis_i8_tied_logits", None)
+            .map_err(|e| anyhow::anyhow!("MSL logits i8: {e}"))?;
+        let logits_i8 = device
+            .new_compute_pipeline_state_with_function(&logits_fn)
+            .map_err(|e| anyhow::anyhow!("PSO logits i8: {e}"))?;
         let dummy = alloc_shared_f32_buffer(&device, 8)?;
         Ok(MetalInner {
             device,
             queue,
             pipeline,
+            embed_i8,
+            logits_i8,
             dummy,
         })
     })
@@ -232,14 +442,76 @@ pub fn alloc_shared_f32_buffer(device: &metal::Device, n_floats: usize) -> Resul
 }
 
 #[cfg(target_os = "macos")]
+pub fn alloc_shared_bytes(device: &metal::Device, n_bytes: usize) -> Result<metal::Buffer> {
+    let bytes = n_bytes.max(16) as u64;
+    let opts = metal::MTLResourceOptions::StorageModeShared
+        | metal::MTLResourceOptions::CPUCacheModeDefaultCache
+        | metal::MTLResourceOptions::HazardTrackingModeTracked;
+    let buf = device.new_buffer(bytes, opts);
+    if buf.length() < bytes {
+        bail!("MTLBuffer length {} < {bytes}", buf.length());
+    }
+    Ok(buf)
+}
+
+/// Zero-copy Shared buffer wrapping a page-aligned host pointer. Caller retains
+/// ownership of `bytes` for the lifetime of the returned buffer.
+#[cfg(target_os = "macos")]
+pub fn wrap_shared_bytes_no_copy(device: &metal::Device, bytes: &[u8]) -> Result<metal::Buffer> {
+    if bytes.as_ptr() as usize % 16_384 != 0 {
+        bail!("DMA wrap requires 16 KiB alignment");
+    }
+    let opts = metal::MTLResourceOptions::StorageModeShared
+        | metal::MTLResourceOptions::CPUCacheModeDefaultCache
+        | metal::MTLResourceOptions::HazardTrackingModeTracked;
+    let buf =
+        device.new_buffer_with_bytes_no_copy(bytes.as_ptr().cast(), bytes.len() as u64, opts, None);
+    Ok(buf)
+}
+
+#[cfg(target_os = "macos")]
+pub fn write_shared_bytes(buffer: &metal::Buffer, src: &[u8]) -> Result<()> {
+    let need = src.len() as u64;
+    if need > buffer.length() {
+        bail!("write {} bytes into MTLBuffer of {}", need, buffer.length());
+    }
+    if src.is_empty() {
+        return Ok(());
+    }
+    unsafe {
+        let dst = buffer.contents().cast::<u8>();
+        if dst.is_null() {
+            bail!("MTLBuffer.contents is null");
+        }
+        ptr::copy_nonoverlapping(src.as_ptr(), dst, src.len());
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
+pub fn write_shared_u32_buffer(buffer: &metal::Buffer, src: &[u32]) -> Result<()> {
+    let need = (src.len() * 4) as u64;
+    if need > buffer.length() {
+        bail!("write {} bytes into MTLBuffer of {}", need, buffer.length());
+    }
+    if src.is_empty() {
+        return Ok(());
+    }
+    unsafe {
+        let dst = buffer.contents().cast::<u32>();
+        if dst.is_null() {
+            bail!("MTLBuffer.contents is null");
+        }
+        ptr::copy_nonoverlapping(src.as_ptr(), dst, src.len());
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
 pub fn write_shared_f32_buffer(buffer: &metal::Buffer, src: &[f32]) -> Result<()> {
     let need = (src.len() * 4) as u64;
     if need > buffer.length() {
-        bail!(
-            "write {} bytes into MTLBuffer of {}",
-            need,
-            buffer.length()
-        );
+        bail!("write {} bytes into MTLBuffer of {}", need, buffer.length());
     }
     if src.is_empty() {
         return Ok(());
@@ -451,6 +723,60 @@ kernel void ullis_mob_kan_fused_step(
 
         y[gid * out_f + o] = acc;
     }
+}
+
+struct I8GemmSpec {
+    uint n;
+    uint d;
+    uint v;
+    uint pad;
+};
+
+kernel void ullis_i8_embed_lookup(
+    device const char*  codes [[buffer(0)]],
+    device const float* scale [[buffer(1)]],
+    device const uint*  ids   [[buffer(2)]],
+    device       float* y     [[buffer(3)]],
+    constant I8GemmSpec& p    [[buffer(4)]],
+    uint gid [[thread_position_in_grid]]
+) {
+    if (gid >= p.n) {
+        return;
+    }
+    uint id = ids[gid];
+    if (id >= p.v) {
+        id = p.v - 1u;
+    }
+    float s = scale[id];
+    device const char* row = codes + id * p.d;
+    device float* out = y + gid * p.d;
+    for (uint j = 0; j < p.d; ++j) {
+        out[j] = float(row[j]) * s;
+    }
+}
+
+kernel void ullis_i8_tied_logits(
+    device const float* hidden [[buffer(0)]],
+    device const char*  codes  [[buffer(1)]],
+    device const float* scale  [[buffer(2)]],
+    device       float* logits [[buffer(3)]],
+    constant I8GemmSpec& p     [[buffer(4)]],
+    uint tid [[thread_index_in_threadgroup]],
+    uint tpg [[threads_per_threadgroup]],
+    uint2 gid [[threadgroup_position_in_grid]]
+) {
+    uint i = gid.y;
+    uint tok = gid.x * tpg + tid;
+    if (i >= p.n || tok >= p.v) {
+        return;
+    }
+    device const float* h = hidden + i * p.d;
+    device const char* row = codes + tok * p.d;
+    float acc = 0.0f;
+    for (uint j = 0; j < p.d; ++j) {
+        acc += h[j] * float(row[j]);
+    }
+    logits[i * p.v + tok] = acc * scale[tok];
 }
 "#;
 

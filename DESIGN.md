@@ -3,6 +3,26 @@
 Standalone ternary Kolmogorov–Arnold engine. Python/PyTorch is gone.
 Math is a faithful port of Ullis AI Engine v2.0 plus Mixture-of-Bumps.
 
+## v0.8.0 Deep Context & Vocabulary Expansion
+
+V doubles to **8192** without growing the 40 MB train / 15 MB infer envelopes:
+
+1. **Byte-fallback WordPiece.** Specials `0..3`, raw UTF-8 bytes `4..259`, then
+   language-agnostic WordPiece atoms (English / Russian function words and
+   syntax identifiers occupy single ids). Unmapped UTF-8 falls back to byte
+   ids in-stream and never panics. Encode is greedy longest-match.
+2. **Packed 8-bit tied embeddings.** The `[V, D]` plane is stored as int8 codes
+   plus a per-row scale. `TernaryKanLinear` stays 2-bit ternary. The Metal
+   kernels `ullis_i8_embed_lookup` / `ullis_i8_tied_logits` unpack `char` weights
+   in-shader. Training CE is streamed per token so `[n, V]` logits are never
+   resident (`V=8192` would otherwise double the tied-head working set).
+3. **`SovereignFlashBuffer`.** The `VecDeque` token ring is gone. A page-aligned
+   (16 KiB) compacting primitive holds 32 768 ids; `bind_metal` wraps the host
+   pointer with `new_buffer_with_bytes_no_copy` (metal-rs 0.29).
+
+Target: **< 40 MB RSS** train (`d=32 L=3 G≤12 V=8192 T=96 B=4`), **< 15 MB**
+packed inference (last-token i8 logits only).
+
 ## v0.7.0 Cognitive Core
 
 Training was underfitting at CE `6.7–7.1` under the rigid `G = 4 → 8 → 12`
@@ -27,7 +47,7 @@ optimization plane with three language-agnostic mechanisms:
 
 Memory envelope is unchanged: SGD, no Adam, fused forward, host tape.
 Target remains **< 40 MB RSS** during default training (`d=32 L=3 G≤12
-V=4096 T=96 B=4`).
+V=8192 T=96 B=4`).
 
 ## v0.6.0 Sovereign Core
 
@@ -102,13 +122,13 @@ velocities as detached `Vec<f32>` (no graph).
 | `device`     | `SovereignDevice`: MTLDevice/queue, fused MSL compile, Shared buffer map            |
 | `tensor`     | `SovereignTensor`: host `Vec<f32>` + isolated `MTLBuffer`, pipeline ownership       |
 | `accelerate` | Accelerate FFI (`cblas_sgemm`, vDSP, `vvexpf`) + CPU fused MoB-KAN                  |
-| `quant`      | TWN threshold, STE, 2-bit pack/unpack (`u8` bit-shifts)                             |
+| `quant`      | TWN 2-bit pack/unpack plus per-row packed-i8 (`PackedI8Matrix`)                     |
 | `gauss`      | G×G Gauss–Jordan (`matmul`/`broadcast` only, G ≤ 16)                                |
 | `kan`        | `TernaryKanLinear` + non-uniform ReLU-bumps + MoB router + knot insert               |
-| `mixers`     | `CausalShift` (0 params) / tiny causal attention                                    |
-| `model`      | `UllisKan`: embed → L × (shift + KAN) → RMSNorm → tied logits                       |
-| `tokenizer`  | Byte-level BPE, vocab 4096, code-seeded merges                                      |
-| `data`       | 4-key JSONL (`system/user/thinking/output`) via `serde_json`, `VecDeque` token ring |
+| `mixers`     | `CausalShift` (0 params) / tiny causal attention / streamed tied CE                 |
+| `model`      | `UllisKan`: packed-i8 embed → L × (shift + KAN) → RMSNorm → tied i8 logits          |
+| `tokenizer`  | Byte-fallback WordPiece, vocab 8192, language-agnostic atoms                        |
+| `data`       | 4-key JSONL via `serde_json`, `SovereignFlashBuffer` token ring                     |
 | `think`      | `--thinking` budgets, ephemeral reasoning GC, dialogue cache                        |
 | `train`      | 4-phase QAT, continuous knot insert, SGD+momentum, CE+entropy on thinking+output    |
 | `checkpoint` | Self-contained `packed.bin` (magic `ULLIS03`, loads v0.3 weights)                   |
@@ -224,7 +244,7 @@ Loss is masked onto the `thinking` + `output` span so the KAN layer learns
 the reasoning trajectory, plus the entropy penalty above. Legacy
 `{"text","lang"}` lines are lifted in-stream (the `lang` key is never a
 training target).
-Token ring is a `VecDeque<u32>` capped at 32 768 ids (~128 KB).
+Token ring is a page-aligned `SovereignFlashBuffer` capped at 32 768 ids (~128 KB).
 
 ## Thinking mode
 
@@ -264,7 +284,7 @@ Every log step / generation:
 
 ## Memory budget (M1 8 GB, defaults)
 
-`d=32`, `L=3`, `G=12`, `V=4096`, `T=96`, `B=4`, SGD (no Adam states).
+`d=32`, `L=3`, `G=12`, `V=8192`, `T=96`, `B=4`, SGD (no Adam states).
 Peak training footprint is designed to stay in the low tens of MB of
 unified memory. JSONL I/O is independent of corpus size. Thinking scratch
 is ephemeral: after each turn the ring is wiped, so `xhigh` resonance

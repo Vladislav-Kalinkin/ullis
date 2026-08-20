@@ -211,6 +211,93 @@ pub fn embed_lookup(table: &[f32], vocab: usize, d: usize, ids: &[u32]) -> Resul
     Ok(y)
 }
 
+/// Streamed tied-head CE + entropy. Never materializes `[n, V]` logits, so
+/// `V=8192` training stays inside the 40 MB envelope.
+///
+/// Returns `(loss, mean_entropy, dhidden[n,d], dembed[V,d])`.
+pub fn streamed_tied_ce(
+    hidden: &[f32],
+    embed: &[f32],
+    n: usize,
+    d: usize,
+    v: usize,
+    targets: &[u32],
+    mask: &[u8],
+    entropy_coef: f32,
+) -> Result<(f32, f32, Vec<f32>, Vec<f32>)> {
+    if hidden.len() != n * d || embed.len() != v * d || targets.len() != n || mask.len() != n {
+        anyhow::bail!("streamed tied-ce shape");
+    }
+    let mut dhidden = vec![0.0f32; n * d];
+    let mut dembed = vec![0.0f32; v * d];
+    let mut row = vec![0.0f32; v];
+    let mut loss = 0.0f32;
+    let mut h_sum = 0.0f32;
+    let mut den = 0.0f32;
+    let lam = entropy_coef.max(0.0);
+    for i in 0..n {
+        if mask[i] == 0 {
+            continue;
+        }
+        den += 1.0;
+        let h = &hidden[i * d..(i + 1) * d];
+        for tok in 0..v {
+            let er = &embed[tok * d..(tok + 1) * d];
+            let mut acc = 0.0f32;
+            for j in 0..d {
+                acc += h[j] * er[j];
+            }
+            row[tok] = acc;
+        }
+        let m = row.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+        let mut z = 0.0f32;
+        for tok in 0..v {
+            row[tok] = (row[tok] - m).exp();
+            z += row[tok];
+        }
+        let inv = 1.0 / z.max(1e-20);
+        let mut entropy = 0.0f32;
+        for tok in 0..v {
+            row[tok] *= inv;
+            let p = row[tok].max(1e-12);
+            entropy -= p * p.ln();
+        }
+        let y = (targets[i] as usize).min(v.saturating_sub(1));
+        loss += -row[y].max(1e-12).ln();
+        h_sum += entropy;
+        for tok in 0..v {
+            let p = row[tok];
+            let mut g = p;
+            if tok == y {
+                g -= 1.0;
+            }
+            if lam > 0.0 {
+                g += lam * (-p * (p.max(1e-12).ln() + entropy));
+            }
+            let er = &embed[tok * d..(tok + 1) * d];
+            let dh = &mut dhidden[i * d..(i + 1) * d];
+            let de = &mut dembed[tok * d..(tok + 1) * d];
+            for j in 0..d {
+                dh[j] += g * er[j];
+                de[j] += g * h[j];
+            }
+        }
+    }
+    if den > 0.0 {
+        let inv = 1.0 / den;
+        loss *= inv;
+        h_sum *= inv;
+        for x in &mut dhidden {
+            *x *= inv;
+        }
+        for x in &mut dembed {
+            *x *= inv;
+        }
+        loss += lam * h_sum;
+    }
+    Ok((loss, h_sum, dhidden, dembed))
+}
+
 pub fn embed_scatter(vocab: usize, d: usize, ids: &[u32], dy: &[f32]) -> Result<Vec<f32>> {
     let mut dw = vec![0.0f32; vocab * d];
     for (t, &id) in ids.iter().enumerate() {

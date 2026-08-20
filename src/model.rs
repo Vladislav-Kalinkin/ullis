@@ -6,10 +6,9 @@ use crate::device::SovereignDevice;
 use crate::kan::{KanEvalMode, NamedBlob, TernaryKanLinear};
 use crate::mixers::{
     causal_shift, causal_shift_backward, embed_lookup, embed_scatter, randn, rmsnorm,
-    rmsnorm_backward, CausalAttention,
+    rmsnorm_backward, streamed_tied_ce, CausalAttention,
 };
-use crate::optim::masked_ce_entropy;
-use crate::quant::TernaryHist;
+use crate::quant::{tied_logits_i8, PackedI8Matrix, TernaryHist};
 use crate::tensor::SovereignTensor;
 use crate::tokenizer::{BpeTokenizer, StreamDecoder};
 
@@ -239,6 +238,7 @@ struct ModelCache {
 pub struct UllisKan {
     pub cfg: TrainConfig,
     pub embed: SovereignTensor,
+    pub embed_i8: PackedI8Matrix,
     pub embed_grad: Vec<f32>,
     pub blocks: Vec<KanBlock>,
     pub norm: RmsNorm,
@@ -264,11 +264,13 @@ impl UllisKan {
         }
         let v = cfg.vocab_size;
         let d = cfg.d_model;
+        let embed_i8 = PackedI8Matrix::quantize(embed.as_slice(), v, d)?;
         Ok(Self {
             norm: RmsNorm::new(cfg.d_model)?,
             embed_grad: vec![0.0; v * d],
             cfg,
             embed,
+            embed_i8,
             blocks,
             device,
             tape: None,
@@ -276,6 +278,13 @@ impl UllisKan {
             last_entropy: 0.0,
             last_router_entropy: 0.0,
         })
+    }
+
+    pub fn refresh_embed_i8(&mut self) -> Result<()> {
+        let v = self.cfg.vocab_size;
+        let d = self.cfg.d_model;
+        self.embed_i8 = PackedI8Matrix::quantize(self.embed.as_slice(), v, d)?;
+        Ok(())
     }
 
     pub fn set_phase(&mut self, phase: u8) -> Result<()> {
@@ -316,6 +325,9 @@ impl UllisKan {
             b.ff.pack()?;
             b.ff.bind(&self.device)?;
         }
+        self.refresh_embed_i8()?;
+        let deq = self.embed_i8.dequantize();
+        self.embed.as_mut_slice().copy_from_slice(&deq);
         Ok(())
     }
 
@@ -341,9 +353,25 @@ impl UllisKan {
         mode: KanEvalMode,
         tape: bool,
     ) -> Result<Vec<f32>> {
+        let hidden = self.forward_hidden(token_ids, b, t, mode, tape)?;
+        self.project_logits(&hidden, b * t)
+    }
+
+    fn forward_hidden(
+        &mut self,
+        token_ids: &[u32],
+        b: usize,
+        t: usize,
+        mode: KanEvalMode,
+        tape: bool,
+    ) -> Result<Vec<f32>> {
         let d = self.cfg.d_model;
         let n = b * t;
-        let mut x = embed_lookup(self.embed.as_slice(), self.cfg.vocab_size, d, token_ids)?;
+        let mut x = if self.blocks.iter().any(|blk| blk.ff.packed) {
+            self.embed_i8.lookup(token_ids)
+        } else {
+            embed_lookup(self.embed.as_slice(), self.cfg.vocab_size, d, token_ids)?
+        };
         let mut block_tapes = Vec::new();
         let gpu = &self.device;
         for blk in &mut self.blocks {
@@ -355,17 +383,6 @@ impl UllisKan {
         }
         let pre_norm = if tape { x.clone() } else { Vec::new() };
         let hidden = self.norm.forward(&x, n, d)?;
-        let mut logits = vec![0.0f32; n * self.cfg.vocab_size];
-        sgemm_nt(
-            n,
-            self.cfg.vocab_size,
-            d,
-            1.0,
-            &hidden,
-            self.embed.as_slice(),
-            0.0,
-            &mut logits,
-        )?;
         if tape {
             self.tape = Some(ModelCache {
                 ids: token_ids.to_vec(),
@@ -373,10 +390,28 @@ impl UllisKan {
                 t,
                 blocks: block_tapes,
                 pre_norm,
-                hidden,
+                hidden: hidden.clone(),
             });
         }
+        Ok(hidden)
+    }
+
+    fn project_logits(&self, hidden: &[f32], n: usize) -> Result<Vec<f32>> {
+        let d = self.cfg.d_model;
+        let v = self.cfg.vocab_size;
+        let mut logits = vec![0.0f32; n * v];
+        if self.blocks.iter().any(|blk| blk.ff.packed) {
+            tied_logits_i8(hidden, n, d, &self.embed_i8, &mut logits);
+        } else {
+            sgemm_nt(n, v, d, 1.0, hidden, self.embed.as_slice(), 0.0, &mut logits)?;
+        }
         Ok(logits)
+    }
+
+    fn project_logits_last(&self, hidden: &[f32], n: usize) -> Result<Vec<f32>> {
+        let d = self.cfg.d_model;
+        let last = &hidden[(n - 1) * d..n * d];
+        self.project_logits(last, 1)
     }
 
     pub fn train_step(
@@ -392,38 +427,28 @@ impl UllisKan {
         let v = self.cfg.vocab_size;
         let d = self.cfg.d_model;
         let n = b * t;
-        let logits = self.forward_mode(ids, b, t, KanEvalMode::Full, true)?;
+        let _hidden = self.forward_hidden(ids, b, t, KanEvalMode::Full, true)?;
         let entropy_coef = self.cfg.entropy_coef as f32;
-        let (mut loss, mean_h, dlogits) =
-            masked_ce_entropy(&logits, n, v, targets, mask, entropy_coef)?;
+        let tape = self
+            .tape
+            .take()
+            .ok_or_else(|| anyhow::anyhow!("missing tape"))?;
+        let (mut loss, mean_h, dhidden, dembed) = streamed_tied_ce(
+            &tape.hidden,
+            self.embed.as_slice(),
+            n,
+            d,
+            v,
+            targets,
+            mask,
+            entropy_coef,
+        )?;
         self.last_ce = loss - entropy_coef.max(0.0) * mean_h;
         self.last_entropy = mean_h;
         if l1 > 0.0 {
             loss += l1 * self.l1_penalty();
         }
-        // tied logits: logits = hidden @ embed.T
-        // dH = dlogits @ embed; dEmbed += hidden.T @ dlogits  (and gather path)
-        let tape = self
-            .tape
-            .take()
-            .ok_or_else(|| anyhow::anyhow!("missing tape"))?;
-        let mut dhidden = vec![0.0f32; n * d];
-        // dhidden = dlogits @ embed  (dlogits [n,v], embed [v,d] → [n,d])
-        crate::accelerate::sgemm(
-            n,
-            d,
-            v,
-            1.0,
-            &dlogits,
-            self.embed.as_slice(),
-            0.0,
-            &mut dhidden,
-        )?;
-        // dEmbed from tied head: embed_grad += dlogits.T @ hidden → [v,d]
-        // For each row of dlogits [v] and hidden [d]: outer product. Use sgemm:
-        // C[v,d] += A[v,n] @ B[n,d] where A = dlogits^T
-        let dlt = transpose(&dlogits, n, v);
-        crate::accelerate::sgemm(v, d, n, 1.0, &dlt, &tape.hidden, 1.0, &mut self.embed_grad)?;
+        add_assign(&mut self.embed_grad, &dembed);
 
         let (dpre, dw) = rmsnorm_backward(
             &tape.pre_norm,
@@ -539,10 +564,9 @@ impl UllisKan {
             ids
         };
         let t = ctx.len().max(1);
-        let logits = self.forward_mode(ctx, 1, t, mode, false)?;
-        let v = self.cfg.vocab_size;
-        let last = &logits[(t - 1) * v..t * v];
-        Ok(sample_logits(last, temperature, rng))
+        let hidden = self.forward_hidden(ctx, 1, t, mode, false)?;
+        let last = self.project_logits_last(&hidden, t)?;
+        Ok(sample_logits(&last, temperature, rng))
     }
 
     pub fn generate_stream_pieces(
@@ -610,7 +634,14 @@ impl UllisKan {
 
     pub fn collect_blobs(&self) -> Result<Vec<(String, NamedBlob)>> {
         let mut out = Vec::new();
-        push_named(&mut out, "embed", &self.embed);
+        out.push((
+            "embed".into(),
+            NamedBlob::I8 {
+                codes: self.embed_i8.codes_u8(),
+                scale: self.embed_i8.scale.clone(),
+                shape: vec![self.embed_i8.rows, self.embed_i8.cols],
+            },
+        ));
         push_named(&mut out, "norm.weight", &self.norm.weight);
         for (i, b) in self.blocks.iter().enumerate() {
             let pfx = format!("blocks.{i}");
@@ -639,9 +670,21 @@ impl UllisKan {
         Ok(out)
     }
 
+    pub fn load_i8_embed(&mut self, codes: &[u8], scale: &[f32], shape: &[usize]) -> Result<()> {
+        if shape.len() != 2 {
+            bail!("embed i8 shape {shape:?}");
+        }
+        self.embed_i8 = PackedI8Matrix::from_u8(shape[0], shape[1], codes, scale)?;
+        let deq = self.embed_i8.dequantize();
+        self.embed = SovereignTensor::from_vec(shape.to_vec(), deq)?;
+        self.cfg.vocab_size = shape[0];
+        Ok(())
+    }
+
     pub fn load_blob(&mut self, name: &str, data: &[f32], shape: &[usize]) -> Result<()> {
         if name == "embed" {
             self.embed = SovereignTensor::from_vec(shape.to_vec(), data.to_vec())?;
+            self.refresh_embed_i8()?;
             return Ok(());
         }
         if name == "norm.weight" {
@@ -766,6 +809,7 @@ impl UllisKan {
     pub fn write_param(&mut self, name: &str, data: &[f32]) -> Result<()> {
         if name == "embed" {
             self.embed.as_mut_slice().copy_from_slice(data);
+            self.refresh_embed_i8()?;
             return Ok(());
         }
         if name == "norm.weight" {
@@ -824,16 +868,6 @@ fn push_named(out: &mut Vec<(String, NamedBlob)>, name: &str, t: &SovereignTenso
             shape: t.shape().to_vec(),
         },
     ));
-}
-
-fn transpose(a: &[f32], rows: usize, cols: usize) -> Vec<f32> {
-    let mut t = vec![0.0f32; rows * cols];
-    for i in 0..rows {
-        for j in 0..cols {
-            t[j * rows + i] = a[i * cols + j];
-        }
-    }
-    t
 }
 
 fn sample_logits(logits: &[f32], temperature: f32, rng: &mut impl rand::Rng) -> u32 {

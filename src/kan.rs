@@ -51,6 +51,11 @@ pub struct PackedCodes {
 pub enum NamedBlob {
     F32 { data: Vec<f32>, shape: Vec<usize> },
     Packed { bytes: Vec<u8>, shape: Vec<usize> },
+    I8 {
+        codes: Vec<u8>,
+        scale: Vec<f32>,
+        shape: Vec<usize>,
+    },
 }
 
 pub struct TernaryKanLinear {

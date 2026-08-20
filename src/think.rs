@@ -1,13 +1,13 @@
 //! Multi-tier thinking budgets and ephemeral reasoning garbage collection.
 //!
 //! Persistent dialogue never stores `thinking` tokens. The scratch ring is
-//! zeroed, cleared and `shrink_to_fit`'d the instant a turn finishes.
+//! a `SovereignFlashBuffer` that is zeroed the instant a turn finishes.
 
-use std::collections::VecDeque;
 use std::str::FromStr;
 
 use clap::ValueEnum;
 
+use crate::data::SovereignFlashBuffer;
 use crate::kan::KanEvalMode;
 
 /// Inference computational budget (`--thinking`).
@@ -85,7 +85,7 @@ const DEFAULT_SYSTEM: &str = "You are a compact ternary KAN code engine. Infer t
 #[derive(Debug)]
 pub struct DialogueCache {
     system: String,
-    turns: VecDeque<(String, String)>,
+    turns: Vec<(String, String)>,
 }
 
 impl DialogueCache {
@@ -96,7 +96,7 @@ impl DialogueCache {
         }
         Self {
             system,
-            turns: VecDeque::with_capacity(DIALOGUE_TURN_CAP),
+            turns: Vec::with_capacity(DIALOGUE_TURN_CAP),
         }
     }
 
@@ -113,14 +113,13 @@ impl DialogueCache {
 
     pub fn clear(&mut self) {
         self.turns.clear();
-        self.turns.shrink_to_fit();
     }
 
     /// Store a finished turn. Thinking is never accepted here.
     pub fn persist_turn(&mut self, user: String, output: String) {
-        self.turns.push_back((user, output));
+        self.turns.push((user, output));
         while self.turns.len() > DIALOGUE_TURN_CAP {
-            self.turns.pop_front();
+            self.turns.remove(0);
         }
         self.trim_chars();
     }
@@ -136,7 +135,7 @@ impl DialogueCache {
             if n <= DIALOGUE_CHAR_CAP || self.turns.len() <= 1 {
                 break;
             }
-            self.turns.pop_front();
+            self.turns.remove(0);
         }
     }
 
@@ -161,7 +160,7 @@ impl DialogueCache {
 /// Ring of hidden reasoning tokens. Wiped after every turn.
 #[derive(Debug)]
 pub struct ReasoningScratch {
-    tokens: VecDeque<u32>,
+    tokens: SovereignFlashBuffer,
     text: String,
 }
 
@@ -174,13 +173,14 @@ impl Default for ReasoningScratch {
 impl ReasoningScratch {
     pub fn new() -> Self {
         Self {
-            tokens: VecDeque::new(),
+            tokens: SovereignFlashBuffer::new(crate::data::MAX_TOKEN_BUF)
+                .unwrap_or_else(|_| SovereignFlashBuffer::new(64).expect("tiny flash")),
             text: String::new(),
         }
     }
 
     pub fn push_token(&mut self, id: u32) {
-        self.tokens.push_back(id);
+        self.tokens.push(id, 1);
     }
 
     pub fn push_text(&mut self, s: &str) {
@@ -204,13 +204,9 @@ impl ReasoningScratch {
         self.wipe();
     }
 
-    /// Zero, drop, and release capacity. Safe (no `unsafe` overwrite).
+    /// Zero the flash plane and drop the text scratch.
     pub fn wipe(&mut self) {
-        for t in &mut self.tokens {
-            *t = 0;
-        }
         self.tokens.clear();
-        self.tokens.shrink_to_fit();
         if !self.text.is_empty() {
             let n = self.text.len();
             self.text.clear();
@@ -304,7 +300,7 @@ mod tests {
         assert!(!s.is_empty());
         s.clear();
         assert!(s.is_empty());
-        assert!(s.tokens.capacity() <= 64);
+        assert_eq!(s.len(), 0);
     }
 
     #[test]

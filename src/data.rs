@@ -5,8 +5,11 @@
 //!
 //! Legacy `{"text":"...","lang":"..."}` and raw-text lines are lifted in-stream
 //! so existing corpora keep training.
+//!
+//! Token storage is a cache-line / page-aligned `SovereignFlashBuffer` (no
+//! `VecDeque`). After `bind_metal`, evaluation sweeps DMA the host pointer
+//! straight into a Shared `MTLBuffer` with no extra host-to-device copy.
 
-use std::collections::VecDeque;
 use std::fs::File;
 use std::io::{BufRead, BufReader, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
@@ -15,10 +18,11 @@ use anyhow::{Context, Result};
 use rand::prelude::*;
 use serde::{Deserialize, Serialize};
 
+use crate::device::{PageSlab, SovereignDevice};
 use crate::tokenizer::BpeTokenizer;
 
 /// Token ring cap (~128 KB of u32) — independent of file size and thinking depth.
-const MAX_TOKEN_BUF: usize = 32_768;
+pub const MAX_TOKEN_BUF: usize = 32_768;
 
 pub const TAG_SYSTEM: &str = "<|system|>";
 pub const TAG_USER: &str = "<|user|>";
@@ -156,6 +160,192 @@ pub fn encode_supervised(tokenizer: &mut BpeTokenizer, rec: &ChatRecord) -> (Vec
     (ids, mask)
 }
 
+/// Cache-line aligned, compacting token+mask ring. Occupancy is always a
+/// contiguous `[0, len)` window after `compact`, so the token pointer can be
+/// handed to Metal as a no-copy Shared buffer.
+pub struct SovereignFlashBuffer {
+    slab: PageSlab,
+    cap: usize,
+    mask_off: usize,
+    start: usize,
+    len: usize,
+    #[cfg(target_os = "macos")]
+    metal: Option<metal::Buffer>,
+}
+
+impl std::fmt::Debug for SovereignFlashBuffer {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SovereignFlashBuffer")
+            .field("cap", &self.cap)
+            .field("len", &self.len)
+            .field("start", &self.start)
+            .field("bytes", &self.slab.len())
+            .finish()
+    }
+}
+
+impl SovereignFlashBuffer {
+    pub fn new(cap: usize) -> Result<Self> {
+        let cap = cap.max(1);
+        let mask_off = cap * 4;
+        let bytes = mask_off + cap;
+        Ok(Self {
+            slab: PageSlab::new(bytes)?,
+            cap,
+            mask_off,
+            start: 0,
+            len: 0,
+            #[cfg(target_os = "macos")]
+            metal: None,
+        })
+    }
+
+    pub fn len(&self) -> usize {
+        self.len
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    pub fn cap(&self) -> usize {
+        self.cap
+    }
+
+    fn tokens(&self) -> &[u32] {
+        self.slab
+            .u32_at(0, self.cap)
+            .expect("flash token plane")
+    }
+
+    fn tokens_mut(&mut self) -> &mut [u32] {
+        let cap = self.cap;
+        self.slab
+            .u32_at_mut(0, cap)
+            .expect("flash token plane")
+    }
+
+    fn masks(&self) -> &[u8] {
+        let off = self.mask_off;
+        let cap = self.cap;
+        let bytes = self.slab.as_bytes();
+        if off + cap > bytes.len() {
+            return &[];
+        }
+        &bytes[off..off + cap]
+    }
+
+    fn masks_mut(&mut self) -> &mut [u8] {
+        let off = self.mask_off;
+        let cap = self.cap;
+        let bytes = self.slab.as_bytes_mut();
+        if off + cap > bytes.len() {
+            return &mut [];
+        }
+        &mut bytes[off..off + cap]
+    }
+
+    /// Slide occupancy to index 0 so the DMA pointer is a single span.
+    pub fn compact(&mut self) {
+        if self.start == 0 || self.len == 0 {
+            self.start = 0;
+            return;
+        }
+        let start = self.start;
+        let len = self.len;
+        self.tokens_mut().copy_within(start..start + len, 0);
+        self.masks_mut().copy_within(start..start + len, 0);
+        self.start = 0;
+    }
+
+    pub fn clear(&mut self) {
+        if self.len > 0 {
+            let start = self.start;
+            let len = self.len;
+            self.tokens_mut()[start..start + len].fill(0);
+            self.masks_mut()[start..start + len].fill(0);
+        }
+        self.start = 0;
+        self.len = 0;
+    }
+
+    pub fn push(&mut self, id: u32, mask: u8) {
+        if self.len == self.cap {
+            self.drain_front(1);
+        }
+        if self.start + self.len >= self.cap {
+            self.compact();
+        }
+        let i = self.start + self.len;
+        self.tokens_mut()[i] = id;
+        self.masks_mut()[i] = mask;
+        self.len += 1;
+    }
+
+    pub fn extend(&mut self, ids: &[u32], mask: &[u8]) {
+        debug_assert_eq!(ids.len(), mask.len());
+        for (&id, &m) in ids.iter().zip(mask.iter()) {
+            self.push(id, m);
+        }
+    }
+
+    pub fn drain_front(&mut self, n: usize) {
+        let n = n.min(self.len);
+        if n == 0 {
+            return;
+        }
+        let start = self.start;
+        self.tokens_mut()[start..start + n].fill(0);
+        self.masks_mut()[start..start + n].fill(0);
+        self.start += n;
+        self.len -= n;
+        if self.len == 0 {
+            self.start = 0;
+        } else if self.start > self.cap / 2 {
+            self.compact();
+        }
+    }
+
+    pub fn window(&self, start: usize, len: usize) -> (Vec<u32>, Vec<u8>) {
+        let start = start.min(self.len);
+        let len = len.min(self.len.saturating_sub(start));
+        let s = self.start + start;
+        (
+            self.tokens()[s..s + len].to_vec(),
+            self.masks()[s..s + len].to_vec(),
+        )
+    }
+
+    pub fn token_span(&self) -> &[u32] {
+        let s = self.start;
+        &self.tokens()[s..s + self.len]
+    }
+
+    /// Bind the page-aligned token plane as a no-copy Shared Metal buffer.
+    pub fn bind_metal(&mut self, gpu: &SovereignDevice) -> Result<()> {
+        self.compact();
+        #[cfg(target_os = "macos")]
+        {
+            let Some(mtl) = gpu.mtl_device() else {
+                return Ok(());
+            };
+            let tok_bytes = self.slab.as_bytes();
+            self.metal = Some(crate::device::wrap_shared_bytes_no_copy(mtl, tok_bytes)?);
+            Ok(())
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            let _ = gpu;
+            Ok(())
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    pub fn metal_buffer(&self) -> Option<&metal::Buffer> {
+        self.metal.as_ref()
+    }
+}
+
 pub fn parse_jsonl_line(line: &str) -> Option<ChatRecord> {
     let trimmed = line.trim();
     if trimmed.is_empty() {
@@ -180,8 +370,7 @@ pub struct JsonlStream {
     reader: BufReader<File>,
     tokenizer: BpeTokenizer,
     seq_len: usize,
-    buf: VecDeque<u32>,
-    mask: VecDeque<u8>,
+    flash: SovereignFlashBuffer,
     rng: StdRng,
     lines_seen: u64,
 }
@@ -200,8 +389,7 @@ impl JsonlStream {
             reader: BufReader::with_capacity(64 * 1024, file),
             tokenizer,
             seq_len,
-            buf: VecDeque::with_capacity(seq_len * 4),
-            mask: VecDeque::with_capacity(seq_len * 4),
+            flash: SovereignFlashBuffer::new(MAX_TOKEN_BUF)?,
             rng: crate::device::rng_from_seed(seed),
             lines_seen: 0,
         })
@@ -221,20 +409,16 @@ impl JsonlStream {
     }
 
     fn cap_buf(&mut self) {
-        if self.buf.len() > MAX_TOKEN_BUF {
+        if self.flash.len() > MAX_TOKEN_BUF {
             let keep = self.seq_len * 4;
-            let drain = self.buf.len() - keep;
-            self.buf.drain(..drain);
-            if self.mask.len() >= drain {
-                self.mask.drain(..drain);
-            }
+            let drain = self.flash.len().saturating_sub(keep);
+            self.flash.drain_front(drain);
         }
     }
 
     fn push_ids(&mut self, ids: Vec<u32>, mask: Vec<u8>) {
         debug_assert_eq!(ids.len(), mask.len());
-        self.buf.extend(ids);
-        self.mask.extend(mask);
+        self.flash.extend(&ids, &mask);
     }
 
     fn read_one_line(&mut self) -> Result<bool> {
@@ -259,11 +443,11 @@ impl JsonlStream {
     fn refill(&mut self) -> Result<()> {
         let need = self.seq_len + 2;
         let mut loops = 0u32;
-        while self.buf.len() < need {
+        while self.flash.len() < need {
             if !self.read_one_line()? {
                 self.rewind()?;
                 loops += 1;
-                if loops > 2 && self.buf.len() < need {
+                if loops > 2 && self.flash.len() < need {
                     let rec = ChatRecord::from_legacy("fn main() {}\n", Some("rust"));
                     let (ids, mask) = encode_supervised(&mut self.tokenizer, &rec);
                     self.push_ids(ids, mask);
@@ -277,23 +461,13 @@ impl JsonlStream {
         Ok(())
     }
 
-    fn window(&self, start: usize, len: usize) -> (Vec<u32>, Vec<u8>) {
-        let ids: Vec<u32> = self.buf.iter().skip(start).take(len).copied().collect();
-        let mask: Vec<u8> = self.mask.iter().skip(start).take(len).copied().collect();
-        (ids, mask)
-    }
-
     /// Next `(x, y, loss_mask)` — shifted LM, mask aligned with `y`.
     pub fn next_seq(&mut self) -> Result<(Vec<u32>, Vec<u32>, Vec<u8>)> {
         self.refill()?;
-        while self.buf.len() < self.seq_len + 1 {
-            self.buf.push_back(self.tokenizer.eos_id);
-            self.mask.push_back(0);
+        while self.flash.len() < self.seq_len + 1 {
+            self.flash.push(self.tokenizer.eos_id, 0);
         }
-        while self.mask.len() < self.buf.len() {
-            self.mask.push_back(1);
-        }
-        let max_start = self.buf.len() - self.seq_len - 1;
+        let max_start = self.flash.len() - self.seq_len - 1;
         // Bias toward the tail so thinking+output stay in-window on long records.
         let start = if max_start == 0 {
             0
@@ -302,15 +476,13 @@ impl JsonlStream {
         } else {
             self.rng.random_range(0..=max_start)
         };
-        let (chunk, mchunk) = self.window(start, self.seq_len + 1);
+        let (chunk, mchunk) = self.flash.window(start, self.seq_len + 1);
         let x = chunk[..self.seq_len].to_vec();
         let y = chunk[1..].to_vec();
         let loss_mask = mchunk[1..].to_vec();
         if self.rng.random::<f32>() < 0.05 {
-            let drain = (start + 16).min(self.buf.len());
-            self.buf.drain(..drain);
-            let md = drain.min(self.mask.len());
-            self.mask.drain(..md);
+            let drain = (start + 16).min(self.flash.len());
+            self.flash.drain_front(drain);
         }
         Ok((x, y, loss_mask))
     }
@@ -405,5 +577,23 @@ mod tests {
             n += 1;
         }
         assert!(n >= 8, "expected a dense sample set, got {n}");
+    }
+
+    #[test]
+    fn flash_buffer_is_contiguous() {
+        let mut b = SovereignFlashBuffer::new(64).unwrap();
+        for i in 0..80u32 {
+            b.push(i, 1);
+        }
+        assert_eq!(b.len(), 64);
+        b.compact();
+        let span = b.token_span();
+        assert_eq!(span.len(), 64);
+        assert_eq!(span[0], 16);
+        assert_eq!(span[63], 79);
+        b.drain_front(4);
+        assert_eq!(b.token_span()[0], 20);
+        b.clear();
+        assert!(b.is_empty());
     }
 }

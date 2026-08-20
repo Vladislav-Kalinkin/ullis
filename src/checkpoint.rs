@@ -75,11 +75,29 @@ pub fn save(
                 });
                 payload.extend_from_slice(&bytes);
             }
+            NamedBlob::I8 {
+                codes,
+                scale,
+                shape,
+            } => {
+                let start = payload.len() as u64;
+                payload.extend_from_slice(&codes);
+                let scale_bytes = f32_to_le(&scale);
+                payload.extend_from_slice(&scale_bytes);
+                metas.push(TensorMeta {
+                    name,
+                    dtype: "i8".into(),
+                    shape,
+                    offset: start,
+                    nbytes: (codes.len() + scale_bytes.len()) as u64,
+                    packed: false,
+                });
+            }
         }
     }
     let packed = model.blocks.iter().any(|b| b.ff.packed);
     let header = Header {
-        engine: "Ullis AI Engine v0.7".into(),
+        engine: "Ullis AI Engine v0.8".into(),
         config: model.cfg.clone(),
         tokenizer: tokenizer.to_json(),
         phase,
@@ -148,6 +166,14 @@ pub fn load(path: impl AsRef<Path>, device: SovereignDevice) -> Result<Loaded> {
             let n: usize = meta.shape.iter().product();
             let codes = unpack_ternary(bytes, n);
             apply_packed(&mut model, &meta.name, &codes, &meta.shape)?;
+        } else if meta.dtype == "i8" && meta.name == "embed" {
+            let n: usize = meta.shape.iter().product();
+            if bytes.len() < n {
+                bail!("embed i8 overruns payload");
+            }
+            let codes = &bytes[..n];
+            let scale = le_to_f32(&bytes[n..]);
+            model.load_i8_embed(codes, &scale, &meta.shape)?;
         } else {
             let v = le_to_f32(bytes);
             if let Err(e) = model.load_blob(&meta.name, &v, &meta.shape) {
@@ -155,11 +181,7 @@ pub fn load(path: impl AsRef<Path>, device: SovereignDevice) -> Result<Loaded> {
             }
         }
     }
-    if !header
-        .tensors
-        .iter()
-        .any(|t| t.name.contains("inv_widths"))
-    {
+    if !header.tensors.iter().any(|t| t.name.contains("inv_widths")) {
         model.sync_grids();
     }
     Ok(Loaded {

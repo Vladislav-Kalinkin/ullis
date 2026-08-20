@@ -1,4 +1,4 @@
-//! Ullis v0.7 Cognitive Core — fused Metal MoB-KAN + Accelerate SME.
+//! Ullis v0.8 Deep Context — WordPiece V=8192, packed-i8 embed, flash buffer.
 //!
 //! # Compilation graph
 //! ```text
@@ -21,9 +21,9 @@
 //!   (`DIALOGUE_TURN_CAP=6`, `DIALOGUE_CHAR_CAP=3072`). Never stores thinking.
 //! - `ReasoningScratch` — ephemeral think tokens/text. `clear()`/`wipe()` zeros,
 //!   drops, and `shrink_to_fit`s the instant the output stream ends.
-//! - `JsonlStream` `VecDeque<u32>` token ring, cap 32 768 ids (~128 KB), O(seq_len)
+//! - `JsonlStream` `SovereignFlashBuffer` token ring, cap 32 768 ids (~128 KB), O(seq_len)
 //!   independent of corpus size. JSONL via `BufReader` + `serde_json`.
-//! - Working set: `d=32`, `L=3`, `G=12`, `V=4096`, `T=96`, `B=4`, SGD (no Adam).
+//! - Working set: `d=32`, `L=3`, `G=12`, `V=8192`, `T=96`, `B=4`, SGD (no Adam).
 //!
 //! # Gauss–Jordan GPU solver (`gauss::mps_safe_solve`)
 //! Grid lift G=4→8→12 samples `M=max(64,16G)` points and solves
@@ -43,7 +43,7 @@ use ullis::train::{run_smoke, train, TrainArgs};
 #[command(
     name = "ullis",
     version,
-    about = "Ullis AI Engine v0.7 Cognitive — fused Metal MoB-KAN / Accelerate SME"
+    about = "Ullis AI Engine v0.8 Deep Context — WordPiece V=8192 / packed-i8 embed"
 )]
 struct Cli {
     #[command(subcommand)]

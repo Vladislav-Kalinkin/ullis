@@ -19,7 +19,7 @@ the output stream ends.
 | Surface                 | Number          | Notes                                                           |
 | ----------------------- | --------------- | --------------------------------------------------------------- |
 | Pre-training throughput | **~7500 tok/s** | 4-phase ternary QAT, Metal, defaults `d=32 L=3 G=4→12 T=96 B=4` |
-| Deep inference RSS      | **< 35 MB**     | `xhigh` resonance included; think scratch is ephemeral          |
+| Deep inference RSS      | **< 15 MB**     | packed-i8 embed, last-token logits; think scratch is ephemeral  |
 | Unified memory          | **8 GB M1**     | SGD (no Adam states); JSONL I/O independent of corpus size      |
 
 Working set is designed to stay **flat**: dialogue cache never stores
@@ -84,13 +84,13 @@ Colors honor `NO_COLOR` and non-TTY stdout. Persistent dialogue keeps only
 
 | Module       | Role                                                          |
 | ------------ | ------------------------------------------------------------- |
-| `quant`      | TWN threshold, STE, 2-bit pack/unpack                         |
+| `quant`      | TWN 2-bit pack/unpack + packed-i8 embedding plane             |
 | `gauss`      | G×G Gauss–Jordan (`matmul` / broadcast / `cat`, Metal-safe)   |
 | `kan`        | `TernaryKanLinear` + ReLU-bump basis + MoB router             |
 | `mixers`     | `CausalShift` (0 params) / tiny causal attention              |
-| `model`      | `UllisKan`: embed → L × (shift + KAN) → RMSNorm → tied logits |
-| `tokenizer`  | Byte-level BPE, vocab 4096, code-seeded merges                |
-| `data`       | 4-key JSONL, `VecDeque` token ring                            |
+| `model`      | `UllisKan`: i8 embed → L × (shift + KAN) → RMSNorm → i8 logits|
+| `tokenizer`  | Byte-fallback WordPiece, vocab 8192                           |
+| `data`       | 4-key JSONL, `SovereignFlashBuffer` token ring                |
 | `think`      | budgets, ephemeral GC, dialogue cache                         |
 | `train`      | 4-phase QAT, G = 4→8→12 projection, masked CE                 |
 | `checkpoint` | `packed.bin` (magic `ULLIS03`)                                |

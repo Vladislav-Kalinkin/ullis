@@ -79,7 +79,7 @@ impl Default for TrainConfig {
             batch_size: 4,
             mixer: "shift".into(),
             n_heads: 1,
-            vocab_size: 4096,
+            vocab_size: 8192,
             lr: 3e-3,
             lr_qat: 1e-3,
             lr_harden: 3e-4,
