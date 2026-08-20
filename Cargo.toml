@@ -1,0 +1,150 @@
+[package]
+name = "ullis"
+version = "0.5.0"
+edition = "2021"
+description = "Ullis AI Engine v0.5 — visual reasoning ternary KAN in Rust (Candle + Metal)"
+license = "AGPL-3.0-only"
+default-run = "ullis"
+rust-version = "1.80"
+readme = "README.md"
+keywords = ["kan", "ternary", "metal", "llm"]
+categories = ["science"]
+repository = "https://github.com/vladislav-kalinkin/ullis"
+publish = false
+
+[lib]
+name = "ullis"
+path = "src/lib.rs"
+
+[[bin]]
+name = "ullis"
+path = "src/main.rs"
+
+[features]
+default = ["metal"]
+metal = ["candle-core/metal", "candle-nn/metal"]
+accelerate = ["candle-core/accelerate", "candle-nn/accelerate"]
+
+[dependencies]
+anyhow = "1"
+candle-core = "0.11.0"
+candle-nn = "0.11.0"
+clap = { version = "4.5", features = ["derive"] }
+rand = "0.9"
+regex = "1.11"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[target.'cfg(target_os = "macos")'.dependencies]
+mach2 = "0.4"
+
+[lints.rust]
+unsafe_code = "deny"
+missing_debug_implementations = "allow"
+trivial_casts = "deny"
+trivial_numeric_casts = "deny"
+unused_lifetimes = "deny"
+unused_qualifications = "deny"
+elided_lifetimes_in_paths = "deny"
+absolute_paths_not_starting_with_crate = "deny"
+explicit_outlives_requirements = "deny"
+keyword_idents_2018 = "deny"
+keyword_idents_2024 = "deny"
+macro_use_extern_crate = "deny"
+meta_variable_misuse = "deny"
+missing_abi = "deny"
+non_ascii_idents = "deny"
+noop_method_call = "deny"
+single_use_lifetimes = "deny"
+unreachable_pub = "warn"
+unused_import_braces = "deny"
+unused_must_use = { level = "deny", priority = 1 }
+unused_imports = { level = "deny", priority = 1 }
+dead_code = { level = "deny", priority = 1 }
+unsafe_op_in_unsafe_fn = "deny"
+let_underscore_drop = "allow"
+unused_macro_rules = "deny"
+redundant_lifetimes = "deny"
+ambiguous_glob_reexports = "deny"
+
+[lints.clippy]
+all = { level = "deny", priority = -1 }
+pedantic = { level = "deny", priority = -1 }
+nursery = { level = "deny", priority = -1 }
+cargo = { level = "warn", priority = -1 }
+restriction = { level = "allow", priority = -1 }
+module_name_repetitions = "allow"
+must_use_candidate = "allow"
+missing_errors_doc = "allow"
+missing_panics_doc = "allow"
+doc_markdown = "allow"
+# Numeric / tensor code is unreadable under these pedantic rules.
+many_single_char_names = "allow"
+similar_names = "allow"
+cast_possible_truncation = "allow"
+cast_precision_loss = "allow"
+cast_sign_loss = "allow"
+cast_possible_wrap = "allow"
+cast_lossless = "allow"
+float_cmp = "allow"
+unreadable_literal = "allow"
+too_many_lines = "allow"
+too_many_arguments = "allow"
+cognitive_complexity = "allow"
+unnecessary_wraps = "allow"
+missing_const_for_fn = "allow"
+single_match_else = "allow"
+range_plus_one = "allow"
+if_same_then_else = "allow"
+option_if_let_else = "allow"
+needless_range_loop = "allow"
+suboptimal_flops = "allow"
+redundant_closure_for_method_calls = "allow"
+vec_init_then_push = "allow"
+needless_pass_by_value = "allow"
+use_self = "allow"
+map_unwrap_or = "allow"
+implicit_hasher = "allow"
+type_complexity = "allow"
+from_iter_instead_of_collect = "allow"
+cloned_instead_of_copied = "allow"
+manual_let_else = "allow"
+redundant_pub_crate = "allow"
+items_after_statements = "allow"
+return_self_not_must_use = "allow"
+option_option = "allow"
+struct_excessive_bools = "allow"
+fn_params_excessive_bools = "allow"
+wildcard_imports = "allow"
+module_inception = "allow"
+missing_fields_in_debug = "allow"
+tuple_array_conversions = "allow"
+explicit_counter_loop = "allow"
+if_then_some_else_none = "allow"
+equatable_if_let = "allow"
+redundant_clone = "allow"
+unused_self = "allow"
+ref_option = "allow"
+elidable_lifetime_names = "allow"
+needless_raw_string_hashes = "allow"
+uninlined_format_args = "allow"
+format_push_string = "allow"
+manual_is_variant_and = "allow"
+manual_midpoint = "allow"
+option_as_ref_deref = "allow"
+ignored_unit_patterns = "allow"
+assigning_clones = "allow"
+manual_div_ceil = "allow"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+opt-level = 3
+panic = "abort"
+strip = "symbols"
+overflow-checks = false
+
+[profile.dev]
+opt-level = 1
+overflow-checks = true
+debug-assertions = true

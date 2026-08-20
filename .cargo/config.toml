@@ -1,0 +1,5 @@
+# Package-local aliases. Do NOT set rustflags=-Dwarnings here:
+# that flag is inherited by Candle/Metal and will fail the dependency graph.
+[alias]
+lint = "clippy --all-targets --tests --benches --examples"
+ci = "clippy --all-targets --tests"
