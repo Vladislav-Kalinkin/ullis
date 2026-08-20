@@ -101,34 +101,6 @@ Design matrix: [`DESIGN.md`](DESIGN.md).
 
 ---
 
-## License — AGPL-3.0 (sovereign)
+## License — MIT
 
-Ullis is free software under the **GNU Affero General Public License v3.0
-only**. See [`LICENSE`](LICENSE).
-
-Sovereign constraints, in short:
-
-- You may run, study, and modify Ullis.
-- If you **convey** a binary or a modified version, you must provide the
-  corresponding source under AGPL-3.0.
-- If you run a **modified Ullis as a network service** (chat endpoint,
-  hosted REPL, SaaS wrapper), AGPL §13 requires you to offer that same
-  corresponding source to remote users — no silent proprietary fork.
-- No additional royalty, trademark grant, or patent retaliation. Warranty
-  is disclaimed (§15–16).
-
-Commercial closed-source redistribution is incompatible with this license.
-
-```
-Ullis AI Engine — ternary Kolmogorov–Arnold visual reasoning stream.
-Copyright (C) 2026  Ullis contributors
-
-This program is free software: you can redistribute it and/or modify
-it under the terms of the GNU Affero General Public License as published
-by the Free Software Foundation, version 3 of the License.
-
-This program is distributed in the hope that it will be useful,
-but WITHOUT ANY WARRANTY; without even the implied warranty of
-MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-GNU Affero General Public License for more details.
-```
+Ullis is open-source software licensed under the **MIT License**. See [`LICENSE`](LICENSE).
