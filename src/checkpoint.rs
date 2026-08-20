@@ -5,13 +5,14 @@ use std::io::{Read, Write};
 use std::path::Path;
 
 use anyhow::{bail, Context, Result};
-use candle_core::{DType, Device, Tensor};
 use serde::{Deserialize, Serialize};
 
 use crate::config::TrainConfig;
+use crate::device::SovereignDevice;
 use crate::kan::NamedBlob;
 use crate::model::UllisKan;
 use crate::quant::{pack_ternary, unpack_ternary};
+use crate::tensor::SovereignTensor;
 use crate::tokenizer::{BpeTokenizer, TokenizerJson};
 
 pub const MAGIC: &[u8; 8] = b"ULLIS03\n";
@@ -51,14 +52,12 @@ pub fn save(
     let mut metas = Vec::new();
     for (name, blob) in blobs {
         match blob {
-            NamedBlob::F32(t) => {
-                let cpu = t.to_device(&Device::Cpu)?.to_dtype(DType::F32)?;
-                let v = cpu.flatten_all()?.to_vec1::<f32>()?;
-                let bytes = f32_to_le(&v);
+            NamedBlob::F32 { data, shape } => {
+                let bytes = f32_to_le(&data);
                 metas.push(TensorMeta {
                     name,
                     dtype: "f32".into(),
-                    shape: t.dims().to_vec(),
+                    shape,
                     offset: payload.len() as u64,
                     nbytes: bytes.len() as u64,
                     packed: false,
@@ -80,7 +79,7 @@ pub fn save(
     }
     let packed = model.blocks.iter().any(|b| b.ff.packed);
     let header = Header {
-        engine: "Ullis AI Engine v0.5".into(),
+        engine: "Ullis AI Engine v0.7".into(),
         config: model.cfg.clone(),
         tokenizer: tokenizer.to_json(),
         phase,
@@ -105,7 +104,7 @@ pub struct Loaded {
     pub phase: u8,
 }
 
-pub fn load(path: impl AsRef<Path>, device: &Device) -> Result<Loaded> {
+pub fn load(path: impl AsRef<Path>, device: SovereignDevice) -> Result<Loaded> {
     let path = path.as_ref();
     let mut f = File::open(path).with_context(|| format!("open {}", path.display()))?;
     let mut magic = [0u8; 8];
@@ -148,14 +147,20 @@ pub fn load(path: impl AsRef<Path>, device: &Device) -> Result<Loaded> {
         if meta.packed {
             let n: usize = meta.shape.iter().product();
             let codes = unpack_ternary(bytes, n);
-            apply_packed(&mut model, &meta.name, &codes, &meta.shape, device)?;
+            apply_packed(&mut model, &meta.name, &codes, &meta.shape)?;
         } else {
             let v = le_to_f32(bytes);
-            let t = Tensor::from_vec(v, meta.shape.as_slice(), device)?;
-            if let Err(e) = model.load_blob(&meta.name, &t) {
+            if let Err(e) = model.load_blob(&meta.name, &v, &meta.shape) {
                 eprintln!("ullis: skip {}: {e}", meta.name);
             }
         }
+    }
+    if !header
+        .tensors
+        .iter()
+        .any(|t| t.name.contains("inv_widths"))
+    {
+        model.sync_grids();
     }
     Ok(Loaded {
         model,
@@ -164,14 +169,7 @@ pub fn load(path: impl AsRef<Path>, device: &Device) -> Result<Loaded> {
     })
 }
 
-fn apply_packed(
-    model: &mut UllisKan,
-    name: &str,
-    codes: &[i8],
-    shape: &[usize],
-    device: &Device,
-) -> Result<()> {
-    // names like blocks.{i}.ff.packed_base
+fn apply_packed(model: &mut UllisKan, name: &str, codes: &[i8], shape: &[usize]) -> Result<()> {
     let parts: Vec<&str> = name.split('.').collect();
     if parts.len() < 4 || parts[0] != "blocks" {
         return Ok(());
@@ -181,7 +179,7 @@ fn apply_packed(
         return Ok(());
     }
     let f: Vec<f32> = codes.iter().map(|&c| c as f32).collect();
-    let t = Tensor::from_vec(f, shape, device)?;
+    let t = SovereignTensor::from_vec(shape.to_vec(), f)?;
     let packed = pack_ternary(codes);
     let ff = &mut model.blocks[idx].ff;
     if ff.packed_codes.is_none() {

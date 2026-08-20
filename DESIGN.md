@@ -3,23 +3,114 @@
 Standalone ternary Kolmogorov–Arnold engine. Python/PyTorch is gone.
 Math is a faithful port of Ullis AI Engine v2.0 plus Mixture-of-Bumps.
 
-Framework: **Candle 0.11** (Hugging Face) with native **Metal** on Apple Silicon
-and Accelerate BLAS on CPU. Autodiff is Candle `Var` + `Tensor::backward`.
-STE uses the hardtanh identity trick (no custom kernel, no `unsafe` autograd).
+## v0.7.0 Cognitive Core
+
+Training was underfitting at CE `6.7–7.1` under the rigid `G = 4 → 8 → 12`
+uniform warp and unstructured softmax mixing. Stage 3 replaces that
+optimization plane with three language-agnostic mechanisms:
+
+1. **Continuous non-uniform knot insertion.** Every `N` steps (default 50)
+   in phases 1–2, each KAN layer inserts one knot in the highest
+   residual-energy gap. Spline coefficients are least-squares lifted with
+   the existing Gauss–Jordan solver (`gauss::project_spline_coeffs`). Grid
+   is frozen at QAT. Metal cap remains `G ≤ 16`.
+2. **Adaptive ReLU-bump topology.** Centers stay ordered; per-knot widths
+   are `w_0 = c_1−c_0`, `w_{G−1} = c_{G−1}−c_{G−2}`,
+   `w_g = ½(c_{g+1}−c_{g−1})`. The fused Metal/CPU kernel reads
+   `inv_widths[g]` (buffer 11). EMA `|∂L/∂c_g|` and per-edge spline-grad
+   variance site the next insert on high-curvature regions and leave
+   linear fields sparse.
+3. **Logit entropy penalty.** Masked CE is
+   `L = CE + λ_H H[softmax(z)] + λ_R H[softmax(r)]`
+   with `H[p] = −Σ p log p`, `∂H/∂z_k = −p_k(log p_k + H)`.
+   No language tags. Polarizes vocab mass and the K=3 MoB router.
+
+Memory envelope is unchanged: SGD, no Adam, fused forward, host tape.
+Target remains **< 40 MB RSS** during default training (`d=32 L=3 G≤12
+V=4096 T=96 B=4`).
+
+## v0.6.0 Sovereign Core
+
+Candle is no longer the compute substrate. The execution stack is two
+explicit backends with no AMX assembly and no high-level tensor graph:
+
+| Path | Module | Role |
+| ---- | ------ | ---- |
+| GPU  | `device` | `MTLDevice` + `MTLCommandQueue`; runtime-compiled MSL |
+| Host | `accelerate` | FFI to `Accelerate.framework` (BLAS/vDSP → NEON / SME) |
+| Value | `tensor` | `SovereignTensor` = `Vec<f32>` + Shared `MTLBuffer` |
+
+`unsafe` is confined to `device.rs` (Metal `contents()` mapping) and
+`accelerate.rs` (`extern "C"` Accelerate). The crate lint remains
+`unsafe_code = "deny"`.
+
+### Unified fused kernel
+
+`kernel void ullis_mob_kan_fused_step` is compiled from a source string
+at `SovereignDevice::open`. One threadgroup per token. Threadgroup
+scratch holds `x[in]`, `ψ[in·G]`, and `softmax` gates. There is no
+device allocation for bumps, router logits, or expert stacks.
+
+Forward in one encoder:
+
+```
+ψ_g(x_i) = relu(1 − |x_i − c_g| · inv_width_g)²
+g        = softmax(x W_rᵀ)                         // K=3, skipped if coarse
+Q(w)     = TWN_{δ=0.7 mean|row|}(w)  if phase≥3     // packed: w already ∈ {-1,0,+1}
+y_o      = ⟨x, Q(W_base_o)⟩
+         + ⟨ψ_{0..g_use}, Q(W_shared_o)⟩
+         + Σ_k g_k ⟨ψ_{gs..}, Q(W_routed_{k,o})⟩
+```
+
+TWN is **per output row** (and per expert-row for routed weights), matching
+`scale_base` / `scale_shared` / `scale_routed[K, out]`. STE in this kernel is
+the discrete forward; the hardtanh identity for backward is applied on the
+host optimizer until the train loop is fully ported.
+
+Caps (threadgroup 32 KB): `in ≤ 256`, `G ≤ 16`, `K ≤ 4`. Defaults
+(`d=32`, `G=12`, `K=3`, `B=4`, `T=96`) sit at ~2 KB scratch per token.
+Per-knot `inv_widths` is a length-`G` Shared buffer (buffer 11); it does
+not grow threadgroup scratch.
+
+### Memory envelope (target 40–60 MB train / < 35 MB infer)
+
+Apple Silicon unified memory, `MTLResourceStorageModeShared`. Host `Vec<f32>`
+is the Accelerate source of truth; the Metal buffer is the GPU view of the
+same working set, copied at encode/readback boundaries. Fusion eliminates
+the `[N, in, G]` bump tensor and the `[N, K, out]` expert stack from the
+resident set. SGD (no Adam moments). Token ring 32 768 ids.
+
+### Host fallback
+
+`cblas_sgemm` / `vDSP_*` / `vvexpf` — never handwritten AMX. On M4/M5 the
+Accelerate runtime dispatches SME; on M1–M3, NEON. `MobKanSpec` is `repr(C)`
+and is the same bytes the kernel reads as `constant MobKanSpec&`.
+
+### Autograd
+
+Candle is gone. Forward is fused (Metal or Accelerate). Backward is an
+explicit host tape: RMSNorm, causal shift, MoB-KAN (STE hardtanh gate),
+tied logits, masked CE + Shannon entropy penalty. SGD+momentum clips global grad norm and stores
+velocities as detached `Vec<f32>` (no graph).
+
+---
 
 ## Crate map
 
 | Module       | Role                                                                                |
 | ------------ | ----------------------------------------------------------------------------------- |
+| `device`     | `SovereignDevice`: MTLDevice/queue, fused MSL compile, Shared buffer map            |
+| `tensor`     | `SovereignTensor`: host `Vec<f32>` + isolated `MTLBuffer`, pipeline ownership       |
+| `accelerate` | Accelerate FFI (`cblas_sgemm`, vDSP, `vvexpf`) + CPU fused MoB-KAN                  |
 | `quant`      | TWN threshold, STE, 2-bit pack/unpack (`u8` bit-shifts)                             |
-| `gauss`      | G×G Gauss–Jordan (`matmul`/`broadcast` only, G ≤ 12)                                |
-| `kan`        | `TernaryKanLinear` + ReLU-bump basis + MoB router                                   |
+| `gauss`      | G×G Gauss–Jordan (`matmul`/`broadcast` only, G ≤ 16)                                |
+| `kan`        | `TernaryKanLinear` + non-uniform ReLU-bumps + MoB router + knot insert               |
 | `mixers`     | `CausalShift` (0 params) / tiny causal attention                                    |
 | `model`      | `UllisKan`: embed → L × (shift + KAN) → RMSNorm → tied logits                       |
 | `tokenizer`  | Byte-level BPE, vocab 4096, code-seeded merges                                      |
 | `data`       | 4-key JSONL (`system/user/thinking/output`) via `serde_json`, `VecDeque` token ring |
 | `think`      | `--thinking` budgets, ephemeral reasoning GC, dialogue cache                        |
-| `train`      | 4-phase QAT, G = 4→8→12 projection, SGD+momentum, masked CE on thinking+output      |
+| `train`      | 4-phase QAT, continuous knot insert, SGD+momentum, CE+entropy on thinking+output    |
 | `checkpoint` | Self-contained `packed.bin` (magic `ULLIS03`, loads v0.3 weights)                   |
 | `telemetry`  | `mach_task_self` / `task_info` RSS, tok/s, ternary histogram                        |
 | `chat`       | ANSI visual REPL: dim think stream, `└──`, bold-green output                        |
@@ -38,7 +129,7 @@ Edge function (unchanged from v2):
 
 ```
 φ_ji(x_i) = a_ji x_i + Σ_g b_jig ψ_g(x_i)
-ψ_g(x)    = relu(1 − |x − c_g| / w)²
+ψ_g(x)    = relu(1 − |x − c_g| / w_g)²
 ```
 
 `ψ` is a quadratic ReLU bump, not a Cox–de Boor B-spline. Mixing is a
@@ -55,26 +146,47 @@ dense `F.linear` over flattened basis `[in · G] → out`. `bias = false`.
 | 12  | 8      | 4      |
 
 - **Shared bumps** always fire (syntax / grammar / keywords).
-- **Routed bumps** have `K = 3` expert coefficient slices (python / rust / bash).
+- **Routed bumps** have `K = 3` expert coefficient slices. Polarization is
+  driven by the router entropy penalty, not by language labels.
 - Per-token micro-router: `softmax(x W_rᵀ)`, `W_r ∈ R^{K × in}` (tiny, FP32).
 - Routed contribution is one batched GEMM: `[N, in·G_r] × [K·out, in·G_r]`,
   then `Σ_k g_k · y_k`. No language flags; the prompt tokens are the signal.
 
 Disable with `--no-moe` to recover the exact v2 edge function.
 
-### Dynamic grid
+### Dynamic non-uniform grid
 
-Training starts at `G = 4`. At the warmup midpoint the spline coefficients
-are least-squares lifted onto `G = 8`, then onto `G = 12` at sparsify.
-Projection: sample `M = max(64, 16G)` points, form `Ψ_newᵀ Ψ_new b' = Ψ_newᵀ Ψ_old b`.
-The G×G solve is Gauss–Jordan with ridge `1e-6 · mean(diag)` — elementwise /
-broadcast / `cat` only, so it stays on Metal. Frozen from QAT onward.
+Training starts at `G = 4`. Every `knot_insert_every` steps (default 50)
+during warmup and sparsify the layer inserts **one** knot at the midpoint
+of the gap that maximises
+`(EMA|∂L/∂c_g| + EMA|∂L/∂c_{g+1}|) · (c_{g+1}−c_g) · mean(edge_var)`.
+Coefficients are least-squares lifted onto the new (non-uniform) knot
+vector: sample `M = max(64, 16G)` points, form
+`Ψ_newᵀ Ψ_new b' = Ψ_newᵀ Ψ_old b` with per-knot bump widths.
+The G×G solve is Gauss–Jordan with ridge `1e-6 · mean(diag)`. After each
+SGD step, centers are projected back onto a strictly ordered chain and
+widths are rebuilt from spacing. Frozen from QAT onward. Uniform
+`extend_grid(G)` remains for smoke / legacy jumps.
+
+### Entropy-regularized masked CE
+
+Loss on the thinking+output span:
+
+```
+L = mean_mask[ −log p_{y} + λ_H H(p) ] + λ_R mean H(g) + λ_1 ‖w‖_1
+H(p) = −Σ_j p_j log p_j
+∂H/∂z_k = −p_k (log p_k + H)
+```
+
+Defaults `λ_H = 0.03`, `λ_R = 0.05`. This is not a language classifier:
+high-entropy vocab rows and indecisive MoB gates are penalized, so the
+router polarizes without hardcoded syntax or language flags.
 
 ### 4-phase ternary QAT
 
 | Phase | Name     | Weights                                    | Grid   | LR     |
 | ----- | -------- | ------------------------------------------ | ------ | ------ |
-| 1     | warmup   | FP `a`,`b`,centers                         | 4 → 8  | `3e-3` |
+| 1     | warmup   | FP `a`,`b`,centers                         | 4 → …  | `3e-3` |
 | 2     | sparsify | + L1 on `a`,`b`                            | → 12   | `3e-3` |
 | 3     | qat      | STE ternary, TWN `δ = 0.7·mean(            | w_row  | )`     | frozen | `1e-3` |
 | 4     | harden   | freeze `a`,`b`; train scales / RMS / embed | frozen | `3e-4` |
@@ -109,7 +221,9 @@ Packed as:
 ```
 
 Loss is masked onto the `thinking` + `output` span so the KAN layer learns
-the reasoning trajectory. Legacy `{"text","lang"}` lines are lifted in-stream.
+the reasoning trajectory, plus the entropy penalty above. Legacy
+`{"text","lang"}` lines are lifted in-stream (the `lang` key is never a
+training target).
 Token ring is a `VecDeque<u32>` capped at 32 768 ids (~128 KB).
 
 ## Thinking mode

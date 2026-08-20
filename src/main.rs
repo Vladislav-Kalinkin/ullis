@@ -1,4 +1,4 @@
-//! Ullis v0.5 — ternary MoE-KAN visual reasoning engine (Candle + Metal).
+//! Ullis v0.7 Cognitive Core — fused Metal MoB-KAN + Accelerate SME.
 //!
 //! # Compilation graph
 //! ```text
@@ -7,7 +7,7 @@
 //!             RMSNorm → causal mixer (shift | 1-head attn)
 //!             RMSNorm → TernaryKanLinear  φ_ji = a_ji x_i + Σ_g b_jig ψ_g(x_i)
 //!                       ψ_g = relu(1 − |x − c_g|/w)²
-//!                       G split shared/routed (MoB): G=4→(3,1)  G=8→(6,2)  G=12→(8,4)
+//!                       G split shared/routed (MoB); non-uniform knot insert G=4…12
 //!                       router softmax(x W_rᵀ), K=3 (python|rust|bash)
 //!                       --thinking xhigh: +3 residual KAN loops (mixer once)
 //!          }
@@ -43,7 +43,7 @@ use ullis::train::{run_smoke, train, TrainArgs};
 #[command(
     name = "ullis",
     version,
-    about = "Ullis AI Engine v0.5 — visual reasoning ternary KAN (Rust / Metal)"
+    about = "Ullis AI Engine v0.7 Cognitive — fused Metal MoB-KAN / Accelerate SME"
 )]
 struct Cli {
     #[command(subcommand)]

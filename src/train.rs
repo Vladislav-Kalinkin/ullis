@@ -2,13 +2,12 @@ use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 use anyhow::Result;
-use candle_core::DType;
 use clap::Args;
 
 use crate::checkpoint;
-use crate::config::{grid_target, TrainConfig};
+use crate::config::{next_grid_size, TrainConfig};
 use crate::data::JsonlStream;
-use crate::device::{device_name, scalar_f32, setup_device, synchronize};
+use crate::device::{device_name, setup_device, synchronize};
 use crate::model::UllisKan;
 use crate::optim::SgdMomentum;
 use crate::seed::{corpus_texts, ensure_jsonl};
@@ -63,6 +62,15 @@ pub struct TrainArgs {
     /// Disable Mixture-of-Bumps (recover the v2 all-shared edge function).
     #[arg(long, default_value_t = false)]
     pub no_moe: bool,
+    /// Vocab-softmax Shannon entropy penalty (language-agnostic).
+    #[arg(long, default_value_t = 0.03)]
+    pub entropy_coef: f64,
+    /// MoB router Shannon entropy penalty.
+    #[arg(long, default_value_t = 0.05)]
+    pub router_entropy_coef: f64,
+    /// Insert one non-uniform knot every N steps (phases 1–2). 0 disables.
+    #[arg(long, default_value_t = 50)]
+    pub knot_every: usize,
     #[arg(long)]
     pub cpu: bool,
 }
@@ -92,6 +100,9 @@ impl TrainArgs {
             log_every: self.log_every,
             data_path: self.data.to_string_lossy().into_owned(),
             moe: !self.no_moe,
+            entropy_coef: self.entropy_coef,
+            router_entropy_coef: self.router_entropy_coef,
+            knot_insert_every: self.knot_every,
             ..TrainConfig::default()
         }
     }
@@ -129,7 +140,7 @@ pub fn train(args: TrainArgs) -> Result<PathBuf> {
         format_cfg(&cfg)
     );
 
-    let mut model = UllisKan::new(cfg.clone(), &device)?;
+    let mut model = UllisKan::new(cfg.clone(), device)?;
     println!("{}", model.param_report());
 
     let ckpt_dir = PathBuf::from(&cfg.ckpt_dir);
@@ -140,53 +151,37 @@ pub fn train(args: TrainArgs) -> Result<PathBuf> {
         let epochs = epochs_of(&cfg);
         let lr = lr_of(&cfg);
         model.set_phase(phase)?;
-        let mut opt =
-            SgdMomentum::new(model.trainable_vars(phase), lr, cfg.momentum, cfg.max_norm)?;
+        let mut opt = SgdMomentum::new(&model, phase, lr, cfg.momentum, cfg.max_norm)?;
         println!(
             "\n== phase {phase} {name} epochs={epochs} lr={lr} G={} ==",
             model.cfg.n_basis
         );
         let t0 = Instant::now();
         let mut thru = Throughput::new();
+        let mut global_step = 0usize;
 
         for epoch in 0..epochs {
-            if let Some(target) = maybe_grid(&mut model, &mut cfg, phase, epoch) {
-                println!("  grid G -> {target} (vectorized Gauss–Jordan projection)");
-                opt =
-                    SgdMomentum::new(model.trainable_vars(phase), lr, cfg.momentum, cfg.max_norm)?;
-                println!("  {}", model.param_report());
-            }
             let mut running = 0.0f32;
             let mut n_seen = 0u32;
             thru.reset();
 
             for step in 0..cfg.steps_per_epoch {
                 let lv = {
-                    let (x, y, mask) = stream.next_batch(cfg.batch_size, &device)?;
-                    let logits = model.forward(&x)?;
-                    let (b, t, v) = logits.dims3()?;
-                    let mut loss = crate::data::masked_cross_entropy(
-                        &logits.reshape((b * t, v))?,
-                        &y.flatten_all()?,
-                        &mask.flatten_all()?,
-                    )?;
-                    // Drop logits before L1 / backward so the CE graph is the only tape.
-                    drop(logits);
-                    drop(mask);
-                    if phase == 2 {
-                        loss = (loss + (model.l1_penalty()? * cfg.l1)?)?;
-                    }
-                    let grads = loss.backward()?;
-                    let lv = scalar_f32(&loss)?;
-                    drop(loss);
-                    opt.step(&grads)?;
-                    drop(grads);
-                    drop(x);
-                    drop(y);
+                    let (x, y, mask) = stream.next_batch(cfg.batch_size)?;
+                    let l1 = if phase == 2 { cfg.l1 as f32 } else { 0.0 };
+                    let lv = model.train_step(&x, &y, &mask, cfg.batch_size, cfg.seq_len, l1)?;
+                    opt.step(&mut model, phase)?;
                     lv
                 };
-                // Return Metal command-buffer scratch to the pool this step.
-                synchronize(&device)?;
+                synchronize(&model.device)?;
+                global_step += 1;
+                if let Some(g) = maybe_insert(&mut model, &mut cfg, phase, global_step) {
+                    println!(
+                        "  knot insert G -> {g} (non-uniform Gauss–Jordan, residual-energy site)"
+                    );
+                    opt = SgdMomentum::new(&model, phase, lr, cfg.momentum, cfg.max_norm)?;
+                    println!("  {}", model.param_report());
+                }
 
                 running += lv;
                 n_seen += 1;
@@ -196,7 +191,10 @@ pub fn train(args: TrainArgs) -> Result<PathBuf> {
                     let stats = model.ternary_stats()?;
                     let avg = running / n_seen.max(1) as f32;
                     println!(
-                        "  {name} e{epoch} s{step:04} loss={avg:.4} rss={:.1}MB tok/s={:.0} G={} zero={:.2} +={:.2} -={:.2}",
+                        "  {name} e{epoch} s{step:04} loss={avg:.4} ce={:.4} H={:.3} Hr={:.3} rss={:.1}MB tok/s={:.0} G={} zero={:.2} +={:.2} -={:.2}",
+                        model.last_ce,
+                        model.last_entropy,
+                        model.last_router_entropy,
                         process_memory_mb(),
                         thru.tok_s(),
                         model.cfg.n_basis,
@@ -230,28 +228,26 @@ pub fn train(args: TrainArgs) -> Result<PathBuf> {
     )?;
     println!("packed inference checkpoint -> {}", packed_path.display());
     println!("{}", model.param_report());
-    let _ = DType::F32;
     Ok(packed_path)
 }
 
-fn maybe_grid(
+fn maybe_insert(
     model: &mut UllisKan,
     cfg: &mut TrainConfig,
     phase: u8,
-    epoch: usize,
+    global_step: usize,
 ) -> Option<usize> {
-    if phase >= 3 {
-        return None;
-    }
-    let target = grid_target(cfg, phase, epoch);
+    let target = next_grid_size(cfg, phase, global_step, cfg.n_basis);
     if target <= cfg.n_basis {
         return None;
     }
-    if model.extend_grid(target).is_err() {
-        return None;
+    match model.insert_knot() {
+        Ok(g) => {
+            cfg.n_basis = g;
+            Some(g)
+        }
+        Err(_) => None,
     }
-    cfg.n_basis = target;
-    Some(target)
 }
 
 fn format_cfg(cfg: &TrainConfig) -> String {
@@ -269,12 +265,12 @@ fn write_card(path: &Path, model: &UllisKan, tokenizer: &BpeTokenizer) -> Result
         }
     }
     let card = serde_json::json!({
-        "engine": "Ullis AI Engine v0.5",
+        "engine": "Ullis AI Engine v0.7",
         "config": model.cfg,
         "vocab_size": tokenizer.vocab_size,
         "n_merges": tokenizer.merges.len(),
         "packed_bytes": packed_bytes,
-        "embed_params": model.embed.as_tensor().elem_count(),
+        "embed_params": model.embed.numel(),
         "report": model.param_report(),
     });
     std::fs::write(path, serde_json::to_string_pretty(&card)?)?;
@@ -282,65 +278,72 @@ fn write_card(path: &Path, model: &UllisKan, tokenizer: &BpeTokenizer) -> Result
 }
 
 pub fn run_smoke(cpu: bool) -> Result<()> {
-    use candle_core::{Device, Tensor};
-
     let device = setup_device(!cpu)?;
     println!("smoke device={}", device_name(&device));
 
     let mut rng = crate::device::rng_from_seed(0);
-    let mut layer = crate::kan::TernaryKanLinear::new(16, 8, 4, false, 1, 0.7, &device, &mut rng)?;
-    let x = crate::mixers::randn(&[4, 16], 1.0, &device, &mut rng)?;
+    let mut layer = crate::kan::TernaryKanLinear::new(16, 8, 4, false, 1, 0.7, &mut rng)?;
+    let x = crate::mixers::randn(4 * 16, 1.0, &mut rng);
     layer.set_phase(1)?;
-    let y1 = layer.forward(&x)?;
-    assert_eq!(y1.dims(), &[4, 8]);
+    let y1 = layer.forward(&device, &x, 4)?;
+    assert_eq!(y1.len(), 4 * 8);
 
-    let y_coarse = y1.detach();
+    let y_coarse = y1.clone();
     layer.extend_grid(8)?;
     assert_eq!(layer.n_basis, 8);
-    let y_mid = layer.forward(&x)?;
-    let err_grid = {
-        let d = (y_coarse - y_mid.detach())?.abs()?.mean_all()?;
-        scalar_f32(&d)?
-    };
+    let y_mid = layer.forward(&device, &x, 4)?;
+    let err_grid: f32 = y_coarse
+        .iter()
+        .zip(y_mid.iter())
+        .map(|(a, b)| (a - b).abs())
+        .sum::<f32>()
+        / y_coarse.len() as f32;
     assert!(err_grid < 0.15, "grid 4->8 drifted by {err_grid}");
 
     layer.extend_grid(12)?;
-    let y_fine = layer.forward(&x)?;
-    let loss = y_fine.sqr()?.mean_all()?;
-    let _grads = loss.backward()?;
-    assert!(
-        layer
-            .weight_shared
-            .as_ref()
-            .unwrap()
-            .as_tensor()
-            .elem_count()
-            > 0
-    );
+    let y_fine = layer.forward(&device, &x, 4)?;
+    let n = y_fine.len() as f32;
+    let mut dy: Vec<f32> = y_fine.iter().map(|v| 2.0 * v / n).collect();
+    let _dx = layer.backward(&x, &dy, 4, crate::kan::KanEvalMode::Full)?;
+    assert!(layer.weight_shared.as_ref().unwrap().numel() > 0);
 
     layer.set_phase(3)?;
-    let y3 = layer.forward(&x)?;
-    let loss = y3.sqr()?.mean_all()?;
-    let grads = loss.backward()?;
-    assert!(grads
-        .get(layer.weight_base.as_ref().unwrap().as_tensor())
-        .is_some());
+    layer.zero_grad();
+    let y3 = layer.forward(&device, &x, 4)?;
+    let n = y3.len() as f32;
+    dy = y3.iter().map(|v| 2.0 * v / n).collect();
+    let _ = layer.backward(&x, &dy, 4, crate::kan::KanEvalMode::Full)?;
+    assert!(layer.grad_base.iter().any(|g| *g != 0.0));
 
     let (cb, _, _) = layer.snapshot_codes()?;
     let packed = crate::quant::pack_ternary(&cb);
     let rt = crate::quant::unpack_ternary(&packed, cb.len());
     assert_eq!(rt, cb, "2-bit pack/unpack must be lossless");
 
-    let y_qat = layer.forward(&x)?.detach();
+    let y_qat = layer.forward(&device, &x, 4)?;
     layer.pack()?;
-    let y_pk = layer.forward(&x)?;
-    let err = scalar_f32(&(y_qat - y_pk)?.abs()?.mean_all()?)?;
+    let y_pk = layer.forward(&device, &x, 4)?;
+    let err: f32 = y_qat
+        .iter()
+        .zip(y_pk.iter())
+        .map(|(a, b)| (a - b).abs())
+        .sum::<f32>()
+        / y_qat.len() as f32;
 
-    let gram = Tensor::eye(5, DType::F32, &device)?.affine(2.0, 0.0)?;
-    let rhs = Tensor::arange(0f32, 15f32, &device)?.reshape((5, 3))?;
-    let solved = crate::gauss::mps_safe_solve(&gram, &rhs)?;
-    let recon = gram.matmul(&solved)?;
-    let rec_err = scalar_f32(&(recon - rhs)?.abs()?.mean_all()?)?;
+    let mut gram = vec![0.0f32; 25];
+    for i in 0..5 {
+        gram[i * 5 + i] = 2.0;
+    }
+    let rhs: Vec<f32> = (0..15).map(|i| i as f32).collect();
+    let solved = crate::gauss::solve_square(&gram, 5, &rhs, 3)?;
+    let mut recon = vec![0.0f32; 15];
+    crate::accelerate::sgemm(5, 3, 5, 1.0, &gram, &solved, 0.0, &mut recon)?;
+    let rec_err: f32 = recon
+        .iter()
+        .zip(rhs.iter())
+        .map(|(a, b)| (a - b).abs())
+        .sum::<f32>()
+        / 15.0;
     assert!(rec_err < 1e-3, "gauss-jordan residual {rec_err}");
 
     let texts = corpus_texts(80, 0);
@@ -361,32 +364,31 @@ pub fn run_smoke(cpu: bool) -> Result<()> {
         moe: false,
         ..TrainConfig::default()
     };
-    let mut model = UllisKan::new(cfg.clone(), &device)?;
+    let mut model = UllisKan::new(cfg.clone(), device)?;
     model.set_phase(1)?;
-    let ids_t = Tensor::from_vec(
-        (0u32..48).map(|i| i % tok.vocab_size).collect::<Vec<_>>(),
-        (2, 24),
-        &device,
-    )?;
-    let logits = model.forward(&ids_t)?;
-    assert_eq!(logits.dims(), &[2, 24, tok.vocab_size as usize]);
+    let ids_t: Vec<u32> = (0u32..48).map(|i| i % tok.vocab_size).collect();
+    let logits = model.forward(&ids_t, 2, 24)?;
+    assert_eq!(logits.len(), 2 * 24 * tok.vocab_size as usize);
     model.extend_grid(8)?;
     cfg.n_basis = 8;
     model.set_phase(4)?;
     model.pack()?;
     let mut rng = crate::device::rng_from_seed(0);
     let _ = model.generate_stream_pieces("def run(", &mut tok, 8, 0.0, &mut rng)?;
-    let y_full = model.forward(&ids_t)?;
-    let y_coarse = model.forward_mode(&ids_t, crate::kan::KanEvalMode::Coarse)?;
-    assert_eq!(y_full.dims(), y_coarse.dims());
-    drop(y_full);
-    drop(y_coarse);
+    let y_full = model.forward(&ids_t, 2, 24)?;
+    let y_coarse = model.forward_mode(
+        &ids_t,
+        2,
+        24,
+        crate::kan::KanEvalMode::Coarse,
+        false,
+    )?;
+    assert_eq!(y_full.len(), y_coarse.len());
 
     println!(
         "smoke ok device={} packed_err={err:.2e} grid_err={err_grid:.2e} {}",
-        device_name(&device),
+        device_name(&model.device),
         model.param_report()
     );
-    let _ = Device::Cpu;
     Ok(())
 }

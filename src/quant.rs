@@ -1,58 +1,34 @@
 //! Ternary codes {-1, 0, +1} via STE, plus 2-bit pack/unpack.
 
-use anyhow::{bail, Result};
-use candle_core::{DType, Tensor, D};
+use anyhow::Result;
 
-/// Per-output-row TWN threshold: δ = ratio · mean(|w_row|).
-pub fn row_delta(weight: &Tensor, ratio: f64) -> Result<Tensor> {
-    let dims = weight.dims();
-    if dims.len() < 2 {
-        let mean = weight.abs()?.mean_all()?;
-        return Ok((mean * ratio)?);
-    }
-    let out = dims[0];
-    let rest: usize = dims[1..].iter().product();
-    let row = weight.reshape((out, rest))?;
-    let delta = (row.abs()?.mean_keepdim(1)? * ratio)?; // [out, 1]
-    let mut view = vec![out];
-    view.extend(std::iter::repeat(1).take(dims.len() - 1));
-    Ok(delta.reshape(view)?)
+use crate::accelerate::ternarize_rows;
+
+/// Per-output-row TWN: `δ = ratio · mean(|w_row|)`, codes in `{-1,0,+1}`.
+pub fn ternarize_hard(
+    weight: &[f32],
+    rows: usize,
+    cols: usize,
+    delta_ratio: f64,
+) -> Result<Vec<f32>> {
+    let mut out = vec![0.0f32; weight.len()];
+    ternarize_rows(weight, rows, cols, delta_ratio as f32, &mut out)?;
+    Ok(out)
 }
 
-/// MPS-safe ternary via comparisons (no sign()*mask, which yields -0).
-pub fn ternary_from_threshold(weight: &Tensor, delta: &Tensor) -> Result<Tensor> {
-    let delta = delta.broadcast_as(weight.shape())?;
-    let pos = weight.gt(&delta)?.to_dtype(weight.dtype())?;
-    let neg_thr = delta.neg()?;
-    let neg = weight.lt(&neg_thr)?.to_dtype(weight.dtype())?;
-    Ok((pos - neg)?)
-}
-
-pub fn ternarize_hard(weight: &Tensor, delta_ratio: f64) -> Result<Tensor> {
-    let delta = row_delta(weight, delta_ratio)?;
-    ternary_from_threshold(weight, &delta)
-}
-
-/// Forward: discrete ternary. Backward: hardtanh STE (`|w| ≤ 1`).
-///
-/// `q = clamp(w,-1,1) - detach(clamp(w,-1,1)) + detach(ternary(w))`
-pub fn ternarize_ste(weight: &Tensor, delta_ratio: f64) -> Result<Tensor> {
-    let codes = ternarize_hard(weight, delta_ratio)?.detach();
-    let clamped = weight.clamp(-1.0, 1.0)?;
-    let identity_on_gate = (&clamped - clamped.detach())?;
-    Ok((identity_on_gate + codes)?)
-}
-
-pub fn codes_to_i8(codes: &Tensor) -> Result<Vec<i8>> {
-    let cpu = if codes.device().is_cpu() {
-        codes.clone()
+/// STE gate: identity on `|w| ≤ 1`, zero outside (hardtanh).
+pub fn ste_gate(w: f32) -> f32 {
+    if w.abs() <= 1.0 {
+        1.0
     } else {
-        codes.to_device(&candle_core::Device::Cpu)?
-    };
-    let flat = cpu.flatten_all()?.to_dtype(DType::F32)?.to_vec1::<f32>()?;
-    Ok(flat
-        .into_iter()
-        .map(|v| {
+        0.0
+    }
+}
+
+pub fn codes_to_i8(codes: &[f32]) -> Vec<i8> {
+    codes
+        .iter()
+        .map(|&v| {
             if v > 0.5 {
                 1
             } else if v < -0.5 {
@@ -61,7 +37,7 @@ pub fn codes_to_i8(codes: &Tensor) -> Result<Vec<i8>> {
                 0
             }
         })
-        .collect())
+        .collect()
 }
 
 /// Pack values in {-1,0,+1} into u8, 4 codes per byte (2 bits: 0, 1, 2=-1).
@@ -108,24 +84,6 @@ pub fn unpack_ternary(packed: &[u8], n: usize) -> Vec<i8> {
     out
 }
 
-pub fn pack_codes_tensor(codes: &Tensor) -> Result<Vec<u8>> {
-    Ok(pack_ternary(&codes_to_i8(codes)?))
-}
-
-pub fn unpack_to_tensor(
-    packed: &[u8],
-    shape: &[usize],
-    device: &candle_core::Device,
-) -> Result<Tensor> {
-    let n: usize = shape.iter().product();
-    let codes = unpack_ternary(packed, n);
-    if codes.len() != n {
-        bail!("unpack length {} != {}", codes.len(), n);
-    }
-    let f: Vec<f32> = codes.iter().map(|&c| c as f32).collect();
-    Ok(Tensor::from_vec(f, shape, device)?)
-}
-
 #[derive(Clone, Debug, Default)]
 pub struct TernaryHist {
     pub frac_neg: f32,
@@ -153,6 +111,10 @@ impl TernaryHist {
         }
     }
 
+    pub fn from_f32(codes: &[f32]) -> Self {
+        Self::from_codes(&codes_to_i8(codes))
+    }
+
     pub fn merge(&mut self, other: &Self, n: u32, add: u32) {
         let tot = (n + add).max(1) as f32;
         self.frac_neg = (self.frac_neg * n as f32 + other.frac_neg * add as f32) / tot;
@@ -161,57 +123,29 @@ impl TernaryHist {
     }
 }
 
-pub fn histogram_tensor(codes: &Tensor) -> Result<TernaryHist> {
-    Ok(TernaryHist::from_codes(&codes_to_i8(codes)?))
-}
-
-/// TWN-optimal per-out scale: argmin_α ||w − α · ternary(w)||.
-pub fn fit_scale(weight: &Tensor, delta_ratio: f64) -> Result<Tensor> {
-    let codes = ternarize_hard(weight, delta_ratio)?;
-    let out = weight.dim(0)?;
-    let rest: usize = weight.dims()[1..].iter().product();
-    let w = weight.reshape((out, rest))?;
-    let c = codes.reshape((out, rest))?;
-    let denom = c.abs()?.sum_keepdim(1)?.clamp(1.0, f64::MAX)?;
-    let num = (w.broadcast_mul(&c))?.sum_keepdim(1)?;
-    Ok(num.broadcast_div(&denom)?.reshape(out)?)
-}
-
-pub fn mean_abs(t: &Tensor) -> Result<Tensor> {
-    Ok(t.abs()?.mean_all()?)
-}
-
-/// Convenience: flatten last two dims product for L1.
-pub fn mean_abs_all(tensors: &[&Tensor]) -> Result<Tensor> {
-    let mut acc: Option<Tensor> = None;
-    let mut n = 0usize;
-    for t in tensors {
-        let m = t.abs()?.mean_all()?;
-        acc = Some(match acc {
-            None => m,
-            Some(a) => (a + m)?,
-        });
-        n += 1;
-    }
-    match acc {
-        Some(a) if n > 0 => Ok((a / n as f64)?),
-        _ => {
-            let dev = tensors
-                .first()
-                .map(|t| t.device().clone())
-                .unwrap_or(candle_core::Device::Cpu);
-            Ok(Tensor::zeros((), DType::F32, &dev)?)
+/// TWN-optimal per-row scale: `α = Σ w·q / Σ |q|`.
+pub fn fit_scale(weight: &[f32], rows: usize, cols: usize, delta_ratio: f64) -> Result<Vec<f32>> {
+    let codes = ternarize_hard(weight, rows, cols, delta_ratio)?;
+    let mut scales = vec![1.0f32; rows];
+    for r in 0..rows {
+        let s = r * cols;
+        let mut num = 0.0f32;
+        let mut den = 0.0f32;
+        for j in 0..cols {
+            let q = codes[s + j];
+            num += weight[s + j] * q;
+            den += q.abs();
         }
+        scales[r] = if den > 0.0 { num / den } else { 1.0 };
     }
+    Ok(scales)
 }
 
-pub fn last_dim_product(t: &Tensor) -> Result<usize> {
-    Ok(t.dims().iter().skip(1).product())
-}
-
-#[allow(dead_code)]
-pub fn softmax_last(x: &Tensor) -> Result<Tensor> {
-    candle_nn::ops::softmax(x, D::Minus1).map_err(|e| anyhow::anyhow!(e))
+pub fn mean_abs(t: &[f32]) -> f32 {
+    if t.is_empty() {
+        return 0.0;
+    }
+    t.iter().map(|v| v.abs()).sum::<f32>() / t.len() as f32
 }
 
 #[cfg(test)]
@@ -233,5 +167,12 @@ mod tests {
         assert_eq!(p.len(), 1);
         let u = unpack_ternary(&p, t.len());
         assert_eq!(u, t);
+    }
+
+    #[test]
+    fn ste_gate_hardtanh() {
+        assert_eq!(ste_gate(-1.5), 0.0);
+        assert_eq!(ste_gate(-0.1), 1.0);
+        assert_eq!(ste_gate(1.2), 0.0);
     }
 }

@@ -39,6 +39,31 @@ pub struct TrainConfig {
     /// Mixture-of-Bumps: split G into shared + routed experts.
     pub moe: bool,
     pub n_experts: usize,
+    /// Shannon entropy penalty on vocab softmax (`λ_H`). Language-agnostic.
+    #[serde(default = "default_entropy_coef")]
+    pub entropy_coef: f64,
+    /// Shannon entropy penalty on the K-expert router (`λ_R`).
+    #[serde(default = "default_router_entropy_coef")]
+    pub router_entropy_coef: f64,
+    /// Insert one non-uniform knot every N steps during phases 1–2.
+    #[serde(default = "default_knot_insert_every")]
+    pub knot_insert_every: usize,
+    /// EMA decay for per-knot residual energy / per-edge grad variance.
+    #[serde(default = "default_knot_ema")]
+    pub knot_ema: f64,
+}
+
+fn default_entropy_coef() -> f64 {
+    0.03
+}
+fn default_router_entropy_coef() -> f64 {
+    0.05
+}
+fn default_knot_insert_every() -> usize {
+    50
+}
+fn default_knot_ema() -> f64 {
+    0.9
 }
 
 impl Default for TrainConfig {
@@ -74,6 +99,10 @@ impl Default for TrainConfig {
             data_path: "data/train.jsonl".into(),
             moe: true,
             n_experts: N_EXPERTS,
+            entropy_coef: default_entropy_coef(),
+            router_entropy_coef: default_router_entropy_coef(),
+            knot_insert_every: default_knot_insert_every(),
+            knot_ema: default_knot_ema(),
         }
     }
 }
@@ -111,6 +140,24 @@ pub fn grid_target(cfg: &TrainConfig, phase: u8, epoch: usize) -> usize {
     }
 }
 
+/// Continuous knot scheduler: grow `G` by one every `knot_insert_every` steps
+/// until `grid_final`, frozen from QAT onward. Placement is non-uniform.
+pub fn next_grid_size(cfg: &TrainConfig, phase: u8, global_step: usize, current: usize) -> usize {
+    if phase >= 3 || current >= cfg.grid_final {
+        return current;
+    }
+    if cfg.knot_insert_every == 0 {
+        return current;
+    }
+    if global_step > 0 && global_step % cfg.knot_insert_every == 0 {
+        (current + 1)
+            .min(cfg.grid_final)
+            .min(crate::accelerate::MobKanSpec::MAX_G as usize)
+    } else {
+        current
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -122,6 +169,8 @@ mod tests {
             grid_start: 4,
             grid_mid: 8,
             grid_final: 12,
+            knot_insert_every: 50,
+            n_basis: 4,
             ..TrainConfig::default()
         };
         assert_eq!(grid_target(&cfg, 1, 0), 4);
@@ -129,6 +178,11 @@ mod tests {
         assert_eq!(grid_target(&cfg, 1, 2), 8);
         assert_eq!(grid_target(&cfg, 2, 0), 12);
         assert_eq!(grid_target(&cfg, 3, 0), cfg.n_basis);
+        assert_eq!(next_grid_size(&cfg, 1, 0, 4), 4);
+        assert_eq!(next_grid_size(&cfg, 1, 50, 4), 5);
+        assert_eq!(next_grid_size(&cfg, 1, 49, 4), 4);
+        assert_eq!(next_grid_size(&cfg, 3, 50, 12), 12);
+        assert_eq!(next_grid_size(&cfg, 1, 50, 12), 12);
     }
 
     #[test]

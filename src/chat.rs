@@ -29,7 +29,7 @@ const BANNER: &str = r"
  | |_| | | | \__ \
   \___/  |_|_|___/
 
- Ullis AI Engine v0.5 | Visual Reasoning (Rust / Metal)
+ Ullis AI Engine v0.6 Sovereign | fused Metal MoB-KAN
  type a prefix  ·  language is inferred  ·  /help  /exit
 ";
 
@@ -89,13 +89,13 @@ pub fn run_chat(args: ChatArgs) -> Result<()> {
     let device = setup_device(!args.cpu)?;
     let path = resolve_model(&args.model)?;
     let loaded =
-        checkpoint::load(&path, &device).with_context(|| format!("load {}", path.display()))?;
-    let model = loaded.model;
+        checkpoint::load(&path, device).with_context(|| format!("load {}", path.display()))?;
+    let mut model = loaded.model;
     let mut tokenizer = loaded.tokenizer;
     println!(
         "loaded {} on {}  {}  thinking={}",
         path.display(),
-        device_name(&device),
+        device_name(&model.device),
         model.param_report(),
         args.thinking.as_str()
     );
@@ -103,7 +103,7 @@ pub fn run_chat(args: ChatArgs) -> Result<()> {
         print_banner();
         let mut cache = DialogueCache::new(args.system.clone());
         stream_turn(
-            &model,
+            &mut model,
             &mut tokenizer,
             &mut cache,
             &p,
@@ -114,7 +114,7 @@ pub fn run_chat(args: ChatArgs) -> Result<()> {
         return Ok(());
     }
     repl(
-        &model,
+        &mut model,
         &mut tokenizer,
         args.max_new,
         args.temperature,
@@ -147,7 +147,7 @@ fn use_color() -> bool {
 }
 
 fn stream_turn(
-    model: &UllisKan,
+    model: &mut UllisKan,
     tokenizer: &mut BpeTokenizer,
     cache: &mut DialogueCache,
     user: &str,
@@ -265,7 +265,7 @@ fn trim_ctx(ctx: &mut Vec<u32>, seq_len: usize) {
 }
 
 fn color_stream(
-    model: &UllisKan,
+    model: &mut UllisKan,
     tokenizer: &BpeTokenizer,
     ctx: &mut Vec<u32>,
     paint: &mut PaintScan,
@@ -499,7 +499,7 @@ fn hold_len(s: &str) -> usize {
 }
 
 fn repl(
-    model: &UllisKan,
+    model: &mut UllisKan,
     tokenizer: &mut BpeTokenizer,
     mut max_new: usize,
     mut temperature: f32,

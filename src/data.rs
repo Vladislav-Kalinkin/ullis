@@ -12,7 +12,6 @@ use std::io::{BufRead, BufReader, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
-use candle_core::{DType, Device, Tensor, D};
 use rand::prelude::*;
 use serde::{Deserialize, Serialize};
 
@@ -316,11 +315,7 @@ impl JsonlStream {
         Ok((x, y, loss_mask))
     }
 
-    pub fn next_batch(
-        &mut self,
-        batch: usize,
-        device: &Device,
-    ) -> Result<(Tensor, Tensor, Tensor)> {
+    pub fn next_batch(&mut self, batch: usize) -> Result<(Vec<u32>, Vec<u32>, Vec<u8>)> {
         let mut xs = Vec::with_capacity(batch * self.seq_len);
         let mut ys = Vec::with_capacity(batch * self.seq_len);
         let mut ms = Vec::with_capacity(batch * self.seq_len);
@@ -328,12 +323,9 @@ impl JsonlStream {
             let (x, y, m) = self.next_seq()?;
             xs.extend(x);
             ys.extend(y);
-            ms.extend(m.into_iter().map(u32::from));
+            ms.extend(m);
         }
-        let x = Tensor::from_vec(xs, (batch, self.seq_len), device)?;
-        let y = Tensor::from_vec(ys, (batch, self.seq_len), device)?;
-        let m = Tensor::from_vec(ms, (batch, self.seq_len), device)?;
-        Ok((x, y, m))
+        Ok((xs, ys, ms))
     }
 
     pub fn lines_seen(&self) -> u64 {
@@ -343,18 +335,6 @@ impl JsonlStream {
     pub fn path(&self) -> &Path {
         &self.path
     }
-}
-
-/// Mean token NLL over positions where `mask != 0`. Stays on-device.
-pub fn masked_cross_entropy(logits: &Tensor, targets: &Tensor, mask: &Tensor) -> Result<Tensor> {
-    let (n, _v) = logits.dims2()?;
-    let log_sm = candle_nn::ops::log_softmax(logits, D::Minus1)?;
-    let idx = targets.to_dtype(DType::U32)?.reshape((n, 1))?;
-    let picked = log_sm.gather(&idx, 1)?.reshape(n)?;
-    let m = mask.to_dtype(DType::F32)?.reshape(n)?;
-    let weighted = picked.neg()?.mul(&m)?;
-    let den = m.sum_all()?.clamp(1.0f32, f32::MAX)?;
-    Ok((weighted.sum_all()? / den)?)
 }
 
 #[cfg(test)]
@@ -401,7 +381,11 @@ mod tests {
 
     #[test]
     fn train_jsonl_is_strict_four_key() {
-        let path = "data/train.jsonl";
+        let path = if Path::new("data/thinking-train.jsonl").exists() {
+            "data/thinking-train.jsonl"
+        } else {
+            "data/train.jsonl"
+        };
         let text = std::fs::read_to_string(path).expect("data/train.jsonl");
         let mut n = 0usize;
         for line in text.lines() {
