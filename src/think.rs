@@ -155,6 +155,19 @@ impl DialogueCache {
     pub fn turn_count(&self) -> usize {
         self.turns.len()
     }
+
+    pub fn turns(&self) -> &[(String, String)] {
+        &self.turns
+    }
+
+    pub fn restore(&mut self, system: String, turns: Vec<(String, String)>) {
+        self.set_system(system);
+        self.turns = turns;
+        while self.turns.len() > DIALOGUE_TURN_CAP {
+            self.turns.remove(0);
+        }
+        self.trim_chars();
+    }
 }
 
 /// Ring of hidden reasoning tokens. Wiped after every turn.
@@ -172,8 +185,12 @@ impl Default for ReasoningScratch {
 
 impl ReasoningScratch {
     pub fn new() -> Self {
+        Self::with_cap(crate::data::MAX_TOKEN_BUF)
+    }
+
+    pub fn with_cap(cap: usize) -> Self {
         Self {
-            tokens: SovereignFlashBuffer::new(crate::data::MAX_TOKEN_BUF)
+            tokens: SovereignFlashBuffer::new(cap.max(64))
                 .unwrap_or_else(|_| SovereignFlashBuffer::new(64).expect("tiny flash")),
             text: String::new(),
         }

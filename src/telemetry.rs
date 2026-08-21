@@ -6,9 +6,51 @@
 #![allow(unsafe_code)]
 
 use std::mem::{size_of, MaybeUninit};
+use std::sync::OnceLock;
 use std::time::Instant;
 
 use crate::quant::TernaryHist;
+
+static METAL_HELLO_MB: OnceLock<f64> = OnceLock::new();
+
+/// Cache RSS after `SovereignDevice::open` (empty fused pipeline, no model).
+pub fn cache_metal_hello_mb(mb: f64) {
+    let _ = METAL_HELLO_MB.set(mb);
+}
+
+pub fn metal_hello_mb() -> f64 {
+    METAL_HELLO_MB.get().copied().unwrap_or(0.0)
+}
+
+/// Split train-memory HUD. `gpu_alias` is 1 when Metal wraps PageSlab tensors.
+#[derive(Clone, Debug, Default)]
+pub struct TrainFootprint {
+    pub rss_mb: f64,
+    pub baseline_metal_mb: f64,
+    pub net_mb: f64,
+    pub params_bytes: u64,
+    pub grad_bytes: u64,
+    pub opt_bytes: u64,
+    pub workspace_bytes: u64,
+    pub gpu_alias: u8,
+    pub embed_i8_bytes: u64,
+    pub scratch_bumps: u64,
+}
+
+impl TrainFootprint {
+    pub fn format_fields(&self) -> String {
+        format!(
+            " net={:.1}MB params={:.1}kB grad={:.1}kB opt={:.1}kB ws={:.1}kB i8={:.1}kB alias={}",
+            self.net_mb,
+            self.params_bytes as f64 / 1024.0,
+            self.grad_bytes as f64 / 1024.0,
+            self.opt_bytes as f64 / 1024.0,
+            self.workspace_bytes as f64 / 1024.0,
+            self.embed_i8_bytes as f64 / 1024.0,
+            self.gpu_alias
+        )
+    }
+}
 
 #[derive(Clone, Debug)]
 pub struct Hud {

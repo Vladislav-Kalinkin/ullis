@@ -7,7 +7,12 @@
 //!
 //! Encode is greedy longest-match over the piece table. Unmapped UTF-8, including
 //! incomplete multi-byte sequences, falls back to raw byte ids in-stream and
-//! never panics. Default scale is `V = 8192`.
+//! never panics.
+//!
+//! Production scale is `V ≥ 8192` ([`MIN_VOCAB`]), selectable at runtime via
+//! `--vocab-size` up to [`MAX_VOCAB`] (1 048 576). Tables below [`MIN_VOCAB`] are rejected.
+//! Empty tail ids (when pair-merges exhaust before `V`) occupy no piece bytes and
+//! decode as empty, so the lexicon can grow without a dense rewrite.
 
 use std::collections::HashMap;
 use std::path::Path;
@@ -23,7 +28,26 @@ pub const UNK: &str = "<unk>";
 pub const N_SPECIAL: u32 = 4;
 /// ids `4..259` are raw UTF-8 bytes. Byte *values* are still `0..=255`.
 pub const BYTE_OFFSET: u32 = N_SPECIAL;
-pub const DEFAULT_VOCAB: u32 = 8192;
+/// Hard minimum production vocabulary.
+pub const MIN_VOCAB: u32 = 8192;
+/// Default production scale (equals [`MIN_VOCAB`]).
+pub const DEFAULT_VOCAB: u32 = MIN_VOCAB;
+/// Absolute ceiling for `--vocab-size` (131 072+; Metal buffer / i8-block cap).
+pub const MAX_VOCAB: u32 = 1_048_576;
+
+/// Runtime `--vocab-size` gate. Unit tests may construct smaller tables via
+/// [`BpeTokenizer::new`] so encode/decode math stays cheap.
+pub fn validate_vocab_size(vocab_size: u32) -> Result<u32> {
+    if vocab_size < MIN_VOCAB {
+        bail!(
+            "vocab-size {vocab_size} is below the hard minimum {MIN_VOCAB}"
+        );
+    }
+    if vocab_size > MAX_VOCAB {
+        bail!("vocab-size {vocab_size} exceeds the absolute ceiling {MAX_VOCAB}");
+    }
+    Ok(vocab_size)
+}
 
 pub const CODE_SEEDS: &[&str] = &[
     "def ",
@@ -599,7 +623,10 @@ impl BpeTokenizer {
         specials: Option<Vec<String>>,
     ) -> Result<Self> {
         if vocab_size < BYTE_OFFSET + 256 {
-            bail!("vocab_size must be >= {}", BYTE_OFFSET + 256);
+            bail!(
+                "vocab_size must be >= {} (byte-fallback floor)",
+                BYTE_OFFSET + 256
+            );
         }
         let specials = specials.unwrap_or_else(|| {
             vec![
@@ -625,6 +652,31 @@ impl BpeTokenizer {
         };
         tok.rebuild();
         Ok(tok)
+    }
+
+    /// Grow the id plane in place. Existing pieces stay put; new slots are empty
+    /// until later merges or [`crate::quant::PackedI8Matrix`] block allocation.
+    pub fn expand_to(&mut self, vocab_size: u32) -> Result<()> {
+        if vocab_size < self.vocab_size {
+            bail!(
+                "cannot shrink tokenizer vocab {} -> {vocab_size}",
+                self.vocab_size
+            );
+        }
+        if vocab_size == self.vocab_size {
+            return Ok(());
+        }
+        self.vocab_size = vocab_size;
+        self.id_to_bytes.resize(vocab_size as usize, Vec::new());
+        self.encode_cache.clear();
+        Ok(())
+    }
+
+    pub fn populated(&self) -> u32 {
+        let mut n = BYTE_OFFSET + 256;
+        n += self.atoms.len() as u32;
+        n += self.merges.len() as u32;
+        n.min(self.vocab_size)
     }
 
     fn rebuild(&mut self) {
@@ -687,7 +739,7 @@ impl BpeTokenizer {
             return cached.clone();
         }
         let ids = self.encode_bytes_uncached(data);
-        if self.encode_cache.len() < 8192 {
+        if self.encode_cache.len() < 4096 {
             self.encode_cache.insert(data.to_vec(), ids.clone());
         }
         ids
@@ -789,16 +841,9 @@ impl BpeTokenizer {
     }
 
     pub fn load_default() -> Result<Self> {
-        let data: TokenizerJson = serde_json::from_str(DEFAULT_TOKENIZER_JSON)?;
-        let tok = Self::from_json(&data)?;
-        if tok.vocab_size == DEFAULT_VOCAB {
-            return Ok(tok);
-        }
         train_wordpiece(&[], DEFAULT_VOCAB, 7)
     }
 }
-
-pub const DEFAULT_TOKENIZER_JSON: &str = include_str!("../assets/tokenizer-4096.json");
 
 pub struct StreamDecoder<'a> {
     tokenizer: &'a BpeTokenizer,
@@ -880,12 +925,6 @@ pub fn train_wordpiece(texts: &[String], vocab_size: u32, seed: u64) -> Result<B
     let mut corpus: Vec<String> = texts.iter().filter(|t| !t.is_empty()).cloned().collect();
     if corpus.is_empty() {
         corpus.push(ATOMS_SORTED.join(""));
-        corpus.push(
-            "The function returns a result from the model. Hello world.\n\
-             Привет мир. Это тестовый текст для словаря. Функция возвращает результат.\n\
-             def load(path):\n    return path\nfn main() {}\n"
-                .into(),
-        );
     }
     corpus.shuffle(&mut rng);
 
@@ -914,10 +953,13 @@ pub fn train_wordpiece(texts: &[String], vocab_size: u32, seed: u64) -> Result<B
         if counts.is_empty() {
             break;
         }
-        let ((a, b), _) = counts
+        let ((a, b), count) = counts
             .into_iter()
             .max_by_key(|(_, c)| *c)
             .expect("non-empty");
+        if count < 2 {
+            break;
+        }
         if let Some(&nid) = pair_to_id.get(&(a, b)) {
             seqs = seqs.iter().map(|s| apply_merge(s, a, b, nid)).collect();
             continue;
@@ -941,6 +983,7 @@ pub fn load_or_train(
     path: Option<&Path>,
     seed: u64,
 ) -> Result<BpeTokenizer> {
+    let vocab_size = validate_vocab_size(vocab_size)?;
     let mut candidates: Vec<std::path::PathBuf> = Vec::new();
     if let Some(p) = path {
         if !p.as_os_str().is_empty() {
@@ -949,25 +992,15 @@ pub fn load_or_train(
     }
     candidates.push(Path::new("assets/tokenizer-8192.json").to_path_buf());
     candidates.push(Path::new("ullis/assets/tokenizer-8192.json").to_path_buf());
-    candidates.push(Path::new("assets/tokenizer-4096.json").to_path_buf());
-    candidates.push(Path::new("ullis/assets/tokenizer-4096.json").to_path_buf());
-    candidates.push(Path::new("ullis-core/assets/tokenizer-4096.json").to_path_buf());
+    candidates.push(Path::new("checkpoints/tokenizer.json").to_path_buf());
     for cand in candidates {
         if cand.exists() {
-            let tok = BpeTokenizer::load(&cand)?;
+            let mut tok = BpeTokenizer::load(&cand)?;
             if tok.vocab_size == vocab_size {
                 return Ok(tok);
             }
-        }
-    }
-    if vocab_size == DEFAULT_VOCAB {
-        if let Ok(tok) = train_wordpiece(texts, vocab_size, seed) {
-            return Ok(tok);
-        }
-    }
-    if vocab_size == 4096 {
-        if let Ok(tok) = BpeTokenizer::load_default() {
-            if tok.vocab_size == 4096 {
+            if tok.vocab_size < vocab_size && tok.vocab_size >= MIN_VOCAB {
+                tok.expand_to(vocab_size)?;
                 return Ok(tok);
             }
         }
@@ -1022,5 +1055,25 @@ mod tests {
         let s = "Hello мир fn main()";
         let ids = tok.encode(s, false, false);
         assert_eq!(tok.decode(&ids), s);
+    }
+
+    #[test]
+    fn rejects_below_min_vocab() {
+        assert!(validate_vocab_size(4096).is_err());
+        assert!(validate_vocab_size(MIN_VOCAB - 1).is_err());
+        assert_eq!(validate_vocab_size(MIN_VOCAB).unwrap(), MIN_VOCAB);
+        assert_eq!(validate_vocab_size(131_072).unwrap(), 131_072);
+        assert!(validate_vocab_size(MAX_VOCAB + 1).is_err());
+    }
+
+    #[test]
+    fn expand_keeps_pieces() {
+        let mut tok = train_wordpiece(&[], 1024, 1).unwrap();
+        let s = "fn main()";
+        let ids = tok.encode(s, false, false);
+        tok.expand_to(16_384).unwrap();
+        assert_eq!(tok.vocab_size, 16_384);
+        assert_eq!(tok.decode(&ids), s);
+        assert_eq!(tok.encode(s, false, false), ids);
     }
 }

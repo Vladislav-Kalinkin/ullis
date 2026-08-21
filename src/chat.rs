@@ -5,22 +5,26 @@
 //! streams in bold green. `ReasoningScratch::clear` runs the instant the
 //! visible stream ends — thinking never enters `DialogueCache`.
 
-use std::io::{self, IsTerminal, Write};
+use std::fs::File;
+use std::io::{self, IsTerminal, Read, Write};
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
-use anyhow::{Context, Result};
+use anyhow::{bail, Context, Result};
 use clap::Args;
 use rand::SeedableRng;
+use serde::{Deserialize, Serialize};
 
 use crate::checkpoint;
-use crate::data::{pack_record, TAG_OUTPUT, TAG_SYSTEM, TAG_THINKING, TAG_THINK_END, TAG_USER};
+use crate::data::{
+    pack_record, SovereignFlashBuffer, TAG_OUTPUT, TAG_SYSTEM, TAG_THINKING, TAG_THINK_END, TAG_USER,
+};
 use crate::device::{device_name, setup_device, synchronize};
 use crate::kan::KanEvalMode;
 use crate::model::UllisKan;
 use crate::telemetry::process_memory_mb;
 use crate::think::{strip_tags, thinking_closed, DialogueCache, ReasoningScratch, ThinkingMode};
-use crate::tokenizer::{BpeTokenizer, StreamDecoder};
+use crate::tokenizer::{validate_vocab_size, BpeTokenizer, StreamDecoder};
 
 const BANNER: &str = r"
   _   _ _ _ _
@@ -29,7 +33,7 @@ const BANNER: &str = r"
  | |_| | | | \__ \
   \___/  |_|_|___/
 
- Ullis AI Engine v0.6 Sovereign | fused Metal MoB-KAN
+ Ullis AI Engine v0.9 Infinite Lexicon | fused Metal MoB-KAN
  type a prefix  ·  language is inferred  ·  /help  /exit
 ";
 
@@ -43,6 +47,10 @@ commands
   /thinking <tier>      low | medium | high | xhigh
   /system <text>        replace the system prompt
   /stats                model report + rss
+  /save <name>          write flash-buffer tokens to sessions/<name>.ullissnap
+  /load <name>          restore tokens + dialogue into the Metal pipeline
+  /delete <name>        purge sessions/<name>.ullissnap
+  /rename <old> <new>   rename a saved session file
 thinking streams dim/italic; output streams bold green after └──
 anything else is a prompt — `def ` steers Python, `fn ` steers Rust
 ";
@@ -83,6 +91,153 @@ pub struct ChatArgs {
     pub system: String,
     #[arg(long)]
     pub cpu: bool,
+    /// Continuous `SovereignFlashBuffer` cap (token ids).
+    #[arg(long = "context-len", default_value_t = 32_768)]
+    pub context_len: usize,
+    /// Optional lexicon expansion at load (must be ≥ checkpoint V, ≥ 8192).
+    #[arg(long = "vocab-size")]
+    pub vocab_size: Option<u32>,
+}
+
+const SNAP_MAGIC: &[u8; 8] = b"ULISSN01";
+const SNAP_EXT: &str = "ullissnap";
+
+#[derive(Debug, Serialize, Deserialize)]
+struct SnapHeader {
+    name: String,
+    vocab_size: u32,
+    context_len: usize,
+    n_tokens: usize,
+    system: String,
+    turns: Vec<(String, String)>,
+}
+
+struct PersistentSession {
+    cache: DialogueCache,
+    flash: SovereignFlashBuffer,
+    context_len: usize,
+}
+
+impl PersistentSession {
+    fn new(system: String, context_len: usize) -> Result<Self> {
+        let context_len = context_len.max(64);
+        Ok(Self {
+            cache: DialogueCache::new(system),
+            flash: SovereignFlashBuffer::new(context_len)?,
+            context_len,
+        })
+    }
+
+    fn absorb_ctx(&mut self, ctx: &[u32]) {
+        for &id in ctx {
+            self.flash.push(id, 1);
+        }
+    }
+}
+
+fn snap_dir() -> PathBuf {
+    PathBuf::from("sessions")
+}
+
+fn sanitize_snap_name(name: &str) -> Result<String> {
+    let n = name.trim();
+    if n.is_empty() {
+        bail!("empty session name");
+    }
+    if n.contains("..") || n.contains('/') || n.contains('\\') {
+        bail!("illegal session name `{n}`");
+    }
+    if !n
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.'))
+    {
+        bail!("session name must be [A-Za-z0-9._-], got `{n}`");
+    }
+    Ok(n.to_string())
+}
+
+fn snap_path(name: &str) -> Result<PathBuf> {
+    Ok(snap_dir().join(format!("{}.{SNAP_EXT}", sanitize_snap_name(name)?)))
+}
+
+fn save_snap(session: &PersistentSession, name: &str, vocab_size: u32) -> Result<PathBuf> {
+    let name = sanitize_snap_name(name)?;
+    let path = snap_path(&name)?;
+    std::fs::create_dir_all(snap_dir())?;
+    let tokens = session.flash.token_span();
+    let header = SnapHeader {
+        name: name.clone(),
+        vocab_size,
+        context_len: session.context_len,
+        n_tokens: tokens.len(),
+        system: session.cache.system().to_string(),
+        turns: session.cache.turns().to_vec(),
+    };
+    let header_bytes = serde_json::to_vec(&header)?;
+    let mut f = File::create(&path).with_context(|| format!("create {}", path.display()))?;
+    f.write_all(SNAP_MAGIC)?;
+    f.write_all(&(header_bytes.len() as u32).to_le_bytes())?;
+    f.write_all(&header_bytes)?;
+    for &id in tokens {
+        f.write_all(&id.to_le_bytes())?;
+    }
+    Ok(path)
+}
+
+fn load_snap(session: &mut PersistentSession, model: &UllisKan, name: &str) -> Result<PathBuf> {
+    let path = snap_path(name)?;
+    if !path.exists() {
+        bail!("no session {}", path.display());
+    }
+    let mut f = File::open(&path).with_context(|| format!("open {}", path.display()))?;
+    let mut magic = [0u8; 8];
+    f.read_exact(&mut magic)?;
+    if &magic != SNAP_MAGIC {
+        bail!("bad .ullissnap magic in {}", path.display());
+    }
+    let mut len_buf = [0u8; 4];
+    f.read_exact(&mut len_buf)?;
+    let hlen = u32::from_le_bytes(len_buf) as usize;
+    let mut header_bytes = vec![0u8; hlen];
+    f.read_exact(&mut header_bytes)?;
+    let header: SnapHeader = serde_json::from_slice(&header_bytes)?;
+    let mut raw = Vec::new();
+    f.read_to_end(&mut raw)?;
+    if raw.len() < header.n_tokens.saturating_mul(4) {
+        bail!("truncated token plane in {}", path.display());
+    }
+    let mut tokens = Vec::with_capacity(header.n_tokens);
+    for chunk in raw.chunks_exact(4).take(header.n_tokens) {
+        tokens.push(u32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]));
+    }
+    session.cache.restore(header.system, header.turns);
+    session.flash.load_tokens(&tokens);
+    session.flash.bind_metal(&model.device)?;
+    Ok(path)
+}
+
+fn delete_snap(name: &str) -> Result<PathBuf> {
+    let path = snap_path(name)?;
+    if path.exists() {
+        std::fs::remove_file(&path)?;
+    }
+    Ok(path)
+}
+
+fn rename_snap(old_name: &str, new_name: &str) -> Result<(PathBuf, PathBuf)> {
+    let src = snap_path(old_name)?;
+    let dst = snap_path(new_name)?;
+    if !src.exists() {
+        bail!("no session {}", src.display());
+    }
+    if dst.exists() {
+        bail!("refusing to overwrite {}", dst.display());
+    }
+    if let Some(parent) = dst.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    std::fs::rename(&src, &dst)?;
+    Ok((src, dst))
 }
 
 pub fn run_chat(args: ChatArgs) -> Result<()> {
@@ -92,20 +247,33 @@ pub fn run_chat(args: ChatArgs) -> Result<()> {
         checkpoint::load(&path, device).with_context(|| format!("load {}", path.display()))?;
     let mut model = loaded.model;
     let mut tokenizer = loaded.tokenizer;
+    if let Some(v) = args.vocab_size {
+        let v = validate_vocab_size(v)?;
+        if (v as usize) < model.cfg.vocab_size {
+            bail!(
+                "--vocab-size {v} is smaller than checkpoint V={}",
+                model.cfg.vocab_size
+            );
+        }
+        tokenizer.expand_to(v)?;
+        model.expand_vocab(v as usize)?;
+    }
+    let context_len = args.context_len.max(model.cfg.seq_len);
     println!(
-        "loaded {} on {}  {}  thinking={}",
+        "loaded {} on {}  {}  thinking={}  context_len={}",
         path.display(),
         device_name(&model.device),
         model.param_report(),
-        args.thinking.as_str()
+        args.thinking.as_str(),
+        context_len
     );
     if let Some(p) = args.prompt {
         print_banner();
-        let mut cache = DialogueCache::new(args.system.clone());
+        let mut session = PersistentSession::new(args.system.clone(), context_len)?;
         stream_turn(
             &mut model,
             &mut tokenizer,
-            &mut cache,
+            &mut session,
             &p,
             args.max_new,
             args.temperature,
@@ -120,6 +288,7 @@ pub fn run_chat(args: ChatArgs) -> Result<()> {
         args.temperature,
         args.thinking,
         args.system,
+        context_len,
     )
 }
 
@@ -149,7 +318,7 @@ fn use_color() -> bool {
 fn stream_turn(
     model: &mut UllisKan,
     tokenizer: &mut BpeTokenizer,
-    cache: &mut DialogueCache,
+    session: &mut PersistentSession,
     user: &str,
     max_new: usize,
     temperature: f32,
@@ -158,12 +327,12 @@ fn stream_turn(
     print!("ullis▸ ");
     let _ = io::stdout().flush();
 
-    let (system, user_block) = cache.pack_user(user);
+    let (system, user_block) = session.cache.pack_user(user);
     let kan_mode = thinking.kan_mode();
     let think_budget = thinking.think_budget(model.cfg.seq_len);
     let mut rng = rand::rngs::StdRng::from_os_rng();
     let t0 = Instant::now();
-    let mut scratch = ReasoningScratch::new();
+    let mut scratch = ReasoningScratch::with_cap(session.context_len);
     let eos = tokenizer.eos_id;
     let color = use_color();
     let mut paint = PaintScan::new(think_budget > 0);
@@ -235,13 +404,17 @@ fn stream_turn(
     stdout.flush()?;
     println!();
 
-    // Ephemeral GC: thinking activations/tokens leave the ring before persist.
+    // Persist the continuous token ring, then GC think scratch.
+    session.absorb_ctx(&ctx);
+    session.flash.bind_metal(&model.device).ok();
     scratch.clear();
     ctx.clear();
     ctx.shrink_to_fit();
     synchronize(&model.device)?;
 
-    cache.persist_turn(user.trim().to_string(), visible.clone());
+    session
+        .cache
+        .persist_turn(user.trim().to_string(), visible.clone());
 
     let dt = t0.elapsed().as_secs_f64().max(1e-9);
     let stats = model.ternary_stats().unwrap_or_default();
@@ -505,10 +678,11 @@ fn repl(
     mut temperature: f32,
     mut thinking: ThinkingMode,
     system: String,
+    context_len: usize,
 ) -> Result<()> {
     print_banner();
     println!("{}", model.param_report());
-    let mut cache = DialogueCache::new(system);
+    let mut session = PersistentSession::new(system, context_len)?;
     let stdin = io::stdin();
     loop {
         print!("you▸ ");
@@ -531,22 +705,84 @@ fn repl(
             continue;
         }
         if line == "/clear" {
-            cache.clear();
+            session.cache.clear();
+            session.flash.clear();
             println!("context cleared");
             continue;
         }
         if line == "/stats" {
             let stats = model.ternary_stats().unwrap_or_default();
             println!(
-                "{}  rss={:.1}MB  thinking={}  turns={}  zero={:.2} +={:.2} -={:.2}",
+                "{}  rss={:.1}MB  thinking={}  turns={}  flash={}  context_len={}  zero={:.2} +={:.2} -={:.2}",
                 model.param_report(),
                 process_memory_mb(),
                 thinking.as_str(),
-                cache.turn_count(),
+                session.cache.turn_count(),
+                session.flash.len(),
+                session.context_len,
                 stats.frac_zero,
                 stats.frac_pos,
                 stats.frac_neg
             );
+            continue;
+        }
+        if let Some(rest) = line.strip_prefix("/save") {
+            let name = rest.trim();
+            if name.is_empty() {
+                println!("usage: /save <name>");
+            } else {
+                match save_snap(&session, name, model.cfg.vocab_size as u32) {
+                    Ok(p) => println!(
+                        "saved {}  tokens={}  {}",
+                        p.display(),
+                        session.flash.len(),
+                        name
+                    ),
+                    Err(e) => println!("save failed: {e}"),
+                }
+            }
+            continue;
+        }
+        if let Some(rest) = line.strip_prefix("/load") {
+            let name = rest.trim();
+            if name.is_empty() {
+                println!("usage: /load <name>");
+            } else {
+                match load_snap(&mut session, model, name) {
+                    Ok(p) => println!(
+                        "loaded {}  tokens={}  turns={}",
+                        p.display(),
+                        session.flash.len(),
+                        session.cache.turn_count()
+                    ),
+                    Err(e) => println!("load failed: {e}"),
+                }
+            }
+            continue;
+        }
+        if let Some(rest) = line.strip_prefix("/delete") {
+            let name = rest.trim();
+            if name.is_empty() {
+                println!("usage: /delete <name>");
+            } else {
+                match delete_snap(name) {
+                    Ok(p) => println!("deleted {}", p.display()),
+                    Err(e) => println!("delete failed: {e}"),
+                }
+            }
+            continue;
+        }
+        if let Some(rest) = line.strip_prefix("/rename") {
+            let mut parts = rest.split_whitespace();
+            let old = parts.next();
+            let new = parts.next();
+            match (old, new) {
+                (Some(old), Some(new)) => match rename_snap(old, new) {
+                    Ok((s, d)) => println!("renamed {} -> {}", s.display(), d.display()),
+                    Err(e) => println!("rename failed: {e}"),
+                },
+                _ => println!("usage: /rename <old_name> <new_name>"),
+            }
             continue;
         }
         if let Some(rest) = line.strip_prefix("/thinking") {
@@ -564,9 +800,9 @@ fn repl(
         if let Some(rest) = line.strip_prefix("/system") {
             let rest = rest.trim();
             if rest.is_empty() {
-                println!("system={}", cache.system());
+                println!("system={}", session.cache.system());
             } else {
-                cache.set_system(rest.to_string());
+                session.cache.set_system(rest.to_string());
                 println!("system updated");
             }
             continue;
@@ -600,7 +836,7 @@ fn repl(
         stream_turn(
             model,
             tokenizer,
-            &mut cache,
+            &mut session,
             user,
             max_new,
             temperature,
@@ -659,5 +895,44 @@ mod tests {
         let ops = p.feed("print(1)\n");
         assert!(!ops.iter().any(|op| matches!(op, PaintOp::Banner)));
         assert!(ops.iter().any(|op| matches!(op, PaintOp::Output(_))));
+    }
+
+    #[test]
+    fn snap_name_rejects_path_escape() {
+        assert!(sanitize_snap_name("../etc").is_err());
+        assert!(sanitize_snap_name("a/b").is_err());
+        assert_eq!(sanitize_snap_name("demo_1").unwrap(), "demo_1");
+    }
+
+    #[test]
+    fn snap_roundtrip_tokens() {
+        let dir = snap_dir();
+        let _ = std::fs::create_dir_all(&dir);
+        let mut session = PersistentSession::new("sys".into(), 128).unwrap();
+        session.cache.persist_turn("u".into(), "fn f() {}".into());
+        session.absorb_ctx(&[1, 2, 3, 7]);
+        let path = save_snap(&session, "unit_roundtrip", 8192).unwrap();
+        assert!(path.ends_with("unit_roundtrip.ullissnap"));
+        let gpu = crate::device::SovereignDevice::open(false).unwrap();
+        let cfg = crate::config::TrainConfig {
+            d_model: 8,
+            n_layers: 1,
+            n_basis: 4,
+            vocab_size: 32,
+            seq_len: 8,
+            mixer: "shift".into(),
+            moe: false,
+            fused_grad_ckpt: false,
+            ..crate::config::TrainConfig::default()
+        };
+        let model = UllisKan::new(cfg, gpu).unwrap();
+        let mut loaded = PersistentSession::new("other".into(), 128).unwrap();
+        load_snap(&mut loaded, &model, "unit_roundtrip").unwrap();
+        assert_eq!(loaded.flash.token_span(), &[1, 2, 3, 7]);
+        assert_eq!(loaded.cache.system(), "sys");
+        assert_eq!(loaded.cache.turn_count(), 1);
+        rename_snap("unit_roundtrip", "unit_renamed").unwrap();
+        delete_snap("unit_renamed").unwrap();
+        assert!(!snap_path("unit_renamed").unwrap().exists());
     }
 }

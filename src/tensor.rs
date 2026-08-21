@@ -1,38 +1,43 @@
-//! `SovereignTensor` — host `Vec<f32>` plus an isolated Metal buffer descriptor.
+//! `SovereignTensor` — page-aligned host slab aliased as a Metal Shared buffer.
 //!
-//! No Candle `Tensor`. The host vector is the CPU/Accelerate source of truth.
-//! The Metal buffer is a Shared unified-memory allocation owned by this value
-//! and released on drop. All pointer casts go through `device` (the only
-//! `unsafe` island for Metal).
+//! No Candle `Tensor`. The `PageSlab` is the CPU/Accelerate source of truth.
+//! On Metal, `wrap_shared_bytes_no_copy` aliases the **whole** 16 KiB-aligned
+//! slab; there is no host↔device memcpy and no `host_gen`/`device_gen`.
+//!
+//! Drop order is declaration order (first field first). `gpu` is declared
+//! before `slab` so the `MTLBuffer` dies before `PageSlab::dealloc`. Call
+//! `detach_gpu` before replacing a tensor whose numel changes (`regrid`,
+//! `refresh_geometry`, `expand_vocab`). Never wrap a mid-slab interior.
 
 use anyhow::{bail, Result};
 
-use crate::accelerate::{mob_kan_fused_cpu, MobKanSpec};
-use crate::device::{self, Backend, SovereignDevice};
+use crate::accelerate::{
+    acc_dg_partials, apply_topk_gates, mob_kan_fused_bwd_cpu, mob_kan_fused_cpu,
+    reduce_bwd_partials, router_bwd_cpu, sgemm_nt, softmax_rows, BwdPartialLayout, FusedBwdGrads,
+    MobKanSpec,
+};
+use crate::device::{self, Backend, PageSlab, SovereignDevice};
 
-/// Lightweight f32 tensor with manual host/device pipeline ownership.
+/// Lightweight f32 tensor with a page-aligned host slab and optional Metal wrap.
 pub struct SovereignTensor {
-    shape: Vec<usize>,
-    host: Vec<f32>,
-    host_gen: u64,
-    device_gen: u64,
+    // Drop = declaration order. gpu MUST be first so the wrap dies before dealloc.
     #[cfg(target_os = "macos")]
     gpu: Option<GpuSlot>,
+    slab: PageSlab,
+    shape: Vec<usize>,
+    numel: usize,
 }
 
 #[cfg(target_os = "macos")]
 struct GpuSlot {
     buffer: metal::Buffer,
-    floats: usize,
 }
 
 impl std::fmt::Debug for SovereignTensor {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("SovereignTensor")
             .field("shape", &self.shape)
-            .field("numel", &self.numel())
-            .field("host_gen", &self.host_gen)
-            .field("device_gen", &self.device_gen)
+            .field("numel", &self.numel)
             .field("gpu", &self.has_gpu())
             .finish()
     }
@@ -40,14 +45,11 @@ impl std::fmt::Debug for SovereignTensor {
 
 impl Clone for SovereignTensor {
     fn clone(&self) -> Self {
-        Self {
-            shape: self.shape.clone(),
-            host: self.host.clone(),
-            host_gen: 1,
-            device_gen: 0,
-            #[cfg(target_os = "macos")]
-            gpu: None,
+        let mut t = Self::zeros(self.shape.clone()).expect("clone of a valid SovereignTensor");
+        if self.numel > 0 {
+            t.as_mut_slice().copy_from_slice(self.as_slice());
         }
+        t
     }
 }
 
@@ -60,24 +62,29 @@ impl SovereignTensor {
                 data.len()
             );
         }
-        Ok(Self {
-            shape,
-            host: data,
-            host_gen: 1,
-            device_gen: 0,
-            #[cfg(target_os = "macos")]
-            gpu: None,
-        })
+        let mut t = Self::zeros(shape)?;
+        if n > 0 {
+            t.as_mut_slice().copy_from_slice(&data);
+        }
+        Ok(t)
     }
 
     pub fn zeros(shape: Vec<usize>) -> Result<Self> {
         let n = numel_shape(&shape)?;
-        Self::from_vec(shape, vec![0.0; n])
+        let slab = PageSlab::new(n.max(1).saturating_mul(4))?;
+        Ok(Self {
+            #[cfg(target_os = "macos")]
+            gpu: None,
+            slab,
+            shape,
+            numel: n,
+        })
     }
 
     pub fn fill(shape: Vec<usize>, value: f32) -> Result<Self> {
-        let n = numel_shape(&shape)?;
-        Self::from_vec(shape, vec![value; n])
+        let mut t = Self::zeros(shape)?;
+        t.as_mut_slice().fill(value);
+        Ok(t)
     }
 
     pub fn shape(&self) -> &[usize] {
@@ -85,7 +92,7 @@ impl SovereignTensor {
     }
 
     pub fn numel(&self) -> usize {
-        self.host.len()
+        self.numel
     }
 
     pub fn has_gpu(&self) -> bool {
@@ -99,44 +106,31 @@ impl SovereignTensor {
         }
     }
 
-    pub fn host_dirty(&self) -> bool {
-        self.host_gen != self.device_gen && self.has_gpu()
-    }
-
-    pub fn device_dirty(&self) -> bool {
-        self.device_gen > self.host_gen
-    }
-
     pub fn as_slice(&self) -> &[f32] {
-        &self.host
+        self.slab.f32_at(self.numel).expect("tensor slab")
     }
 
     pub fn as_mut_slice(&mut self) -> &mut [f32] {
-        self.host_gen = self
-            .host_gen
-            .saturating_add(1)
-            .max(self.device_gen.saturating_add(1));
-        &mut self.host
+        self.slab.f32_at_mut(self.numel).expect("tensor slab")
     }
 
-    /// Bind a Shared Metal buffer. Idempotent if the existing buffer is sized.
+    /// Bind a Shared Metal wrap of the whole slab. Idempotent while attached.
+    ///
+    /// Exclusive CPU/GPU epochs: do not keep `&mut [f32]` live across
+    /// `dispatch_fused_mob_kan`. After a GPU write, `wait_until_completed`
+    /// (inside dispatch) is the host-visibility fence.
     pub fn attach(&mut self, gpu: &SovereignDevice) -> Result<()> {
         #[cfg(target_os = "macos")]
         {
             let Some(mtl) = gpu.mtl_device() else {
                 return Ok(());
             };
-            let n = self.numel().max(1);
-            let reuse = self
-                .gpu
-                .as_ref()
-                .is_some_and(|slot| slot.floats >= self.numel().max(1));
-            if !reuse {
-                let buffer = device::alloc_shared_f32_buffer(mtl, n)?;
-                self.gpu = Some(GpuSlot { buffer, floats: n });
-                self.device_gen = 0;
+            if self.gpu.is_some() {
+                return Ok(());
             }
-            self.upload()?;
+            let bytes = self.slab.as_bytes();
+            let buffer = device::wrap_shared_bytes_no_copy(mtl, bytes)?;
+            self.gpu = Some(GpuSlot { buffer });
             Ok(())
         }
         #[cfg(not(target_os = "macos"))]
@@ -146,50 +140,11 @@ impl SovereignTensor {
         }
     }
 
-    /// Host → Shared buffer. No-op when already in sync.
-    pub fn upload(&mut self) -> Result<()> {
-        #[cfg(target_os = "macos")]
-        {
-            if self.host_gen == self.device_gen {
-                return Ok(());
-            }
-            let Some(slot) = self.gpu.as_ref() else {
-                return Ok(());
-            };
-            device::write_shared_f32_buffer(&slot.buffer, &self.host)?;
-            self.device_gen = self.host_gen;
-            Ok(())
-        }
-        #[cfg(not(target_os = "macos"))]
-        {
-            Ok(())
-        }
-    }
-
-    /// Shared buffer → host. Call after a GPU kernel writes this tensor.
-    pub fn download(&mut self) -> Result<()> {
-        #[cfg(target_os = "macos")]
-        {
-            let Some(slot) = self.gpu.as_ref() else {
-                return Ok(());
-            };
-            device::read_shared_f32_buffer(&slot.buffer, &mut self.host)?;
-            self.host_gen = self.host_gen.saturating_add(1);
-            self.device_gen = self.host_gen;
-            Ok(())
-        }
-        #[cfg(not(target_os = "macos"))]
-        {
-            Ok(())
-        }
-    }
-
-    /// Drop the Metal buffer, keeping host data. Releases unified pages.
+    /// Drop the Metal wrap, keeping slab data. Call before realloc / replace.
     pub fn detach_gpu(&mut self) {
         #[cfg(target_os = "macos")]
         {
             self.gpu = None;
-            self.device_gen = 0;
         }
     }
 
@@ -198,10 +153,37 @@ impl SovereignTensor {
         self.gpu.as_ref().map(|s| &s.buffer)
     }
 
+    /// Grow-or-reuse a scratch tensor of exact `numel`. Used for pooled Metal x/y.
+    pub fn reuse_for<'a>(
+        slot: &'a mut Option<Self>,
+        shape: Vec<usize>,
+        gpu: &SovereignDevice,
+    ) -> Result<&'a mut Self> {
+        let n = numel_shape(&shape)?;
+        let reuse = slot.as_ref().is_some_and(|t| t.numel() == n);
+        if reuse {
+            let t = slot
+                .as_mut()
+                .ok_or_else(|| anyhow::anyhow!("reuse slot empty"))?;
+            t.reshape(shape)?;
+            t.attach(gpu)?;
+            Ok(t)
+        } else {
+            if let Some(old) = slot.as_mut() {
+                old.detach_gpu();
+            }
+            let mut t = Self::zeros(shape)?;
+            t.attach(gpu)?;
+            *slot = Some(t);
+            slot.as_mut()
+                .ok_or_else(|| anyhow::anyhow!("reuse slot set"))
+        }
+    }
+
     pub fn reshape(&mut self, shape: Vec<usize>) -> Result<()> {
         let n = numel_shape(&shape)?;
-        if n != self.numel() {
-            bail!("reshape {} -> {shape:?} changes numel {}", self.numel(), n);
+        if n != self.numel {
+            bail!("reshape {} -> {shape:?} changes numel {}", self.numel, n);
         }
         self.shape = shape;
         Ok(())
@@ -235,6 +217,206 @@ pub struct FusedKanTensors<'a> {
     pub scale_base: &'a SovereignTensor,
     pub scale_shared: &'a SovereignTensor,
     pub scale_routed: &'a SovereignTensor,
+}
+
+/// Bindings for one fused MoB-KAN backward launch.
+pub struct FusedKanBwdTensors<'a> {
+    pub x: &'a SovereignTensor,
+    pub dy: &'a SovereignTensor,
+    pub w_base: &'a SovereignTensor,
+    pub w_shared: &'a SovereignTensor,
+    pub w_routed: Option<&'a SovereignTensor>,
+    pub router: Option<&'a SovereignTensor>,
+    pub centers: &'a SovereignTensor,
+    pub inv_widths: &'a SovereignTensor,
+    pub scale_base: &'a SovereignTensor,
+    pub scale_shared: &'a SovereignTensor,
+    pub scale_routed: &'a SovereignTensor,
+    pub grads: FusedBwdGrads<'a>,
+    pub lambda_r: f32,
+    pub aux_coef: f32,
+}
+
+/// Run fused backward. Metal writes TG-private partials and the host reduces;
+/// CPU is the tiled Accelerate path. Returns `(router entropy, aux)`.
+pub fn fused_mob_kan_bwd(
+    gpu: &SovereignDevice,
+    spec: &MobKanSpec,
+    tensors: FusedKanBwdTensors<'_>,
+    part: &mut Option<SovereignTensor>,
+) -> Result<(f32, f32)> {
+    spec.validate()?;
+    check_len(tensors.x, spec.x_len(), "x")?;
+    check_len(tensors.dy, spec.y_len(), "dy")?;
+    check_len(tensors.w_base, spec.w_base_len(), "w_base")?;
+    check_len(tensors.w_shared, spec.w_shared_len(), "w_shared")?;
+    check_len(tensors.centers, spec.centers_len(), "centers")?;
+    check_len(tensors.inv_widths, spec.centers_len(), "inv_widths")?;
+    match gpu.backend() {
+        Backend::Metal => fused_bwd_metal(gpu, spec, tensors, part),
+        Backend::Cpu => fused_bwd_cpu(spec, tensors),
+    }
+}
+
+fn fused_bwd_cpu(spec: &MobKanSpec, tensors: FusedKanBwdTensors<'_>) -> Result<(f32, f32)> {
+    let FusedKanBwdTensors {
+        x,
+        dy,
+        w_base,
+        w_shared,
+        w_routed,
+        router,
+        centers,
+        inv_widths,
+        scale_base,
+        scale_shared,
+        scale_routed,
+        grads,
+        lambda_r,
+        aux_coef,
+    } = tensors;
+    let empty: &[f32] = &[];
+    let wr = w_routed.map_or(empty, SovereignTensor::as_slice);
+    let rt = router.map_or(empty, SovereignTensor::as_slice);
+    mob_kan_fused_bwd_cpu(
+        spec,
+        x.as_slice(),
+        w_base.as_slice(),
+        w_shared.as_slice(),
+        wr,
+        rt,
+        centers.as_slice(),
+        inv_widths.as_slice(),
+        scale_base.as_slice(),
+        scale_shared.as_slice(),
+        scale_routed.as_slice(),
+        dy.as_slice(),
+        lambda_r,
+        aux_coef,
+        grads,
+    )
+}
+
+#[cfg(target_os = "macos")]
+fn fused_bwd_metal(
+    gpu: &SovereignDevice,
+    spec: &MobKanSpec,
+    tensors: FusedKanBwdTensors<'_>,
+    part_slot: &mut Option<SovereignTensor>,
+) -> Result<(f32, f32)> {
+    let FusedKanBwdTensors {
+        x,
+        dy,
+        w_base,
+        w_shared,
+        w_routed,
+        router,
+        centers,
+        inv_widths,
+        scale_base,
+        scale_shared,
+        scale_routed,
+        mut grads,
+        lambda_r,
+        aux_coef,
+    } = tensors;
+    if spec.packed != 0 {
+        grads.dx[..spec.x_len()].fill(0.0);
+        return Ok((0.0, 0.0));
+    }
+    let layout = BwdPartialLayout::from_spec(spec);
+    let part = SovereignTensor::reuse_for(part_slot, vec![layout.floats.max(1)], gpu)?;
+    grads.dx[..spec.x_len()].fill(0.0);
+
+    let empty: &[f32] = &[];
+    let router_s = router.map_or(empty, SovereignTensor::as_slice);
+    let n = spec.n_us();
+    let k = spec.k_us();
+    let in_f = spec.in_us();
+    let routed = !spec.mask_routed();
+    let mut gates = vec![0.0f32; n * k.max(1)];
+    let mut dg = vec![0.0f32; n * k.max(1)];
+    if routed {
+        sgemm_nt(n, k, in_f, 1.0, x.as_slice(), router_s, 0.0, &mut gates)?;
+        softmax_rows(&mut gates, n, k)?;
+    }
+    let mut mix_gates = gates.clone();
+    apply_topk_gates(&mut mix_gates, n, k, spec.topk);
+
+    let dummy = gpu.dummy_buffer();
+    let tin_max = spec.tile_in_us();
+    let mut in0 = 0usize;
+    while in0 < spec.in_us() {
+        let tin = tin_max.min(spec.in_us() - in0);
+        part.as_mut_slice().fill(0.0);
+        {
+            let xb = x
+                .metal_buffer()
+                .ok_or_else(|| anyhow::anyhow!("x has no Metal buffer"))?;
+            let dyb = dy
+                .metal_buffer()
+                .ok_or_else(|| anyhow::anyhow!("dy has no Metal buffer"))?;
+            let w_base_b = w_base
+                .metal_buffer()
+                .ok_or_else(|| anyhow::anyhow!("w_base has no Metal buffer"))?;
+            let w_shared_b = w_shared
+                .metal_buffer()
+                .ok_or_else(|| anyhow::anyhow!("w_shared has no Metal buffer"))?;
+            let centers_b = centers
+                .metal_buffer()
+                .ok_or_else(|| anyhow::anyhow!("centers has no Metal buffer"))?;
+            let inv_b = inv_widths
+                .metal_buffer()
+                .ok_or_else(|| anyhow::anyhow!("inv_widths has no Metal buffer"))?;
+            let sb = scale_base
+                .metal_buffer()
+                .ok_or_else(|| anyhow::anyhow!("scale_base has no Metal buffer"))?;
+            let ss = scale_shared
+                .metal_buffer()
+                .ok_or_else(|| anyhow::anyhow!("scale_shared has no Metal buffer"))?;
+            let sr = scale_routed
+                .metal_buffer()
+                .ok_or_else(|| anyhow::anyhow!("scale_routed has no Metal buffer"))?;
+            let w_routed_b = w_routed
+                .and_then(SovereignTensor::metal_buffer)
+                .unwrap_or(dummy);
+            let router_b = router
+                .and_then(SovereignTensor::metal_buffer)
+                .unwrap_or(dummy);
+            let part_b = part
+                .metal_buffer()
+                .ok_or_else(|| anyhow::anyhow!("part has no Metal buffer"))?;
+            gpu.dispatch_fused_mob_kan_bwd(
+                spec, in0 as u32, tin as u32, xb, dyb, w_base_b, w_shared_b, w_routed_b, router_b,
+                centers_b, inv_b, sb, ss, sr, part_b,
+            )?;
+        }
+        reduce_bwd_partials(spec, &layout, in0, tin, part.as_slice(), &mut grads)?;
+        acc_dg_partials(spec, &layout, part.as_slice(), &mut dg)?;
+        in0 += tin;
+    }
+    router_bwd_cpu(
+        spec,
+        x.as_slice(),
+        router_s,
+        &gates,
+        &mix_gates,
+        &dg,
+        lambda_r,
+        aux_coef,
+        grads.grad_router,
+        grads.dx,
+    )
+}
+
+#[cfg(not(target_os = "macos"))]
+fn fused_bwd_metal(
+    _gpu: &SovereignDevice,
+    spec: &MobKanSpec,
+    tensors: FusedKanBwdTensors<'_>,
+    _part: &mut Option<SovereignTensor>,
+) -> Result<(f32, f32)> {
+    fused_bwd_cpu(spec, tensors)
 }
 
 /// Run the fused step on `gpu`. Metal path is a single compute encoder;
@@ -308,10 +490,7 @@ fn fused_metal(
     spec: &MobKanSpec,
     tensors: FusedKanTensors<'_>,
 ) -> Result<()> {
-    // Uploads must happen on &mut tensors. We cannot mut-borrow all inputs
-    // through FusedKanTensors (they are shared refs). Callers attach+upload
-    // weights; we upload y's output buffer and require inputs already synced.
-    tensors.y.upload()?;
+    // Alias: no memcpy. Dispatch `wait_until_completed` is the host fence.
     {
         let x = tensors
             .x
@@ -374,7 +553,6 @@ fn fused_metal(
             scale_routed,
         )?;
     }
-    tensors.y.download()?;
     Ok(())
 }
 
@@ -400,6 +578,19 @@ mod tests {
         t.reshape(vec![3, 2]).unwrap();
         assert_eq!(t.shape(), &[3, 2]);
         assert_eq!(t.as_slice()[0], 9.0);
+        let p = t.as_slice().as_ptr() as usize;
+        assert_eq!(p % 16_384, 0, "slab must be 16 KiB-aligned for DMA wrap");
+    }
+
+    #[test]
+    fn clone_is_independent_host_copy() {
+        let mut t = SovereignTensor::from_vec(vec![2], vec![1.0, 2.0]).unwrap();
+        let mut u = t.clone();
+        u.as_mut_slice()[0] = 7.0;
+        t.as_mut_slice()[0] = 5.0;
+        assert_eq!(t.as_slice()[0], 5.0);
+        assert_eq!(u.as_slice()[0], 7.0);
+        assert!(!u.has_gpu());
     }
 
     #[test]
@@ -437,5 +628,107 @@ mod tests {
         )
         .unwrap();
         assert!(y.as_slice().iter().all(|v| v.is_finite()));
+    }
+
+    /// Field order: `gpu` is declared before `slab`. Drop of an attached
+    /// tensor must `gpu.take()` (MTLBuffer) before `PageSlab::dealloc`.
+    /// miri does not cover Metal; this is the debug-glue stand-in.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn detach_before_drop_and_alias_host() {
+        let gpu = SovereignDevice::open(true).unwrap();
+        if !gpu.is_metal() {
+            return;
+        }
+        let mut t = SovereignTensor::from_vec(vec![4], vec![1.0, 2.0, 3.0, 4.0]).unwrap();
+        t.attach(&gpu).unwrap();
+        assert!(t.has_gpu());
+        t.as_mut_slice()[0] = 9.0;
+        assert_eq!(t.as_slice()[0], 9.0);
+        t.detach_gpu();
+        assert!(!t.has_gpu());
+        assert_eq!(t.as_slice()[0], 9.0);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn metal_alias_matches_cpu() {
+        let gpu = SovereignDevice::open(true).unwrap();
+        if !gpu.is_metal() {
+            return;
+        }
+        let cpu = SovereignDevice::open(false).unwrap();
+        let spec = MobKanSpec::new(2, 4, 3, 4, 3, 1, 3, 3, 1, false, false, 1.5, 0.7).unwrap();
+        let mut x = SovereignTensor::fill(vec![2, 4], 0.2).unwrap();
+        let mut y_gpu = SovereignTensor::zeros(vec![2, 3]).unwrap();
+        let mut w_base = SovereignTensor::fill(vec![3, 4], 0.05).unwrap();
+        let mut w_shared = SovereignTensor::fill(vec![3, 12], 0.02).unwrap();
+        let mut w_routed = SovereignTensor::fill(vec![3, 3, 4], 0.01).unwrap();
+        let mut router = SovereignTensor::zeros(vec![3, 4]).unwrap();
+        let mut centers = SovereignTensor::from_vec(vec![4], vec![-2.0, -0.66, 0.66, 2.0]).unwrap();
+        let iw = crate::accelerate::bump_inv_widths(centers.as_slice());
+        let mut inv_widths = SovereignTensor::from_vec(vec![4], iw).unwrap();
+        let mut scale_base = SovereignTensor::fill(vec![3], 1.0).unwrap();
+        let mut scale_shared = SovereignTensor::fill(vec![3], 1.0).unwrap();
+        let mut scale_routed = SovereignTensor::fill(vec![3, 3], 1.0).unwrap();
+        for t in [
+            &mut x,
+            &mut y_gpu,
+            &mut w_base,
+            &mut w_shared,
+            &mut w_routed,
+            &mut router,
+            &mut centers,
+            &mut inv_widths,
+            &mut scale_base,
+            &mut scale_shared,
+            &mut scale_routed,
+        ] {
+            t.attach(&gpu).unwrap();
+        }
+        fused_mob_kan_step(
+            &gpu,
+            &spec,
+            FusedKanTensors {
+                x: &x,
+                y: &mut y_gpu,
+                w_base: &w_base,
+                w_shared: &w_shared,
+                w_routed: Some(&w_routed),
+                router: Some(&router),
+                centers: &centers,
+                inv_widths: &inv_widths,
+                scale_base: &scale_base,
+                scale_shared: &scale_shared,
+                scale_routed: &scale_routed,
+            },
+        )
+        .unwrap();
+        let mut y_cpu = SovereignTensor::zeros(vec![2, 3]).unwrap();
+        fused_mob_kan_step(
+            &cpu,
+            &spec,
+            FusedKanTensors {
+                x: &x,
+                y: &mut y_cpu,
+                w_base: &w_base,
+                w_shared: &w_shared,
+                w_routed: Some(&w_routed),
+                router: Some(&router),
+                centers: &centers,
+                inv_widths: &inv_widths,
+                scale_base: &scale_base,
+                scale_shared: &scale_shared,
+                scale_routed: &scale_routed,
+            },
+        )
+        .unwrap();
+        let max = y_gpu
+            .as_slice()
+            .iter()
+            .zip(y_cpu.as_slice())
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0f32, f32::max);
+        assert!(max < 1e-4, "metal vs cpu max|Δ|={max}");
     }
 }

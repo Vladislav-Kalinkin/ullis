@@ -1,9 +1,18 @@
-use ullis::seed::corpus_texts;
 use ullis::tokenizer::{train_bpe, StreamDecoder};
+
+fn fixture_texts() -> Vec<String> {
+    vec![
+        "def load(path):\n    return path\n".into(),
+        "fn main() {\n    match x {\n        Ok(s) => s,\n    }\n}\n".into(),
+        "#!/usr/bin/env bash\nset -euo pipefail\n".into(),
+        "impl Agent {\n    fn new(name: &str) -> Self { Self { name: name.into() } }\n}\n".into(),
+        "return match impl def class import".into(),
+    ]
+}
 
 #[test]
 fn roundtrip_code() {
-    let texts = corpus_texts(60, 1);
+    let texts = fixture_texts();
     let mut tok = train_bpe(&texts, 512, 1).unwrap();
     let samples = [
         "def load(path):\n    return path\n",
@@ -20,7 +29,7 @@ fn roundtrip_code() {
 
 #[test]
 fn code_atoms_compress() {
-    let texts = corpus_texts(80, 2);
+    let texts = fixture_texts();
     let mut tok = train_bpe(&texts, 1024, 2).unwrap();
     for atom in ["def ", "fn ", "return", "impl", "match"] {
         let ids = tok.encode(atom, false, false);

@@ -6,18 +6,21 @@ use clap::Args;
 
 use crate::checkpoint;
 use crate::config::{next_grid_size, TrainConfig};
-use crate::data::JsonlStream;
-use crate::device::{device_name, setup_device, synchronize};
+use crate::data::{jsonl_corpus_texts, JsonlStream};
+use crate::device::{
+    device_name, setup_device, setup_device_with, synchronize, Backend, DeviceFlags,
+};
 use crate::model::UllisKan;
 use crate::optim::SgdMomentum;
-use crate::seed::{corpus_texts, ensure_jsonl};
-use crate::telemetry::{process_memory_mb, Throughput};
+use crate::telemetry::{
+    cache_metal_hello_mb, metal_hello_mb, process_memory_mb, TrainFootprint, Throughput,
+};
 use crate::tokenizer::{load_or_train, BpeTokenizer};
 
 #[derive(Debug, Args)]
 pub struct TrainArgs {
-    /// JSONL corpus (`{"system","user","thinking","output"}` per line; legacy `text`/`lang` lifted).
-    #[arg(long, default_value = "data/train.jsonl")]
+    /// JSONL corpus (`{"system","user","thinking","output"}` per line). Required; never synthesized.
+    #[arg(long, default_value = "data/thinking-train.jsonl")]
     pub data: PathBuf,
     /// Steps per epoch (each of the 4 phases).
     #[arg(long, default_value_t = 200)]
@@ -39,8 +42,15 @@ pub struct TrainArgs {
     pub seq_len: usize,
     #[arg(long, default_value_t = 4)]
     pub batch_size: usize,
-    #[arg(long, default_value_t = 8192)]
-    pub vocab: u32,
+    /// Vocabulary capacity. Hard minimum 8192; scales to 131072+.
+    #[arg(long = "vocab-size", visible_alias = "vocab", default_value_t = 8192)]
+    pub vocab_size: u32,
+    /// Continuous `SovereignFlashBuffer` token-ring cap.
+    #[arg(long = "context-len", default_value_t = 32_768)]
+    pub context_len: usize,
+    /// Recompute layer interiors on backward (identical grads, ~½ peak RAM).
+    #[arg(long = "fused-grad-ckpt", default_value_t = true, action = clap::ArgAction::Set)]
+    pub fused_grad_ckpt: bool,
     #[arg(long, default_value = "shift")]
     pub mixer: String,
     #[arg(long, default_value_t = 3)]
@@ -73,6 +83,18 @@ pub struct TrainArgs {
     pub knot_every: usize,
     #[arg(long)]
     pub cpu: bool,
+    /// KAN weight storage master. Compute stays FP32. `fp32` (default) or `fp16`.
+    #[arg(long, default_value = "fp32")]
+    pub master: String,
+    /// Momentum storage. `fp32` (default) or `q8`.
+    #[arg(long, default_value = "fp32")]
+    pub mom: String,
+    /// MoE top-k. `0` = dense (bit-identical). `1` or `2` = sparse routed experts.
+    #[arg(long = "moe-topk", default_value_t = 0)]
+    pub moe_topk: u32,
+    /// Switch load-balance coefficient (only when `--moe-topk` > 0).
+    #[arg(long = "moe-aux", default_value_t = 0.01)]
+    pub moe_aux: f64,
 }
 
 impl TrainArgs {
@@ -85,9 +107,11 @@ impl TrainArgs {
             grid_mid: self.grid_mid,
             grid_final: self.grid_final,
             seq_len: self.seq_len,
+            context_len: self.context_len.max(self.seq_len),
             batch_size: self.batch_size,
             mixer: self.mixer.clone(),
-            vocab_size: self.vocab as usize,
+            vocab_size: self.vocab_size as usize,
+            fused_grad_ckpt: self.fused_grad_ckpt,
             steps_per_epoch: self.steps,
             epochs_warmup: self.epochs_warmup,
             epochs_sparsify: self.epochs_sparsify,
@@ -115,27 +139,92 @@ const PHASES: [(u8, &str, fn(&TrainConfig) -> usize, fn(&TrainConfig) -> f64); 4
     (4, "harden", |c| c.epochs_harden, |c| c.lr_harden),
 ];
 
+/// Fused gradient checkpointing (v0.9).
+///
+/// Let `F_ℓ` be the fused MoB-KAN block (RMSNorm → mixer → RMSNorm → KAN)
+/// compiled as `ullis_mob_kan_fused_step` with `ULLIS_FUSED_GRAD_CKPT=1`.
+/// The full tape stores interiors
+/// `{ n1, h, n2, ff, res_* }` per layer. Checkpointing stores only the
+/// boundary `x^{(ℓ)}` and rematerializes interiors on the backward pass:
+///
+/// ```text
+/// Forward:
+///   x^{(0)} = Embed(ids)
+///   for ℓ = 0 .. L-1:
+///       save x^{(ℓ)}
+///       x^{(ℓ+1)} = F_ℓ(x^{(ℓ)})          // fused GPU, drop interiors
+///   ĥ = RMSNorm(x^{(L)})
+///
+/// Backward (identical to full tape):
+///   g = ∂L/∂ĥ
+///   g ← ∂ RMSNorm*(x^{(L)}, g)
+///   for ℓ = L-1 .. 0:
+///       (n1,h,n2,ff) = F_ℓ(x^{(ℓ)})      // recompute, same Metal kernel
+///       g ← B_ℓ(g; n1,h,n2,ff)           // exact STE / bump backward
+///   ∂L/∂E ← scatter(g, ids)
+/// ```
+///
+/// Because `F_ℓ` is deterministic given weights, `B_ℓ(F_ℓ(x), g) = B_ℓ(tape, g)`.
+/// Peak activation RAM is `Θ(L · n · d)` instead of `Θ(L · 4 · n · d)`
+/// (plus resonance buffers), i.e. up to ~50% of the pre-training working set.
 pub fn train(args: TrainArgs) -> Result<PathBuf> {
     let mut cfg = args.to_config();
+    cfg.master = crate::config::MasterDtype::parse_name(&args.master)?;
+    cfg.mom = crate::config::MomDtype::parse_name(&args.mom)?;
+    if args.moe_topk > 2 {
+        anyhow::bail!("--moe-topk {} not in 0|1|2", args.moe_topk);
+    }
+    cfg.moe_topk = args.moe_topk;
+    cfg.moe_aux = args.moe_aux;
     cfg.n_basis = cfg.grid_start;
-    let device = setup_device(!args.cpu)?;
+    crate::tokenizer::validate_vocab_size(cfg.vocab_size as u32)?;
+    let device = setup_device_with(
+        !args.cpu,
+        DeviceFlags {
+            fused_grad_ckpt: cfg.fused_grad_ckpt,
+        },
+    )?;
+    cache_metal_hello_mb(process_memory_mb());
+    println!(
+        "metal_hello={:.1}MB (rss gate: hello+12)",
+        metal_hello_mb()
+    );
     let tok_path = if cfg.tokenizer_path.is_empty() {
         None
     } else {
         Some(Path::new(&cfg.tokenizer_path))
     };
-    let texts = corpus_texts(240, cfg.seed);
+    let data_path = PathBuf::from(&cfg.data_path);
+    if !data_path.exists() {
+        anyhow::bail!(
+            "JSONL corpus missing: {} (pass --data; Ullis does not synthesize training text)",
+            data_path.display()
+        );
+    }
+    let texts = jsonl_corpus_texts(&data_path, 8_192)?;
+    if texts.is_empty() {
+        anyhow::bail!("JSONL corpus is empty: {}", data_path.display());
+    }
     let tokenizer = load_or_train(cfg.vocab_size as u32, &texts, tok_path, cfg.seed)?;
     cfg.vocab_size = tokenizer.vocab_size as usize;
 
-    let data_path = ensure_jsonl(&cfg.data_path, cfg.seed)?;
-    let mut stream = JsonlStream::open(&data_path, tokenizer.clone(), cfg.seq_len, cfg.seed)?;
+    let mut stream = JsonlStream::open_with_cap(
+        &data_path,
+        tokenizer.clone(),
+        cfg.seq_len,
+        cfg.context_len,
+        cfg.seed,
+    )?;
 
     println!(
-        "device={} vocab={} moe={} data={} jsonl=v4 {}",
+        "device={} vocab={} moe={} topk={} aux={} master={:?} mom={:?} data={} jsonl=v4 {}",
         device_name(&device),
         tokenizer.vocab_size,
         cfg.moe,
+        cfg.moe_topk,
+        cfg.moe_aux,
+        cfg.master,
+        cfg.mom,
         data_path.display(),
         format_cfg(&cfg)
     );
@@ -190,12 +279,14 @@ pub fn train(args: TrainArgs) -> Result<PathBuf> {
                 if step % cfg.log_every == 0 {
                     let stats = model.ternary_stats()?;
                     let avg = running / n_seen.max(1) as f32;
+                    let fp = train_footprint(&model, &opt, phase);
                     println!(
-                        "  {name} e{epoch} s{step:04} loss={avg:.4} ce={:.4} H={:.3} Hr={:.3} rss={:.1}MB tok/s={:.0} G={} zero={:.2} +={:.2} -={:.2}",
+                        "  {name} e{epoch} s{step:04} loss={avg:.4} ce={:.4} H={:.3} Hr={:.3} rss={:.1}MB{} tok/s={:.0} G={} zero={:.2} +={:.2} -={:.2}",
                         model.last_ce,
                         model.last_entropy,
                         model.last_router_entropy,
-                        process_memory_mb(),
+                        fp.rss_mb,
+                        fp.format_fields(),
                         thru.tok_s(),
                         model.cfg.n_basis,
                         stats.frac_zero,
@@ -250,6 +341,24 @@ fn maybe_insert(
     }
 }
 
+fn train_footprint(model: &UllisKan, opt: &SgdMomentum, phase: u8) -> TrainFootprint {
+    let rss_mb = process_memory_mb();
+    let baseline_metal_mb = metal_hello_mb();
+    let params_bytes = model.trainable_param_bytes(phase);
+    TrainFootprint {
+        rss_mb,
+        baseline_metal_mb,
+        net_mb: (rss_mb - baseline_metal_mb).max(0.0),
+        params_bytes,
+        grad_bytes: params_bytes,
+        opt_bytes: opt.vel_bytes(),
+        workspace_bytes: model.workspace_bytes(),
+        gpu_alias: u8::from(model.device.backend() == Backend::Metal),
+        embed_i8_bytes: model.embed_i8_bytes(),
+        scratch_bumps: 0,
+    }
+}
+
 fn format_cfg(cfg: &TrainConfig) -> String {
     format!(
         "d={} L={} G0={} T={} B={}",
@@ -265,7 +374,7 @@ fn write_card(path: &Path, model: &UllisKan, tokenizer: &BpeTokenizer) -> Result
         }
     }
     let card = serde_json::json!({
-        "engine": "Ullis AI Engine v0.7",
+        "engine": "Ullis AI Engine v0.9",
         "config": model.cfg,
         "vocab_size": tokenizer.vocab_size,
         "n_merges": tokenizer.merges.len(),
@@ -287,6 +396,12 @@ pub fn run_smoke(cpu: bool) -> Result<()> {
     layer.set_phase(1)?;
     let y1 = layer.forward(&device, &x, 4)?;
     assert_eq!(y1.len(), 4 * 8);
+
+    let mut wide = crate::kan::TernaryKanLinear::new(512, 64, 4, false, 1, 0.7, &mut rng)?;
+    let xw = crate::mixers::randn(2 * 512, 1.0, &mut rng);
+    let yw = wide.forward(&device, &xw, 2)?;
+    assert_eq!(yw.len(), 2 * 64);
+    assert!(yw.iter().all(|v| v.is_finite()));
 
     let y_coarse = y1.clone();
     layer.extend_grid(8)?;
@@ -346,7 +461,11 @@ pub fn run_smoke(cpu: bool) -> Result<()> {
         / 15.0;
     assert!(rec_err < 1e-3, "gauss-jordan residual {rec_err}");
 
-    let texts = corpus_texts(80, 0);
+    let texts = vec![
+        "def load(path):\n    return path\n".into(),
+        "fn main() {\n    match x {\n        Ok(s) => s,\n    }\n}\n".into(),
+        "#!/usr/bin/env bash\nset -euo pipefail\n".into(),
+    ];
     let mut tok = crate::tokenizer::train_bpe(&texts, 512, 0)?;
     let sample = "def load(path):\n    return path\n";
     let ids = tok.encode(sample, false, false);
@@ -376,13 +495,7 @@ pub fn run_smoke(cpu: bool) -> Result<()> {
     let mut rng = crate::device::rng_from_seed(0);
     let _ = model.generate_stream_pieces("def run(", &mut tok, 8, 0.0, &mut rng)?;
     let y_full = model.forward(&ids_t, 2, 24)?;
-    let y_coarse = model.forward_mode(
-        &ids_t,
-        2,
-        24,
-        crate::kan::KanEvalMode::Coarse,
-        false,
-    )?;
+    let y_coarse = model.forward_mode(&ids_t, 2, 24, crate::kan::KanEvalMode::Coarse, false)?;
     assert_eq!(y_full.len(), y_coarse.len());
 
     println!(

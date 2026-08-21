@@ -3,6 +3,27 @@
 Standalone ternary Kolmogorov–Arnold engine. Python/PyTorch is gone.
 Math is a faithful port of Ullis AI Engine v2.0 plus Mixture-of-Bumps.
 
+## v0.9.0 Infinite Lexicon & Persistent Sessions
+
+1. **Expandable vocabulary.** Production `V ≥ 8192` (`MIN_VOCAB`). Runtime
+   `--vocab-size` scales the id plane up to `MAX_VOCAB = 1_048_576` (131 072+).
+   Vocabularies below `MIN_VOCAB` are rejected. Pair-merges stop when count `< 2`, so the
+   tail of a large `V` stays empty rather than fabricating noise pieces.
+2. **Block-sparse packed-i8 embeddings.** `PackedI8Matrix` stores live blocks
+   of 64 rows with SIMD-aligned stride. Empty vocab tail is unmapped: lookup
+   and tied logits treat those rows as exact zeros, so scaling `V` does not
+   densify RSS or rewrite live rows (`grow_rows`).
+3. **Persistent sessions.** `--context-len` caps `SovereignFlashBuffer`. REPL
+   macros `/save` `/load` `/delete` `/rename` serialize the token ring plus
+   dialogue (never thinking) to `sessions/<name>.ullissnap` (`ULISSN01`) and
+   re-bind the plane as a Shared Metal buffer.
+4. **Fused gradient checkpointing.** Metal is compiled with
+   `#define ULLIS_FUSED_GRAD_CKPT 1`. Forward keeps only layer-boundary
+   `x^{(ℓ)}`; backward re-dispatches `ullis_mob_kan_fused_step` to rematerialize
+   interiors. Gradients are identical; peak activation RAM drops ~50%.
+
+Cognitive-bench schema and 15 golden anchors: `data/cognitive-bench.jsonl`.
+
 ## v0.8.0 Deep Context & Vocabulary Expansion
 
 V doubles to **8192** without growing the 40 MB train / 15 MB infer envelopes:
@@ -241,9 +262,7 @@ Packed as:
 ```
 
 Loss is masked onto the `thinking` + `output` span so the KAN layer learns
-the reasoning trajectory, plus the entropy penalty above. Legacy
-`{"text","lang"}` lines are lifted in-stream (the `lang` key is never a
-training target).
+the reasoning trajectory, plus the entropy penalty above.
 Token ring is a page-aligned `SovereignFlashBuffer` capped at 32 768 ids (~128 KB).
 
 ## Thinking mode

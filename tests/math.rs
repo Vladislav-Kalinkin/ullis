@@ -177,11 +177,472 @@ fn moe_sgd_steps_do_not_retain_graphs() {
     if rss0 > 0 {
         let growth = rss1.saturating_sub(rss0);
         assert!(
-            growth < 80 * 1024 * 1024,
+            growth < 8 * 1024 * 1024,
             "optimizer retained graphs: rss grew by {} MB ({} -> {})",
             growth / (1024 * 1024),
             rss0 / (1024 * 1024),
             rss1 / (1024 * 1024)
         );
     }
+}
+
+fn tiny_train_cfg() -> ullis::config::TrainConfig {
+    ullis::config::TrainConfig {
+        d_model: 8,
+        n_layers: 2,
+        n_basis: 4,
+        grid_start: 4,
+        grid_mid: 4,
+        grid_final: 8,
+        vocab_size: 32,
+        seq_len: 6,
+        batch_size: 2,
+        mixer: "shift".into(),
+        moe: true,
+        n_experts: 3,
+        seed: 11,
+        fused_grad_ckpt: true,
+        ..ullis::config::TrainConfig::default()
+    }
+}
+
+fn snapshot_sgd_oracle(
+    model: &mut ullis::model::UllisKan,
+    phase: u8,
+    lr: f32,
+    mu: f32,
+    max_norm: f32,
+) {
+    let snap = model.trainable_snapshot(phase);
+    let mut sq = 0.0f32;
+    for (_, _, g) in &snap {
+        for &v in g {
+            sq += v * v;
+        }
+    }
+    let scale = if max_norm > 0.0 {
+        let n = sq.sqrt();
+        if n > max_norm {
+            max_norm / n
+        } else {
+            1.0
+        }
+    } else {
+        1.0
+    };
+    for (name, mut data, grad) in snap {
+        for j in 0..data.len() {
+            let vel = scale * grad[j];
+            data[j] -= lr * (mu * 0.0 + vel);
+        }
+        model.write_param(&name, &data).unwrap();
+    }
+    model.sync_grids();
+}
+
+fn max_abs_params(a: &ullis::model::UllisKan, b: &ullis::model::UllisKan, phase: u8) -> f32 {
+    let sa = a.trainable_snapshot(phase);
+    let sb = b.trainable_snapshot(phase);
+    assert_eq!(sa.len(), sb.len());
+    let mut m = 0.0f32;
+    for ((na, da, _), (nb, db, _)) in sa.iter().zip(sb.iter()) {
+        assert_eq!(na, nb);
+        assert_eq!(da.len(), db.len());
+        for (x, y) in da.iter().zip(db.iter()) {
+            m = m.max((x - y).abs());
+        }
+    }
+    m
+}
+
+#[test]
+fn inplace_sgd_matches_snapshot_oracle() {
+    use ullis::model::UllisKan;
+    use ullis::optim::SgdMomentum;
+
+    let cfg = tiny_train_cfg();
+    let mut a = UllisKan::new(cfg.clone(), SovereignDevice::open(false).unwrap()).unwrap();
+    let mut b = UllisKan::new(cfg, SovereignDevice::open(false).unwrap()).unwrap();
+    a.set_phase(1).unwrap();
+    b.set_phase(1).unwrap();
+    let ids: Vec<u32> = (0..12).map(|i| i % 32).collect();
+    let y: Vec<u32> = (1..13).map(|i| i % 32).collect();
+    let mask = vec![1u8; 12];
+    let la = a.train_step(&ids, &y, &mask, 2, 6, 0.0).unwrap();
+    let lb = b.train_step(&ids, &y, &mask, 2, 6, 0.0).unwrap();
+    assert!((la - lb).abs() < 1e-6, "loss {la} vs {lb}");
+
+    let i8_before = a.embed_i8.codes.clone();
+    let mut opt = SgdMomentum::new(&a, 1, 3e-3, 0.9, 1.0).unwrap();
+    opt.step(&mut a, 1).unwrap();
+    snapshot_sgd_oracle(&mut b, 1, 3e-3, 0.9, 1.0);
+    let err = max_abs_params(&a, &b, 1);
+    assert!(err < 1e-6, "in-place vs snapshot max-abs {err}");
+    assert_eq!(
+        a.embed_i8.codes, i8_before,
+        "train SGD must not requantize embed i8"
+    );
+}
+
+#[test]
+fn insert_knot_zeros_vel_then_sgd_matches_oracle() {
+    use ullis::model::UllisKan;
+    use ullis::optim::SgdMomentum;
+
+    let cfg = tiny_train_cfg();
+    let mut a = UllisKan::new(cfg.clone(), SovereignDevice::open(false).unwrap()).unwrap();
+    let mut b = UllisKan::new(cfg, SovereignDevice::open(false).unwrap()).unwrap();
+    a.set_phase(1).unwrap();
+    b.set_phase(1).unwrap();
+    let ga = a.insert_knot().unwrap();
+    let gb = b.insert_knot().unwrap();
+    assert_eq!(ga, gb);
+    let mut opt = SgdMomentum::new(&a, 1, 3e-3, 0.9, 1.0).unwrap();
+    assert!(opt.vel_bytes() > 0);
+    let ids: Vec<u32> = (0..12).map(|i| i % 32).collect();
+    let y: Vec<u32> = (1..13).map(|i| i % 32).collect();
+    let mask = vec![1u8; 12];
+    a.train_step(&ids, &y, &mask, 2, 6, 0.0).unwrap();
+    b.train_step(&ids, &y, &mask, 2, 6, 0.0).unwrap();
+    opt.step(&mut a, 1).unwrap();
+    snapshot_sgd_oracle(&mut b, 1, 3e-3, 0.9, 1.0);
+    let err = max_abs_params(&a, &b, 1);
+    assert!(err < 1e-6, "post-insert in-place vs oracle {err}");
+}
+
+#[test]
+fn streamed_tied_ce_acc_matches_allocating_oracle() {
+    let n = 3usize;
+    let d = 4usize;
+    let v = 8usize;
+    let hidden: Vec<f32> = (0..n * d).map(|i| (i as f32) * 0.01 - 0.1).collect();
+    let embed: Vec<f32> = (0..v * d).map(|i| ((i % 7) as f32) * 0.05 - 0.2).collect();
+    let targets = [1u32, 3, 0];
+    let mask = [1u8, 0, 1];
+    let (loss, h, dh, de) =
+        ullis::mixers::streamed_tied_ce(&hidden, &embed, n, d, v, &targets, &mask, 0.03).unwrap();
+    let mut dh2 = vec![9.0f32; n * d];
+    let mut prior = vec![0.25f32; v * d];
+    let mut row = Vec::new();
+    let (loss2, h2) = ullis::mixers::streamed_tied_ce_acc(
+        &hidden, &embed, n, d, v, &targets, &mask, 0.03, &mut dh2, &mut prior, &mut row,
+    )
+    .unwrap();
+    assert!((loss - loss2).abs() < 1e-6);
+    assert!((h - h2).abs() < 1e-6);
+    for (a, b) in dh.iter().zip(dh2.iter()) {
+        assert!((a - b).abs() < 1e-6);
+    }
+    for (g, p) in de.iter().zip(prior.iter()) {
+        assert!(
+            (0.25 + *g - *p).abs() < 1e-6,
+            "must not scale historical embed_grad"
+        );
+    }
+}
+
+#[test]
+fn moe_topk_dense_matches_full_softmax() {
+    let gpu = SovereignDevice::open(false).unwrap();
+    let mut rng = ullis::device::rng_from_seed(3);
+    let mut dense = TernaryKanLinear::new(8, 8, 4, true, 3, 0.7, &mut rng).unwrap();
+    let mut rng = ullis::device::rng_from_seed(3);
+    let mut tagged = TernaryKanLinear::new(8, 8, 4, true, 3, 0.7, &mut rng).unwrap();
+    tagged.moe_topk = 0;
+    let x = ullis::mixers::randn(4 * 8, 1.0, &mut ullis::device::rng_from_seed(4));
+    let y0 = dense.forward(&gpu, &x, 4).unwrap();
+    let y1 = tagged.forward(&gpu, &x, 4).unwrap();
+    let err = y0
+        .iter()
+        .zip(y1.iter())
+        .map(|(a, b)| (a - b).abs())
+        .fold(0.0f32, f32::max);
+    assert!(err == 0.0, "topk=0 must be bit-identical, max|Δ|={err}");
+}
+
+#[test]
+fn moe_topk_routing_histogram_not_collapsed() {
+    use ullis::config::TrainConfig;
+    use ullis::model::UllisKan;
+
+    let gpu = SovereignDevice::open(false).unwrap();
+    let cfg = TrainConfig {
+        d_model: 16,
+        n_layers: 2,
+        n_basis: 4,
+        vocab_size: 64,
+        seq_len: 16,
+        batch_size: 4,
+        mixer: "shift".into(),
+        moe: true,
+        n_experts: 3,
+        moe_topk: 1,
+        seed: 11,
+        fused_grad_ckpt: true,
+        ..TrainConfig::default()
+    };
+    let mut model = UllisKan::new(cfg, gpu).unwrap();
+    model.set_phase(1).unwrap();
+    let ids: Vec<u32> = (0..64).map(|i| i % 64).collect();
+    let _ = model.forward(&ids, 4, 16).unwrap();
+    for (li, blk) in model.blocks.iter().enumerate() {
+        let fr = blk.ff.route_fractions();
+        assert_eq!(fr.len(), 3);
+        for (e, f) in fr.iter().enumerate() {
+            assert!(*f <= 0.95, "layer {li} expert {e} collapsed: fraction {f}");
+        }
+        let hits: u32 = blk.ff.last_route_hits.iter().sum();
+        assert_eq!(hits, blk.ff.last_route_tokens);
+    }
+}
+
+#[test]
+fn moe_topk1_forward_finite() {
+    let gpu = SovereignDevice::open(false).unwrap();
+    let mut rng = ullis::device::rng_from_seed(8);
+    let mut layer = TernaryKanLinear::new(8, 8, 4, true, 3, 0.7, &mut rng).unwrap();
+    layer.moe_topk = 1;
+    let x = ullis::mixers::randn(6 * 8, 1.0, &mut rng);
+    let y = layer.forward(&gpu, &x, 6).unwrap();
+    assert!(y.iter().all(|v| v.is_finite()));
+    let fr = layer.route_fractions();
+    for f in &fr {
+        assert!(*f <= 1.0);
+    }
+    let hits: u32 = layer.last_route_hits.iter().sum();
+    assert_eq!(hits, layer.last_route_tokens);
+}
+
+fn snap_kan_to_f16(model: &mut ullis::model::UllisKan) {
+    for b in &mut model.blocks {
+        for t in [
+            &mut b.ff.weight_base,
+            &mut b.ff.weight_shared,
+            &mut b.ff.weight_routed,
+            &mut b.ff.router,
+        ]
+        .into_iter()
+        .flatten()
+        {
+            ullis::quant::quantize_f16_in_place(t.as_mut_slice());
+        }
+    }
+}
+
+#[test]
+fn fp16_master_matches_snapped_fp32_tape() {
+    use ullis::config::{MasterDtype, TrainConfig};
+    use ullis::model::UllisKan;
+
+    let make = |master: MasterDtype| {
+        let gpu = SovereignDevice::open(false).unwrap();
+        let cfg = TrainConfig {
+            d_model: 8,
+            n_layers: 2,
+            n_basis: 4,
+            vocab_size: 32,
+            seq_len: 6,
+            mixer: "shift".into(),
+            moe: true,
+            n_experts: 3,
+            seed: 9,
+            fused_grad_ckpt: true,
+            master,
+            ..TrainConfig::default()
+        };
+        UllisKan::new(cfg, gpu).unwrap()
+    };
+    let mut fp32 = make(MasterDtype::Fp32);
+    let mut fp16 = make(MasterDtype::Fp16);
+    snap_kan_to_f16(&mut fp32);
+    fp32.set_phase(1).unwrap();
+    fp16.set_phase(1).unwrap();
+    let ids: Vec<u32> = (0..12).map(|i| i % 32).collect();
+    let y: Vec<u32> = (1..13).map(|i| i % 32).collect();
+    let mask = vec![1u8; 12];
+    let la = fp32.train_step(&ids, &y, &mask, 2, 6, 0.0).unwrap();
+    let lb = fp16.train_step(&ids, &y, &mask, 2, 6, 0.0).unwrap();
+    assert!((la - lb).abs() < 1e-4, "loss {la} vs {lb}");
+    let sa = fp32.trainable_snapshot(1);
+    let sb = fp16.trainable_snapshot(1);
+    assert_eq!(sa.len(), sb.len());
+    let mut m = 0.0f32;
+    for ((na, _, ga), (nb, _, gb)) in sa.iter().zip(sb.iter()) {
+        assert_eq!(na, nb);
+        for (x, y) in ga.iter().zip(gb.iter()) {
+            m = m.max((x - y).abs());
+        }
+    }
+    assert!(m < 1e-4, "fp16 master vs snapped fp32 max|Δgrad|={m}");
+}
+
+#[test]
+fn q8_mom_updates_params() {
+    use ullis::config::{MomDtype, TrainConfig};
+    use ullis::model::UllisKan;
+    use ullis::optim::SgdMomentum;
+
+    let gpu = SovereignDevice::open(false).unwrap();
+    let cfg = TrainConfig {
+        d_model: 8,
+        n_layers: 2,
+        n_basis: 4,
+        vocab_size: 32,
+        seq_len: 6,
+        mixer: "shift".into(),
+        moe: true,
+        n_experts: 3,
+        seed: 4,
+        mom: MomDtype::Q8,
+        ..TrainConfig::default()
+    };
+    let mut model = UllisKan::new(cfg, gpu).unwrap();
+    model.set_phase(1).unwrap();
+    let before = model.trainable_snapshot(1);
+    let ids: Vec<u32> = (0..12).map(|i| i % 32).collect();
+    let y: Vec<u32> = (1..13).map(|i| i % 32).collect();
+    let mask = vec![1u8; 12];
+    model.train_step(&ids, &y, &mask, 2, 6, 0.0).unwrap();
+    let mut opt = SgdMomentum::new(&model, 1, 3e-3, 0.9, 1.0).unwrap();
+    opt.step(&mut model, 1).unwrap();
+    let after = model.trainable_snapshot(1);
+    let mut changed = false;
+    for ((_, da, _), (_, db, _)) in before.iter().zip(after.iter()) {
+        for (x, y) in da.iter().zip(db.iter()) {
+            if (x - y).abs() > 1e-12 {
+                changed = true;
+            }
+        }
+    }
+    assert!(changed, "q8 momentum must update weights");
+}
+
+#[test]
+fn fused_forward_d512_cpu() {
+    let gpu = SovereignDevice::open(false).unwrap();
+    let mut rng = ullis::device::rng_from_seed(5);
+    let mut layer = TernaryKanLinear::new(512, 64, 4, true, 3, 0.7, &mut rng).unwrap();
+    let x = ullis::mixers::randn(2 * 512, 1.0, &mut rng);
+    let y = layer.forward(&gpu, &x, 2).unwrap();
+    assert_eq!(y.len(), 2 * 64);
+    assert!(y.iter().all(|v| v.is_finite()));
+    assert!(y.iter().any(|v| *v != 0.0));
+}
+
+fn max_abs(a: &[f32], b: &[f32]) -> f32 {
+    a.iter()
+        .zip(b.iter())
+        .map(|(x, y)| (x - y).abs())
+        .fold(0.0f32, f32::max)
+}
+
+fn layer_bwd_pair(
+    gpu_host: &SovereignDevice,
+    gpu_fused: &SovereignDevice,
+    in_f: usize,
+    out_f: usize,
+    n: usize,
+    moe: bool,
+    phase: u8,
+) -> f32 {
+    let mut rng = ullis::device::rng_from_seed(21);
+    let mut host = TernaryKanLinear::new(in_f, out_f, 4, moe, 3, 0.7, &mut rng).unwrap();
+    let mut rng = ullis::device::rng_from_seed(21);
+    let mut fused = TernaryKanLinear::new(in_f, out_f, 4, moe, 3, 0.7, &mut rng).unwrap();
+    host.set_phase(phase).unwrap();
+    fused.set_phase(phase).unwrap();
+    let x = ullis::mixers::randn(n * in_f, 1.0, &mut ullis::device::rng_from_seed(22));
+    let _ = host.forward(gpu_host, &x, n).unwrap();
+    let _ = fused.forward(gpu_fused, &x, n).unwrap();
+    let dy: Vec<f32> = (0..n * out_f)
+        .map(|i| 0.01 * ((i % 5) as f32 - 2.0))
+        .collect();
+    let dx_h = host
+        .backward(&x, &dy, n, ullis::kan::KanEvalMode::Full)
+        .unwrap();
+    let mut dx_f = vec![0.0f32; n * in_f];
+    let mut xt = None;
+    let mut dyt = None;
+    let mut part = None;
+    fused
+        .backward_fused(
+            gpu_fused,
+            &x,
+            &dy,
+            n,
+            ullis::kan::KanEvalMode::Full,
+            &mut dx_f,
+            &mut xt,
+            &mut dyt,
+            &mut part,
+        )
+        .unwrap();
+    let mut m = max_abs(&dx_h, &dx_f);
+    m = m.max(max_abs(&host.grad_base, &fused.grad_base));
+    m = m.max(max_abs(&host.grad_shared, &fused.grad_shared));
+    m = m.max(max_abs(&host.grad_routed, &fused.grad_routed));
+    m = m.max(max_abs(&host.grad_router, &fused.grad_router));
+    m = m.max(max_abs(&host.grad_centers, &fused.grad_centers));
+    m = m.max(max_abs(&host.grad_scale_base, &fused.grad_scale_base));
+    m = m.max(max_abs(&host.grad_scale_shared, &fused.grad_scale_shared));
+    m = m.max(max_abs(&host.grad_scale_routed, &fused.grad_scale_routed));
+    m
+}
+
+#[test]
+fn fused_bwd_cpu_matches_host_d32() {
+    let cpu = SovereignDevice::open(false).unwrap();
+    let err = layer_bwd_pair(&cpu, &cpu, 32, 32, 8, true, 1);
+    assert!(err < 1e-4, "cpu fused vs host d=32 phase1 max|Δ|={err}");
+    let err = layer_bwd_pair(&cpu, &cpu, 32, 32, 8, true, 3);
+    assert!(err < 1e-4, "cpu fused vs host d=32 qat max|Δ|={err}");
+}
+
+#[test]
+fn fused_bwd_cpu_matches_host_d512() {
+    let cpu = SovereignDevice::open(false).unwrap();
+    let err = layer_bwd_pair(&cpu, &cpu, 512, 64, 2, true, 1);
+    assert!(err < 1e-4, "cpu fused vs host d=512 max|Δ|={err}");
+}
+
+#[test]
+fn fused_bwd_metal_matches_cpu_d32() {
+    let metal = SovereignDevice::open(true).unwrap();
+    if !metal.is_metal() {
+        return;
+    }
+    let cpu = SovereignDevice::open(false).unwrap();
+    let err = layer_bwd_pair(&cpu, &metal, 32, 32, 8, true, 1);
+    assert!(err < 1e-4, "metal fused vs host d=32 max|Δ|={err}");
+}
+
+#[test]
+fn fused_bwd_metal_matches_cpu_d512() {
+    let metal = SovereignDevice::open(true).unwrap();
+    if !metal.is_metal() {
+        return;
+    }
+    let cpu = SovereignDevice::open(false).unwrap();
+    let err = layer_bwd_pair(&cpu, &metal, 512, 64, 2, true, 1);
+    assert!(err < 1e-4, "metal fused vs host d=512 max|Δ|={err}");
+}
+
+#[test]
+fn fused_forward_d512_metal_matches_cpu() {
+    let metal = SovereignDevice::open(true).unwrap();
+    if !metal.is_metal() {
+        return;
+    }
+    let cpu = SovereignDevice::open(false).unwrap();
+    let mut rng = ullis::device::rng_from_seed(6);
+    let mut layer = TernaryKanLinear::new(512, 64, 4, true, 3, 0.7, &mut rng).unwrap();
+    let x = ullis::mixers::randn(2 * 512, 1.0, &mut rng);
+    let y_cpu = layer.forward(&cpu, &x, 2).unwrap();
+    let y_gpu = layer.forward(&metal, &x, 2).unwrap();
+    let max = y_cpu
+        .iter()
+        .zip(y_gpu.iter())
+        .map(|(a, b)| (a - b).abs())
+        .fold(0.0f32, f32::max);
+    assert!(max < 1e-4, "layer d=512 metal vs cpu max|Δ|={max}");
 }

@@ -62,8 +62,7 @@ Loss is masked onto `thinking` + `output` so the KAN layer learns the
 logical chain (bracket matching, import tracking, lifetime ownership,
 pipeline quoting). A verified sample corpus lives at
 [`data/thinking-train.jsonl`](data/thinking-train.jsonl) (Rust, Python, Bash).
-
-Legacy `{"text","lang"}` lines are still lifted in-stream.
+Lines that are not this 4-key object are skipped.
 
 ---
 

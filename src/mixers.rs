@@ -7,34 +7,60 @@ use crate::accelerate::{sgemm, sgemm_nt, softmax_rows};
 /// Parameter-free token mix: delay half the channels by one step.
 /// `x` is `[b, t, c]` row-major.
 pub fn causal_shift(x: &[f32], b: usize, t: usize, c: usize) -> Result<Vec<f32>> {
+    let mut y = vec![0.0f32; b.saturating_mul(t).saturating_mul(c)];
+    causal_shift_into(x, b, t, c, &mut y)?;
+    Ok(y)
+}
+
+/// Write `causal_shift` into `y`. Delayed channels at `t=0` are zeroed.
+pub fn causal_shift_into(x: &[f32], b: usize, t: usize, c: usize, y: &mut [f32]) -> Result<()> {
     if x.len() != b * t * c {
         anyhow::bail!("causal_shift len {} != b*t*c {}", x.len(), b * t * c);
     }
+    if y.len() < x.len() {
+        anyhow::bail!("causal_shift y len {} < {}", y.len(), x.len());
+    }
     let split = c / 2;
-    let mut y = vec![0.0f32; x.len()];
+    let y = &mut y[..x.len()];
     for bi in 0..b {
         for ti in 0..t {
             let src = (bi * t + ti) * c;
             let dst = src;
             y[dst..dst + split].copy_from_slice(&x[src..src + split]);
             if ti == 0 {
-                // delayed half is zeros (already)
+                y[dst + split..dst + c].fill(0.0);
             } else {
                 let prev = (bi * t + (ti - 1)) * c + split;
                 y[dst + split..dst + c].copy_from_slice(&x[prev..prev + (c - split)]);
             }
         }
     }
-    Ok(y)
+    Ok(())
 }
 
 /// `dx` for `y = causal_shift(x)`. `dy` is `[b,t,c]`.
 pub fn causal_shift_backward(dy: &[f32], b: usize, t: usize, c: usize) -> Result<Vec<f32>> {
+    let mut dx = vec![0.0f32; b.saturating_mul(t).saturating_mul(c)];
+    causal_shift_backward_into(dy, b, t, c, &mut dx)?;
+    Ok(dx)
+}
+
+pub fn causal_shift_backward_into(
+    dy: &[f32],
+    b: usize,
+    t: usize,
+    c: usize,
+    dx: &mut [f32],
+) -> Result<()> {
     if dy.len() != b * t * c {
         anyhow::bail!("causal_shift_backward len mismatch");
     }
+    if dx.len() < dy.len() {
+        anyhow::bail!("causal_shift_backward dx short");
+    }
     let split = c / 2;
-    let mut dx = vec![0.0f32; dy.len()];
+    let dx = &mut dx[..dy.len()];
+    dx.fill(0.0);
     for bi in 0..b {
         for ti in 0..t {
             let i = (bi * t + ti) * c;
@@ -49,7 +75,7 @@ pub fn causal_shift_backward(dy: &[f32], b: usize, t: usize, c: usize) -> Result
             }
         }
     }
-    Ok(dx)
+    Ok(())
 }
 
 pub struct CausalAttention {
@@ -76,6 +102,25 @@ impl CausalAttention {
     }
 
     pub fn forward(&self, x: &[f32], b: usize, t: usize) -> Result<Vec<f32>> {
+        let mut y = vec![0.0f32; x.len()];
+        self.forward_into(x, b, t, &mut y)?;
+        Ok(y)
+    }
+
+    pub fn forward_into(&self, x: &[f32], b: usize, t: usize, y: &mut [f32]) -> Result<()> {
+        let d = self.d_model;
+        if x.len() != b * t * d {
+            anyhow::bail!("attn x len");
+        }
+        if y.len() < x.len() {
+            anyhow::bail!("attn y len");
+        }
+        let tmp = self.forward_alloc(x, b, t)?;
+        y[..x.len()].copy_from_slice(&tmp);
+        Ok(())
+    }
+
+    fn forward_alloc(&self, x: &[f32], b: usize, t: usize) -> Result<Vec<f32>> {
         let d = self.d_model;
         if x.len() != b * t * d {
             anyhow::bail!("attn x len");
@@ -145,10 +190,25 @@ pub fn randn(n: usize, std: f32, rng: &mut impl rand::Rng) -> Vec<f32> {
 
 /// RMSNorm last dim. `x` `[n, d]`, `weight` `[d]`.
 pub fn rmsnorm(x: &[f32], n: usize, d: usize, weight: &[f32], eps: f32) -> Result<Vec<f32>> {
+    let mut y = vec![0.0f32; n.saturating_mul(d)];
+    rmsnorm_into(x, n, d, weight, eps, &mut y)?;
+    Ok(y)
+}
+
+pub fn rmsnorm_into(
+    x: &[f32],
+    n: usize,
+    d: usize,
+    weight: &[f32],
+    eps: f32,
+    y: &mut [f32],
+) -> Result<()> {
     if x.len() != n * d || weight.len() != d {
         anyhow::bail!("rmsnorm shape");
     }
-    let mut y = vec![0.0f32; x.len()];
+    if y.len() < x.len() {
+        anyhow::bail!("rmsnorm y len {} < {}", y.len(), x.len());
+    }
     for i in 0..n {
         let row = &x[i * d..(i + 1) * d];
         let mut ms = 0.0f32;
@@ -161,7 +221,7 @@ pub fn rmsnorm(x: &[f32], n: usize, d: usize, weight: &[f32], eps: f32) -> Resul
             dst[j] = row[j] * inv * weight[j];
         }
     }
-    Ok(y)
+    Ok(())
 }
 
 /// Backward of RMSNorm. Returns `(dx, dw)`.
@@ -173,8 +233,30 @@ pub fn rmsnorm_backward(
     weight: &[f32],
     eps: f32,
 ) -> Result<(Vec<f32>, Vec<f32>)> {
-    let mut dx = vec![0.0f32; x.len()];
+    let mut dx = vec![0.0f32; n.saturating_mul(d)];
     let mut dw = vec![0.0f32; d];
+    rmsnorm_backward_into(x, dy, n, d, weight, eps, &mut dx, &mut dw)?;
+    Ok((dx, dw))
+}
+
+pub fn rmsnorm_backward_into(
+    x: &[f32],
+    dy: &[f32],
+    n: usize,
+    d: usize,
+    weight: &[f32],
+    eps: f32,
+    dx: &mut [f32],
+    dw: &mut [f32],
+) -> Result<()> {
+    if x.len() != n * d || dy.len() != n * d || weight.len() != d {
+        anyhow::bail!("rmsnorm_backward shape");
+    }
+    if dx.len() < n * d || dw.len() < d {
+        anyhow::bail!("rmsnorm_backward out short");
+    }
+    dx[..n * d].fill(0.0);
+    dw[..d].fill(0.0);
     for i in 0..n {
         let xr = &x[i * d..(i + 1) * d];
         let g = &dy[i * d..(i + 1) * d];
@@ -196,25 +278,41 @@ pub fn rmsnorm_backward(
             dx[i * d + j] += 2.0 * xr[j] * dms;
         }
     }
-    Ok((dx, dw))
+    Ok(())
 }
 
 pub fn embed_lookup(table: &[f32], vocab: usize, d: usize, ids: &[u32]) -> Result<Vec<f32>> {
+    let mut y = vec![0.0f32; ids.len().saturating_mul(d)];
+    embed_lookup_into(table, vocab, d, ids, &mut y)?;
+    Ok(y)
+}
+
+pub fn embed_lookup_into(
+    table: &[f32],
+    vocab: usize,
+    d: usize,
+    ids: &[u32],
+    y: &mut [f32],
+) -> Result<()> {
     if table.len() != vocab * d {
         anyhow::bail!("embed table len");
     }
-    let mut y = vec![0.0f32; ids.len() * d];
+    if y.len() < ids.len() * d {
+        anyhow::bail!("embed lookup y short");
+    }
     for (t, &id) in ids.iter().enumerate() {
         let i = (id as usize).min(vocab.saturating_sub(1));
         y[t * d..(t + 1) * d].copy_from_slice(&table[i * d..(i + 1) * d]);
     }
-    Ok(y)
+    Ok(())
 }
 
 /// Streamed tied-head CE + entropy. Never materializes `[n, V]` logits, so
 /// `V=8192` training stays inside the 40 MB envelope.
 ///
 /// Returns `(loss, mean_entropy, dhidden[n,d], dembed[V,d])`.
+/// Allocating `dembed` is for tests/oracle only — the train path uses
+/// [`streamed_tied_ce_acc`] into the standing `embed_grad` buffer.
 pub fn streamed_tied_ce(
     hidden: &[f32],
     embed: &[f32],
@@ -225,21 +323,71 @@ pub fn streamed_tied_ce(
     mask: &[u8],
     entropy_coef: f32,
 ) -> Result<(f32, f32, Vec<f32>, Vec<f32>)> {
+    let mut dhidden = vec![0.0f32; n.saturating_mul(d)];
+    let mut dembed = vec![0.0f32; v.saturating_mul(d)];
+    let mut row = Vec::new();
+    let (loss, mean_h) = streamed_tied_ce_acc(
+        hidden,
+        embed,
+        n,
+        d,
+        v,
+        targets,
+        mask,
+        entropy_coef,
+        &mut dhidden,
+        &mut dembed,
+        &mut row,
+    )?;
+    Ok((loss, mean_h, dhidden, dembed))
+}
+
+/// Two-pass CE: count `den`, then accumulate `g/den` **directly** into
+/// `dhidden[n,d]` (overwritten) and `embed_grad[V,d]` (added).
+///
+/// Does **not** allocate a `[V,d]` increment and does **not** scale any
+/// historical values already in `embed_grad`.
+pub fn streamed_tied_ce_acc(
+    hidden: &[f32],
+    embed: &[f32],
+    n: usize,
+    d: usize,
+    v: usize,
+    targets: &[u32],
+    mask: &[u8],
+    entropy_coef: f32,
+    dhidden: &mut [f32],
+    embed_grad: &mut [f32],
+    logits_row: &mut Vec<f32>,
+) -> Result<(f32, f32)> {
     if hidden.len() != n * d || embed.len() != v * d || targets.len() != n || mask.len() != n {
         anyhow::bail!("streamed tied-ce shape");
     }
-    let mut dhidden = vec![0.0f32; n * d];
-    let mut dembed = vec![0.0f32; v * d];
-    let mut row = vec![0.0f32; v];
+    if dhidden.len() != n * d {
+        anyhow::bail!("dhidden len {} != n*d {}", dhidden.len(), n * d);
+    }
+    if embed_grad.len() != v * d {
+        anyhow::bail!("embed_grad len {} != v*d {}", embed_grad.len(), v * d);
+    }
+    dhidden.fill(0.0);
+    if logits_row.len() < v {
+        logits_row.resize(v, 0.0);
+    }
+    let row = &mut logits_row[..v];
+    let mut den = 0.0f32;
+    for &m in mask {
+        if m != 0 {
+            den += 1.0;
+        }
+    }
+    let inv_den = if den > 0.0 { 1.0 / den } else { 0.0 };
+    let lam = entropy_coef.max(0.0);
     let mut loss = 0.0f32;
     let mut h_sum = 0.0f32;
-    let mut den = 0.0f32;
-    let lam = entropy_coef.max(0.0);
     for i in 0..n {
         if mask[i] == 0 {
             continue;
         }
-        den += 1.0;
         let h = &hidden[i * d..(i + 1) * d];
         for tok in 0..v {
             let er = &embed[tok * d..(tok + 1) * d];
@@ -274,41 +422,64 @@ pub fn streamed_tied_ce(
             if lam > 0.0 {
                 g += lam * (-p * (p.max(1e-12).ln() + entropy));
             }
+            g *= inv_den;
             let er = &embed[tok * d..(tok + 1) * d];
             let dh = &mut dhidden[i * d..(i + 1) * d];
-            let de = &mut dembed[tok * d..(tok + 1) * d];
+            let de = &mut embed_grad[tok * d..(tok + 1) * d];
             for j in 0..d {
                 dh[j] += g * er[j];
                 de[j] += g * h[j];
             }
         }
     }
-    if den > 0.0 {
-        let inv = 1.0 / den;
-        loss *= inv;
-        h_sum *= inv;
-        for x in &mut dhidden {
-            *x *= inv;
-        }
-        for x in &mut dembed {
-            *x *= inv;
-        }
-        loss += lam * h_sum;
-    }
-    Ok((loss, h_sum, dhidden, dembed))
+    loss *= inv_den;
+    h_sum *= inv_den;
+    loss += lam * h_sum;
+    Ok((loss, h_sum))
 }
 
 pub fn embed_scatter(vocab: usize, d: usize, ids: &[u32], dy: &[f32]) -> Result<Vec<f32>> {
     let mut dw = vec![0.0f32; vocab * d];
+    embed_scatter_acc(vocab, d, ids, dy, &mut dw)?;
+    Ok(dw)
+}
+
+/// Add `dy[t]` into `embed_grad[id[t]]`. Does not allocate `[V,d]`.
+pub fn embed_scatter_acc(
+    vocab: usize,
+    d: usize,
+    ids: &[u32],
+    dy: &[f32],
+    embed_grad: &mut [f32],
+) -> Result<()> {
+    if vocab == 0 || d == 0 {
+        anyhow::bail!("embed scatter empty vocab/d");
+    }
+    if dy.len() != ids.len() * d {
+        anyhow::bail!(
+            "embed scatter dy len {} != ids*d {}",
+            dy.len(),
+            ids.len() * d
+        );
+    }
+    if embed_grad.len() != vocab * d {
+        anyhow::bail!(
+            "embed_grad len {} != vocab*d {}",
+            embed_grad.len(),
+            vocab * d
+        );
+    }
     for (t, &id) in ids.iter().enumerate() {
-        let i = (id as usize).min(vocab.saturating_sub(1));
+        let raw = id as usize;
+        debug_assert!(raw < vocab, "embed scatter id {id} >= vocab {vocab}");
+        let i = raw.min(vocab.saturating_sub(1));
         let src = &dy[t * d..(t + 1) * d];
-        let dst = &mut dw[i * d..(i + 1) * d];
+        let dst = &mut embed_grad[i * d..i * d + d];
         for j in 0..d {
             dst[j] += src[j];
         }
     }
-    Ok(dw)
+    Ok(())
 }
 
 /// Masked CE. `logits` `[n, v]`, `targets`/`mask` length `n`. Returns `(loss, dlogits)`.

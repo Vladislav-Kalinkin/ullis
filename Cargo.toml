@@ -1,8 +1,8 @@
 [package]
 name = "ullis"
-version = "0.8.0"
+version = "0.9.0"
 edition = "2021"
-description = "Ullis AI Engine — Deep Context WordPiece + packed-i8 embeddings"
+description = "Ullis AI Engine — Infinite Lexicon WordPiece + packed-i8 embeddings"
 license = "MIT-only"
 default-run = "ullis"
 rust-version = "1.80"

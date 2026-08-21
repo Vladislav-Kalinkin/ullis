@@ -3,8 +3,19 @@
 //! Canonical line:
 //! `{"system":"...","user":"...","thinking":"...","output":"..."}`
 //!
-//! Legacy `{"text":"...","lang":"..."}` and raw-text lines are lifted in-stream
-//! so existing corpora keep training.
+//! # Cognitive-bench schema (v0.9)
+//! Let a record be the 4-tuple `R = (s, u, τ, y)` with
+//! `s = system`, `u = user`, `τ = thinking`, `y = output`. Packed stream:
+//!
+//! `x = <|system|> s <|user|> u <|thinking|> τ <|/thinking|> <|output|> y`
+//!
+//! Supervised mask `m_t = 1` iff token `t` falls in `τ ∪ y`, else 0.
+//! Loss `L = mean_m [ −log p(x_{t+1} | x_{≤t}) + λ_H H(p) ] + λ_R H(g)`.
+//! `τ` is a numbered, language-agnostic chain: (1) surface-token language
+//! ID, (2) type/ownership/data-flow inventory, (3) constraint solve
+//! (lifetimes, quoting, encoding), (4) control-flow / pipeline DAG,
+//! (5) failure modes, (6) emission checklist. Golden anchors:
+//! `data/cognitive-bench.jsonl` (3 conversational, 4 Rust, 4 Python, 4 Bash).
 //!
 //! Token storage is a cache-line / page-aligned `SovereignFlashBuffer` (no
 //! `VecDeque`). After `bind_metal`, evaluation sweeps DMA the host pointer
@@ -39,49 +50,7 @@ pub struct ChatRecord {
     pub output: String,
 }
 
-#[derive(Debug, Deserialize)]
-struct LegacyRecord {
-    #[serde(default)]
-    text: Option<String>,
-    #[serde(default)]
-    content: Option<String>,
-    #[serde(default)]
-    lang: Option<String>,
-}
-
-impl LegacyRecord {
-    fn text(&self) -> Option<&str> {
-        self.text
-            .as_deref()
-            .or(self.content.as_deref())
-            .filter(|s| !s.is_empty())
-    }
-}
-
 impl ChatRecord {
-    pub fn system_for_lang(lang: &str) -> &'static str {
-        match lang {
-            "rust" => "You are a Rust compiler specialist.",
-            "python" => "You are a Python interpreter specialist.",
-            "bash" => "You are a POSIX shell specialist.",
-            _ => "You are a compact ternary KAN code engine.",
-        }
-    }
-
-    pub fn from_legacy(text: &str, lang: Option<&str>) -> Self {
-        let lang = lang.unwrap_or_else(|| infer_lang(text));
-        let system = Self::system_for_lang(lang).to_string();
-        let thinking = format!(
-            "1. Language signal is {lang}.\n2. Read the requested snippet.\n3. Emit complete, well-formed source that matches the surrounding tokens."
-        );
-        Self {
-            system,
-            user: "Write the following program.".into(),
-            thinking,
-            output: text.trim_end().to_string(),
-        }
-    }
-
     pub fn pack(&self) -> String {
         pack_record(
             &self.system,
@@ -89,16 +58,6 @@ impl ChatRecord {
             Some(&self.thinking),
             Some(&self.output),
         )
-    }
-}
-
-pub fn infer_lang(text: &str) -> &'static str {
-    if text.contains("fn ") || text.contains("impl ") || text.contains("pub ") {
-        "rust"
-    } else if text.contains("#!/usr/bin/env bash") || text.contains("set -euo") {
-        "bash"
-    } else {
-        "python"
     }
 }
 
@@ -164,13 +123,14 @@ pub fn encode_supervised(tokenizer: &mut BpeTokenizer, rec: &ChatRecord) -> (Vec
 /// contiguous `[0, len)` window after `compact`, so the token pointer can be
 /// handed to Metal as a no-copy Shared buffer.
 pub struct SovereignFlashBuffer {
+    // Drop = declaration order. metal MUST be first so the wrap dies before dealloc.
+    #[cfg(target_os = "macos")]
+    metal: Option<metal::Buffer>,
     slab: PageSlab,
     cap: usize,
     mask_off: usize,
     start: usize,
     len: usize,
-    #[cfg(target_os = "macos")]
-    metal: Option<metal::Buffer>,
 }
 
 impl std::fmt::Debug for SovereignFlashBuffer {
@@ -190,13 +150,13 @@ impl SovereignFlashBuffer {
         let mask_off = cap * 4;
         let bytes = mask_off + cap;
         Ok(Self {
+            #[cfg(target_os = "macos")]
+            metal: None,
             slab: PageSlab::new(bytes)?,
             cap,
             mask_off,
             start: 0,
             len: 0,
-            #[cfg(target_os = "macos")]
-            metal: None,
         })
     }
 
@@ -213,16 +173,12 @@ impl SovereignFlashBuffer {
     }
 
     fn tokens(&self) -> &[u32] {
-        self.slab
-            .u32_at(0, self.cap)
-            .expect("flash token plane")
+        self.slab.u32_at(0, self.cap).expect("flash token plane")
     }
 
     fn tokens_mut(&mut self) -> &mut [u32] {
         let cap = self.cap;
-        self.slab
-            .u32_at_mut(0, cap)
-            .expect("flash token plane")
+        self.slab.u32_at_mut(0, cap).expect("flash token plane")
     }
 
     fn masks(&self) -> &[u8] {
@@ -321,6 +277,15 @@ impl SovereignFlashBuffer {
         &self.tokens()[s..s + self.len]
     }
 
+    /// Replace occupancy with a saved token sequence (session restore).
+    pub fn load_tokens(&mut self, ids: &[u32]) {
+        self.clear();
+        for &id in ids {
+            self.push(id, 1);
+        }
+        self.compact();
+    }
+
     /// Bind the page-aligned token plane as a no-copy Shared Metal buffer.
     pub fn bind_metal(&mut self, gpu: &SovereignDevice) -> Result<()> {
         self.compact();
@@ -329,6 +294,7 @@ impl SovereignFlashBuffer {
             let Some(mtl) = gpu.mtl_device() else {
                 return Ok(());
             };
+            self.metal = None;
             let tok_bytes = self.slab.as_bytes();
             self.metal = Some(crate::device::wrap_shared_bytes_no_copy(mtl, tok_bytes)?);
             Ok(())
@@ -346,23 +312,35 @@ impl SovereignFlashBuffer {
     }
 }
 
+/// Packed 4-key strings for tokenizer training. Training never synthesizes text.
+pub fn jsonl_corpus_texts(path: impl AsRef<Path>, max_records: usize) -> Result<Vec<String>> {
+    let path = path.as_ref();
+    let file = File::open(path).with_context(|| format!("open {}", path.display()))?;
+    let reader = BufReader::new(file);
+    let mut texts = Vec::new();
+    for line in reader.lines() {
+        let line = line?;
+        let Some(rec) = parse_jsonl_line(&line) else {
+            continue;
+        };
+        texts.push(rec.pack());
+        if texts.len() >= max_records {
+            break;
+        }
+    }
+    Ok(texts)
+}
+
 pub fn parse_jsonl_line(line: &str) -> Option<ChatRecord> {
     let trimmed = line.trim();
     if trimmed.is_empty() {
         return None;
     }
-    if let Ok(rec) = serde_json::from_str::<ChatRecord>(trimmed) {
-        if rec.system.is_empty() && rec.user.is_empty() && rec.output.is_empty() {
-            return None;
-        }
-        return Some(rec);
+    let rec = serde_json::from_str::<ChatRecord>(trimmed).ok()?;
+    if rec.system.is_empty() && rec.user.is_empty() && rec.output.is_empty() {
+        return None;
     }
-    if let Ok(leg) = serde_json::from_str::<LegacyRecord>(trimmed) {
-        if let Some(text) = leg.text() {
-            return Some(ChatRecord::from_legacy(text, leg.lang.as_deref()));
-        }
-    }
-    Some(ChatRecord::from_legacy(trimmed, None))
+    Some(rec)
 }
 
 pub struct JsonlStream {
@@ -382,14 +360,25 @@ impl JsonlStream {
         seq_len: usize,
         seed: u64,
     ) -> Result<Self> {
+        Self::open_with_cap(path, tokenizer, seq_len, MAX_TOKEN_BUF, seed)
+    }
+
+    pub fn open_with_cap(
+        path: impl AsRef<Path>,
+        tokenizer: BpeTokenizer,
+        seq_len: usize,
+        context_len: usize,
+        seed: u64,
+    ) -> Result<Self> {
         let path = path.as_ref().to_path_buf();
         let file = File::open(&path).with_context(|| format!("open {}", path.display()))?;
+        let cap = context_len.max(seq_len.saturating_mul(4).max(1));
         Ok(Self {
             path,
             reader: BufReader::with_capacity(64 * 1024, file),
             tokenizer,
             seq_len,
-            flash: SovereignFlashBuffer::new(MAX_TOKEN_BUF)?,
+            flash: SovereignFlashBuffer::new(cap)?,
             rng: crate::device::rng_from_seed(seed),
             lines_seen: 0,
         })
@@ -409,7 +398,8 @@ impl JsonlStream {
     }
 
     fn cap_buf(&mut self) {
-        if self.flash.len() > MAX_TOKEN_BUF {
+        let cap = self.flash.cap();
+        if self.flash.len() > cap {
             let keep = self.seq_len * 4;
             let drain = self.flash.len().saturating_sub(keep);
             self.flash.drain_front(drain);
@@ -447,10 +437,14 @@ impl JsonlStream {
             if !self.read_one_line()? {
                 self.rewind()?;
                 loops += 1;
-                if loops > 2 && self.flash.len() < need {
-                    let rec = ChatRecord::from_legacy("fn main() {}\n", Some("rust"));
-                    let (ids, mask) = encode_supervised(&mut self.tokenizer, &rec);
-                    self.push_ids(ids, mask);
+                if loops > 2 {
+                    if self.flash.is_empty() {
+                        anyhow::bail!(
+                            "JSONL corpus produced no tokens: {}",
+                            self.path.display()
+                        );
+                    }
+                    break;
                 }
             }
             self.cap_buf();
@@ -514,6 +508,34 @@ mod tests {
     use super::*;
 
     #[test]
+    fn cognitive_bench_has_fifteen_dense_anchors() {
+        let raw = std::fs::read_to_string("data/cognitive-bench.jsonl").unwrap();
+        let recs: Vec<ChatRecord> = raw
+            .lines()
+            .filter(|l| !l.trim().is_empty())
+            .map(|l| serde_json::from_str::<ChatRecord>(l).expect(l))
+            .collect();
+        assert_eq!(recs.len(), 15);
+        for rec in &recs {
+            let steps = rec
+                .thinking
+                .lines()
+                .filter(|l| {
+                    let t = l.trim_start();
+                    t.chars().next().is_some_and(|c| c.is_ascii_digit()) && t.contains('.')
+                })
+                .count();
+            assert!(
+                steps >= 6,
+                "sparse thinking ({} steps): {}",
+                steps,
+                rec.user
+            );
+            assert!(!rec.output.is_empty());
+        }
+    }
+
+    #[test]
     fn parse_strict_four_key() {
         let line = r#"{"system":"You are a Rust compiler specialist.","user":"write add","thinking":"add i32s","output":"fn add(a: i32, b: i32) -> i32 { a + b }"}"#;
         let rec = parse_jsonl_line(line).unwrap();
@@ -526,12 +548,10 @@ mod tests {
     }
 
     #[test]
-    fn parse_legacy_lifts() {
+    fn parse_rejects_legacy_text_lang() {
         let line = r#"{"text":"fn main() {}\n","lang":"rust"}"#;
-        let rec = parse_jsonl_line(line).unwrap();
-        assert!(rec.system.contains("Rust"));
-        assert_eq!(rec.output.trim(), "fn main() {}");
-        assert!(!rec.thinking.is_empty());
+        assert!(parse_jsonl_line(line).is_none());
+        assert!(parse_jsonl_line("fn main() {}").is_none());
     }
 
     #[test]
@@ -555,10 +575,12 @@ mod tests {
     fn train_jsonl_is_strict_four_key() {
         let path = if Path::new("data/thinking-train.jsonl").exists() {
             "data/thinking-train.jsonl"
+        } else if Path::new("data/basic-train.jsonl").exists() {
+            "data/basic-train.jsonl"
         } else {
             "data/train.jsonl"
         };
-        let text = std::fs::read_to_string(path).expect("data/train.jsonl");
+        let text = std::fs::read_to_string(path).expect("JSONL corpus");
         let mut n = 0usize;
         for line in text.lines() {
             if line.trim().is_empty() {

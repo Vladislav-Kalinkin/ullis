@@ -1,4 +1,4 @@
-//! Ullis v0.8 Deep Context — WordPiece V=8192, packed-i8 embed, flash buffer.
+//! Ullis v0.9 Infinite Lexicon — WordPiece V≥8192, packed-i8 embed, flash buffer.
 //!
 //! # Compilation graph
 //! ```text
@@ -43,7 +43,7 @@ use ullis::train::{run_smoke, train, TrainArgs};
 #[command(
     name = "ullis",
     version,
-    about = "Ullis AI Engine v0.8 Deep Context — WordPiece V=8192 / packed-i8 embed"
+    about = "Ullis AI Engine v0.9 Infinite Lexicon — WordPiece V≥8192 / packed-i8 embed"
 )]
 struct Cli {
     #[command(subcommand)]
@@ -51,6 +51,7 @@ struct Cli {
 }
 
 #[derive(Subcommand)]
+#[allow(clippy::large_enum_variant)]
 enum Command {
     /// 4-phase ternary QAT from a streaming JSONL corpus.
     Train(TrainArgs),

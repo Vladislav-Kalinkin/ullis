@@ -1,3 +1,4 @@
+use anyhow::{bail, Result};
 use serde::{Deserialize, Serialize};
 
 pub const N_EXPERTS: usize = 3;
@@ -14,6 +15,9 @@ pub struct TrainConfig {
     pub grid_mid: usize,
     pub grid_final: usize,
     pub seq_len: usize,
+    /// Continuous `SovereignFlashBuffer` cap (token ids). Independent of `seq_len`.
+    #[serde(default = "default_context_len")]
+    pub context_len: usize,
     pub batch_size: usize,
     /// `"shift"` (0 extra params) or `"attn"`.
     pub mixer: String,
@@ -51,6 +55,57 @@ pub struct TrainConfig {
     /// EMA decay for per-knot residual energy / per-edge grad variance.
     #[serde(default = "default_knot_ema")]
     pub knot_ema: f64,
+    /// Recompute layer activations on the backward pass (fused Metal / host).
+    #[serde(default = "default_fused_grad_ckpt")]
+    pub fused_grad_ckpt: bool,
+    /// Storage master for KAN weights. Compute is always FP32 (hot unpack).
+    #[serde(default)]
+    pub master: MasterDtype,
+    /// Momentum storage. Compute is always FP32.
+    #[serde(default)]
+    pub mom: MomDtype,
+    /// 0 = dense MoB (bit-identical). 1|2 = per-token top-k after full softmax.
+    #[serde(default)]
+    pub moe_topk: u32,
+    /// Switch load-balance `α · K · Σ f_i P_i`. Used only when `moe_topk > 0`.
+    #[serde(default = "default_moe_aux")]
+    pub moe_aux: f64,
+}
+
+/// KAN weight storage dtype. Centers / Gauss / knots stay FP32.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum MasterDtype {
+    #[default]
+    Fp32,
+    Fp16,
+}
+
+impl MasterDtype {
+    pub fn parse_name(s: &str) -> Result<Self> {
+        match s.to_ascii_lowercase().as_str() {
+            "fp32" | "f32" => Ok(Self::Fp32),
+            "fp16" | "f16" => Ok(Self::Fp16),
+            other => bail!("--master {other}: expected fp32|fp16"),
+        }
+    }
+}
+
+/// SGD velocity storage.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum MomDtype {
+    #[default]
+    Fp32,
+    Q8,
+}
+
+impl MomDtype {
+    pub fn parse_name(s: &str) -> Result<Self> {
+        match s.to_ascii_lowercase().as_str() {
+            "fp32" | "f32" => Ok(Self::Fp32),
+            "q8" | "int8" | "i8" => Ok(Self::Q8),
+            other => bail!("--mom {other}: expected fp32|q8"),
+        }
+    }
 }
 
 fn default_entropy_coef() -> f64 {
@@ -65,6 +120,15 @@ fn default_knot_insert_every() -> usize {
 fn default_knot_ema() -> f64 {
     0.9
 }
+fn default_context_len() -> usize {
+    crate::data::MAX_TOKEN_BUF
+}
+fn default_fused_grad_ckpt() -> bool {
+    true
+}
+fn default_moe_aux() -> f64 {
+    0.01
+}
 
 impl Default for TrainConfig {
     fn default() -> Self {
@@ -76,6 +140,7 @@ impl Default for TrainConfig {
             grid_mid: 8,
             grid_final: 12,
             seq_len: 96,
+            context_len: default_context_len(),
             batch_size: 4,
             mixer: "shift".into(),
             n_heads: 1,
@@ -96,13 +161,18 @@ impl Default for TrainConfig {
             ckpt_dir: "checkpoints".into(),
             log_every: 20,
             tokenizer_path: String::new(),
-            data_path: "data/train.jsonl".into(),
+            data_path: "data/thinking-train.jsonl".into(),
             moe: true,
             n_experts: N_EXPERTS,
             entropy_coef: default_entropy_coef(),
             router_entropy_coef: default_router_entropy_coef(),
             knot_insert_every: default_knot_insert_every(),
             knot_ema: default_knot_ema(),
+            fused_grad_ckpt: default_fused_grad_ckpt(),
+            master: MasterDtype::Fp32,
+            mom: MomDtype::Fp32,
+            moe_topk: 0,
+            moe_aux: default_moe_aux(),
         }
     }
 }
