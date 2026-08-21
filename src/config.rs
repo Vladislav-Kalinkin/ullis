@@ -73,6 +73,36 @@ pub struct TrainConfig {
     /// KAN factorization. Shared-edge is the production layout; `None` is rejected.
     #[serde(default)]
     pub kan_factor: KanFactor,
+    /// `kan` (production) or `memory` (experimental).
+    #[serde(default)]
+    pub arch: ModelArch,
+    /// Memory-arch expert inner width `W`.
+    #[serde(default = "default_expert_width")]
+    pub expert_width: usize,
+    /// Memory-arch slot count `S`.
+    #[serde(default = "default_n_slots")]
+    pub n_slots: usize,
+    /// Memory-arch expert count `E`. Independent of MoB `n_experts`.
+    #[serde(default = "default_mem_experts")]
+    pub mem_experts: usize,
+}
+
+/// Trainable model class.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ModelArch {
+    #[default]
+    Kan,
+    Memory,
+}
+
+impl ModelArch {
+    pub fn parse_name(s: &str) -> Result<Self> {
+        match s.to_ascii_lowercase().as_str() {
+            "kan" | "ulliskan" | "" => Ok(Self::Kan),
+            "memory" | "mem" => Ok(Self::Memory),
+            other => bail!("--arch {other}: expected kan|memory"),
+        }
+    }
 }
 
 /// Spline coefficient layout. Shared-edge is the only production path.
@@ -161,6 +191,15 @@ fn default_fused_grad_ckpt() -> bool {
 fn default_moe_aux() -> f64 {
     0.01
 }
+fn default_expert_width() -> usize {
+    64
+}
+fn default_n_slots() -> usize {
+    32
+}
+fn default_mem_experts() -> usize {
+    4
+}
 
 impl Default for TrainConfig {
     fn default() -> Self {
@@ -206,6 +245,10 @@ impl Default for TrainConfig {
             moe_topk: 0,
             moe_aux: default_moe_aux(),
             kan_factor: KanFactor::SharedEdge,
+            arch: ModelArch::Kan,
+            expert_width: default_expert_width(),
+            n_slots: default_n_slots(),
+            mem_experts: default_mem_experts(),
         }
     }
 }

@@ -60,6 +60,7 @@ struct MetalInner {
     pipeline_bwd_half: metal::ComputePipelineState,
     embed_i8: metal::ComputePipelineState,
     logits_i8: metal::ComputePipelineState,
+    gemm_nt: metal::ComputePipelineState,
     dummy: metal::Buffer,
 }
 
@@ -272,6 +273,86 @@ impl SovereignDevice {
 
     pub fn is_metal(&self) -> bool {
         self.backend == Backend::Metal
+    }
+
+    /// `C[m,n] = A[m,k] @ B[n,k]^T`. Metal when the device is GPU and the
+    /// product is large enough to beat a copy+sync; otherwise Accelerate.
+    ///
+    /// Expert/router GEMMs are a few M FLOPs. The current dispatch copies
+    /// three shared buffers and `wait_until_completed`, which loses to
+    /// host BLAS until the product is tied-head sized.
+    pub fn gemm_nt(
+        &self,
+        m: usize,
+        n: usize,
+        k: usize,
+        a: &[f32],
+        b: &[f32],
+        c: &mut [f32],
+    ) -> Result<()> {
+        let flops = m.saturating_mul(n).saturating_mul(k);
+        #[cfg(target_os = "macos")]
+        if self.is_metal() && flops >= 64 * 1024 * 1024 {
+            return self.dispatch_sgemm_nt(m, n, k, a, b, c);
+        }
+        crate::accelerate::sgemm_nt(m, n, k, 1.0, a, b, 0.0, c)
+    }
+
+    #[cfg(target_os = "macos")]
+    fn dispatch_sgemm_nt(
+        &self,
+        m: usize,
+        n: usize,
+        k: usize,
+        a: &[f32],
+        b: &[f32],
+        c: &mut [f32],
+    ) -> Result<()> {
+        let inner = self
+            .metal
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("gemm on CPU device"))?;
+        if a.len() < m * k || b.len() < n * k || c.len() < m * n {
+            bail!("gemm_nt shape");
+        }
+        if m == 0 || n == 0 || k == 0 {
+            return Ok(());
+        }
+        let ba = alloc_shared_f32_buffer(&inner.device, m * k)?;
+        let bb = alloc_shared_f32_buffer(&inner.device, n * k)?;
+        let bc = alloc_shared_f32_buffer(&inner.device, m * n)?;
+        write_shared_f32(&ba, a)?;
+        write_shared_f32(&bb, b)?;
+        let mu = m as u32;
+        let nu = n as u32;
+        let ku = k as u32;
+        with_autorelease(|| {
+            let cmd = inner.queue.new_command_buffer();
+            cmd.set_label("ullis.sgemm_nt");
+            let enc = cmd.new_compute_command_encoder();
+            enc.set_compute_pipeline_state(&inner.gemm_nt);
+            enc.set_buffer(0, Some(&ba), 0);
+            enc.set_buffer(1, Some(&bb), 0);
+            enc.set_buffer(2, Some(&bc), 0);
+            enc.set_bytes(3, 4, ptr::from_ref(&mu).cast());
+            enc.set_bytes(4, 4, ptr::from_ref(&nu).cast());
+            enc.set_bytes(5, 4, ptr::from_ref(&ku).cast());
+            let tpg = inner.gemm_nt.thread_execution_width().max(1);
+            enc.dispatch_threads(
+                metal::MTLSize::new(n as u64, m as u64, 1),
+                metal::MTLSize::new(tpg.min(n as u64).max(1), 1, 1),
+            );
+            enc.end_encoding();
+            cmd.commit();
+            cmd.wait_until_completed();
+            record_gpu_wait();
+            if cmd.status() != metal::MTLCommandBufferStatus::Completed {
+                bail!("sgemm_nt status {:?}", cmd.status());
+            }
+            Ok(())
+        })?;
+        read_shared_f32(&bc, c)?;
+        Ok(())
     }
 
     pub fn fused_grad_ckpt(&self) -> bool {
@@ -593,6 +674,10 @@ fn compile_metal(flags: DeviceFlags) -> Result<MetalInner> {
         let pipeline_bwd_half = pso_fn(&device, &lib_h, "ullis_mob_kan_fused_bwd")?;
         let embed_i8 = pso_fn(&device, &lib, "ullis_i8_embed_lookup")?;
         let logits_i8 = pso_fn(&device, &lib, "ullis_i8_tied_logits")?;
+        let gemm_lib = device
+            .new_library_with_source(GEMM_MSL, &opts)
+            .map_err(|e| anyhow::anyhow!("MSL gemm compile: {e}"))?;
+        let gemm_nt = pso_fn(&device, &gemm_lib, "ullis_sgemm_nt")?;
         let dummy = alloc_shared_f32_buffer(&device, 8)?;
         Ok(MetalInner {
             device,
@@ -603,6 +688,7 @@ fn compile_metal(flags: DeviceFlags) -> Result<MetalInner> {
             pipeline_bwd_half,
             embed_i8,
             logits_i8,
+            gemm_nt,
             dummy,
         })
     })
@@ -688,6 +774,44 @@ pub fn wrap_shared_bytes_no_copy(device: &metal::Device, bytes: &[u8]) -> Result
 }
 
 #[cfg(target_os = "macos")]
+fn write_shared_f32(buffer: &metal::Buffer, src: &[f32]) -> Result<()> {
+    let bytes = src.len() * 4;
+    if bytes as u64 > buffer.length() {
+        bail!("write f32 {} into {}", bytes, buffer.length());
+    }
+    if src.is_empty() {
+        return Ok(());
+    }
+    unsafe {
+        let dst = buffer.contents().cast::<f32>();
+        if dst.is_null() {
+            bail!("MTLBuffer.contents is null");
+        }
+        ptr::copy_nonoverlapping(src.as_ptr(), dst, src.len());
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
+fn read_shared_f32(buffer: &metal::Buffer, dst: &mut [f32]) -> Result<()> {
+    let bytes = dst.len() * 4;
+    if bytes as u64 > buffer.length() {
+        bail!("read f32 {} from {}", bytes, buffer.length());
+    }
+    if dst.is_empty() {
+        return Ok(());
+    }
+    unsafe {
+        let src = buffer.contents().cast::<f32>();
+        if src.is_null() {
+            bail!("MTLBuffer.contents is null");
+        }
+        ptr::copy_nonoverlapping(src, dst.as_mut_ptr(), dst.len());
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
 pub fn write_shared_bytes(buffer: &metal::Buffer, src: &[u8]) -> Result<()> {
     let need = src.len() as u64;
     if need > buffer.length() {
@@ -767,6 +891,34 @@ pub fn read_shared_f32_buffer(buffer: &metal::Buffer, dst: &mut [f32]) -> Result
 ///
 /// One threadgroup per token. Activations live in threadgroup memory; no
 /// intermediate bump / gate buffers are allocated in device RAM.
+#[cfg(target_os = "macos")]
+const GEMM_MSL: &str = r#"
+#include <metal_stdlib>
+using namespace metal;
+kernel void ullis_sgemm_nt(
+    device const float* A [[buffer(0)]],
+    device const float* B [[buffer(1)]],
+    device float* C       [[buffer(2)]],
+    constant uint& M      [[buffer(3)]],
+    constant uint& N      [[buffer(4)]],
+    constant uint& K      [[buffer(5)]],
+    uint2 gid             [[thread_position_in_grid]]
+) {
+    uint n = gid.x;
+    uint m = gid.y;
+    if (m >= M || n >= N) {
+        return;
+    }
+    float acc = 0.0f;
+    device const float* a = A + m * K;
+    device const float* b = B + n * K;
+    for (uint k = 0; k < K; ++k) {
+        acc += a[k] * b[k];
+    }
+    C[m * N + n] = acc;
+}
+"#;
+
 const FUSED_MSL: &str = r#"
 #include <metal_stdlib>
 using namespace metal;

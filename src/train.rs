@@ -95,6 +95,18 @@ pub struct TrainArgs {
     /// Switch load-balance coefficient (only when `--moe-topk` > 0).
     #[arg(long = "moe-aux", default_value_t = 0.01)]
     pub moe_aux: f64,
+    /// `kan` (production) or `memory` (experimental FWHT+scan+slots+experts).
+    #[arg(long, default_value = "kan")]
+    pub arch: String,
+    /// Memory-arch expert count `E`. Ignored for `kan`.
+    #[arg(long = "experts", default_value_t = 4)]
+    pub experts: usize,
+    /// Memory-arch expert inner width `W`.
+    #[arg(long = "expert-width", default_value_t = 64)]
+    pub expert_width: usize,
+    /// Memory-arch slot count `S`.
+    #[arg(long = "slots", default_value_t = 32)]
+    pub slots: usize,
 }
 
 impl TrainArgs {
@@ -127,6 +139,9 @@ impl TrainArgs {
             entropy_coef: self.entropy_coef,
             router_entropy_coef: self.router_entropy_coef,
             knot_insert_every: self.knot_every,
+            expert_width: self.expert_width,
+            n_slots: self.slots,
+            mem_experts: self.experts,
             ..TrainConfig::default()
         }
     }
@@ -179,7 +194,17 @@ pub fn train(args: TrainArgs) -> Result<PathBuf> {
     cfg.kan_factor = crate::config::KanFactor::SharedEdge;
     cfg.fused_grad_ckpt = true;
     cfg.n_basis = cfg.grid_start;
+    cfg.arch = crate::config::ModelArch::parse_name(&args.arch)?;
+    cfg.expert_width = args.expert_width.max(1);
+    cfg.n_slots = args.slots;
+    cfg.mem_experts = args.experts;
+    if cfg.arch == crate::config::ModelArch::Memory && cfg.moe_topk == 0 {
+        cfg.moe_topk = 2;
+    }
     crate::tokenizer::validate_vocab_size(cfg.vocab_size as u32)?;
+    if cfg.arch == crate::config::ModelArch::Memory {
+        return train_memory(args, cfg);
+    }
     let device = setup_device_with(
         !args.cpu,
         DeviceFlags {
@@ -350,6 +375,142 @@ pub fn train(args: TrainArgs) -> Result<PathBuf> {
         stream.tokenizer(),
     )?;
     println!("packed inference checkpoint -> {}", packed_path.display());
+    println!("{}", model.param_report());
+    Ok(packed_path)
+}
+
+fn train_memory(args: TrainArgs, mut cfg: TrainConfig) -> Result<PathBuf> {
+    let data_path = PathBuf::from(&cfg.data_path);
+    if !data_path.exists() {
+        anyhow::bail!(
+            "JSONL corpus missing: {} (pass --data; Ullis does not synthesize training text)",
+            data_path.display()
+        );
+    }
+    warn_corpus_homogeneity(&data_path)?;
+    let texts = jsonl_corpus_texts(&data_path, 8_192)?;
+    if texts.is_empty() {
+        anyhow::bail!("JSONL corpus is empty: {}", data_path.display());
+    }
+    let tok_path = if cfg.tokenizer_path.is_empty() {
+        None
+    } else {
+        Some(Path::new(&cfg.tokenizer_path))
+    };
+    let tokenizer = load_or_train(cfg.vocab_size as u32, &texts, tok_path, cfg.seed)?;
+    cfg.vocab_size = tokenizer.vocab_size as usize;
+    let mut stream = JsonlStream::open_with_cap(
+        &data_path,
+        tokenizer.clone(),
+        cfg.seq_len,
+        cfg.context_len,
+        cfg.seed,
+    )?;
+    let mut rng = crate::device::rng_from_seed(cfg.seed);
+    let device = setup_device(!args.cpu)?;
+    let mut model = crate::memory::UllisMemory::with_device(cfg.clone(), &mut rng, device)?;
+    println!(
+        "arch=memory device={} {}",
+        device_name(&model.device),
+        model.param_report()
+    );
+    println!(
+        "corpus {} V={} E={} W={} S={} k={} T={} B={}",
+        data_path.display(),
+        cfg.vocab_size,
+        cfg.mem_experts,
+        cfg.expert_width,
+        cfg.n_slots,
+        cfg.moe_topk,
+        cfg.seq_len,
+        cfg.batch_size
+    );
+    let ckpt_dir = PathBuf::from(&cfg.ckpt_dir);
+    std::fs::create_dir_all(&ckpt_dir)?;
+    tokenizer.save(ckpt_dir.join("tokenizer.json"))?;
+
+    for (phase, name, epochs_of, lr_of) in PHASES {
+        let epochs = epochs_of(&cfg);
+        let lr = lr_of(&cfg);
+        model.set_phase(phase);
+        let mut opt = crate::optim::DenseSgd::new(&model.param_lens(), lr, cfg.momentum, cfg.max_norm);
+        println!("\n== phase {phase} {name} epochs={epochs} lr={lr} memory ==");
+        let t0 = Instant::now();
+        let mut thru = Throughput::new();
+        for epoch in 0..epochs {
+            let mut running = 0.0f32;
+            let mut n_seen = 0u32;
+            thru.reset();
+            for step in 0..cfg.steps_per_epoch {
+                let (x, y, mask) = stream.next_batch(cfg.batch_size)?;
+                let l1 = if phase == 2 { cfg.l1 as f32 } else { 0.0 };
+                let lv = model.train_step(&x, &y, &mask, cfg.batch_size, cfg.seq_len, l1)?;
+                crate::memory::memory_sgd_step(&mut model, &mut opt)?;
+                running += lv;
+                n_seen += 1;
+                thru.add((cfg.batch_size * cfg.seq_len) as u64);
+                if step % cfg.log_every == 0 {
+                    let avg = running / n_seen.max(1) as f32;
+                    println!(
+                        "  {name} e{epoch} s{step:04} loss={avg:.4} ce={:.4} H={:.3} mask={:.2} rss={:.1}MB tok/s={:.0} fwd={:.1}ms ce={:.1}ms bwd={:.1}ms",
+                        model.last_ce,
+                        model.last_entropy,
+                        model.last_mask,
+                        process_memory_mb(),
+                        thru.tok_s(),
+                        model.last_fwd_ms,
+                        model.last_ce_ms,
+                        model.last_bwd_ms
+                    );
+                    running = 0.0;
+                    n_seen = 0;
+                    thru.reset();
+                }
+            }
+        }
+        checkpoint::save_memory(
+            ckpt_dir.join(format!("phase{phase}.bin")),
+            &model,
+            stream.tokenizer(),
+            phase,
+        )?;
+        checkpoint::save_memory(
+            ckpt_dir.join("last.bin"),
+            &model,
+            stream.tokenizer(),
+            phase,
+        )?;
+        println!(
+            "phase {phase} done in {:.1}s  wrote {}/last.bin",
+            t0.elapsed().as_secs_f32(),
+            ckpt_dir.display()
+        );
+    }
+
+    checkpoint::save_memory(
+        ckpt_dir.join("last.bin"),
+        &model,
+        stream.tokenizer(),
+        model.phase,
+    )?;
+    model.pack();
+    let packed_path = ckpt_dir.join("packed.bin");
+    checkpoint::save_memory(&packed_path, &model, stream.tokenizer(), 4)?;
+    let card = serde_json::json!({
+        "engine": "Ullis Memory",
+        "arch": "memory",
+        "config": model.cfg,
+        "vocab_size": tokenizer.vocab_size,
+        "report": model.param_report(),
+        "cpu": args.cpu,
+        "files": ["packed.bin", "last.bin", "tokenizer.json"],
+    });
+    std::fs::write(
+        ckpt_dir.join("model_card.json"),
+        serde_json::to_string_pretty(&card)?,
+    )?;
+    println!("memory packed checkpoint -> {}", packed_path.display());
+    println!("memory last.bin (fp32)    -> {}", ckpt_dir.join("last.bin").display());
     println!("{}", model.param_report());
     Ok(packed_path)
 }

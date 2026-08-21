@@ -1,4 +1,4 @@
-//! Self-contained `packed.bin` (magic ULLIS03).
+//! Self-contained `packed.bin` (magic `ULLIS03` KAN, `ULLIS04` memory).
 
 use std::fs::File;
 use std::io::{Read, Write};
@@ -10,12 +10,14 @@ use serde::{Deserialize, Serialize};
 use crate::config::TrainConfig;
 use crate::device::SovereignDevice;
 use crate::kan::NamedBlob;
+use crate::memory::UllisMemory;
 use crate::model::UllisKan;
 use crate::quant::{pack_ternary, unpack_ternary};
 use crate::tensor::SovereignTensor;
 use crate::tokenizer::{BpeTokenizer, TokenizerJson};
 
 pub const MAGIC: &[u8; 8] = b"ULLIS03\n";
+pub const MAGIC_MEM: &[u8; 8] = b"ULLIS04\n";
 
 #[derive(Serialize, Deserialize)]
 pub struct Header {
@@ -47,7 +49,54 @@ pub fn save(
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    let blobs = model.collect_blobs()?;
+    write_packed(
+        path,
+        *MAGIC,
+        "Ullis AI Engine v0.8",
+        &model.cfg,
+        tokenizer,
+        phase,
+        model.blocks.iter().any(|b| b.ff.packed),
+        model.collect_blobs()?,
+    )
+}
+
+pub fn save_memory(
+    path: impl AsRef<Path>,
+    model: &UllisMemory,
+    tokenizer: &BpeTokenizer,
+    phase: u8,
+) -> Result<()> {
+    let packed = model
+        .blocks
+        .iter()
+        .any(|b| b.experts.iter().any(|e| e.packed));
+    write_packed(
+        path,
+        *MAGIC_MEM,
+        "Ullis Memory",
+        &model.cfg,
+        tokenizer,
+        phase,
+        packed,
+        model.collect_blobs(),
+    )
+}
+
+fn write_packed(
+    path: impl AsRef<Path>,
+    magic: [u8; 8],
+    engine: &str,
+    cfg: &TrainConfig,
+    tokenizer: &BpeTokenizer,
+    phase: u8,
+    packed: bool,
+    blobs: Vec<(String, NamedBlob)>,
+) -> Result<()> {
+    let path = path.as_ref();
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
     let mut payload = Vec::new();
     let mut metas = Vec::new();
     for (name, blob) in blobs {
@@ -95,10 +144,9 @@ pub fn save(
             }
         }
     }
-    let packed = model.blocks.iter().any(|b| b.ff.packed);
     let header = Header {
-        engine: "Ullis AI Engine v0.8".into(),
-        config: model.cfg.clone(),
+        engine: engine.into(),
+        config: cfg.clone(),
         tokenizer: tokenizer.to_json(),
         phase,
         packed,
@@ -106,7 +154,7 @@ pub fn save(
     };
     let header_bytes = serde_json::to_vec(&header)?;
     let mut f = File::create(path).with_context(|| format!("create {}", path.display()))?;
-    f.write_all(MAGIC)?;
+    f.write_all(&magic)?;
     f.write_all(&(header_bytes.len() as u32).to_le_bytes())?;
     f.write_all(&header_bytes)?;
     let written = 8 + 4 + header_bytes.len();
@@ -185,6 +233,75 @@ pub fn load(path: impl AsRef<Path>, device: SovereignDevice) -> Result<Loaded> {
         model.sync_grids();
     }
     Ok(Loaded {
+        model,
+        tokenizer,
+        phase: header.phase,
+    })
+}
+
+pub fn peek_magic(path: impl AsRef<Path>) -> Result<[u8; 8]> {
+    let mut f = File::open(path.as_ref())?;
+    let mut magic = [0u8; 8];
+    f.read_exact(&mut magic)?;
+    Ok(magic)
+}
+
+pub struct LoadedMem {
+    pub model: UllisMemory,
+    pub tokenizer: BpeTokenizer,
+    pub phase: u8,
+}
+
+pub fn load_memory(path: impl AsRef<Path>) -> Result<LoadedMem> {
+    let path = path.as_ref();
+    let mut f = File::open(path).with_context(|| format!("open {}", path.display()))?;
+    let mut magic = [0u8; 8];
+    f.read_exact(&mut magic)?;
+    if &magic != MAGIC_MEM {
+        bail!(
+            "bad magic in {}: {:x?} (want ULLIS04)",
+            path.display(),
+            magic
+        );
+    }
+    let mut len_buf = [0u8; 4];
+    f.read_exact(&mut len_buf)?;
+    let hlen = u32::from_le_bytes(len_buf) as usize;
+    let mut header_bytes = vec![0u8; hlen];
+    f.read_exact(&mut header_bytes)?;
+    let header: Header = serde_json::from_slice(&header_bytes)?;
+    let written = 8 + 4 + hlen;
+    let pad = (64 - (written % 64)) % 64;
+    let mut pad_buf = vec![0u8; pad];
+    f.read_exact(&mut pad_buf)?;
+    let mut payload = Vec::new();
+    f.read_to_end(&mut payload)?;
+
+    let tokenizer = BpeTokenizer::from_json(&header.tokenizer)?;
+    let mut cfg = header.config.clone();
+    cfg.vocab_size = tokenizer.vocab_size as usize;
+    let mut rng = crate::device::rng_from_seed(cfg.seed);
+    let mut model = UllisMemory::new(cfg, &mut rng)?;
+    if header.packed {
+        model.pack();
+    }
+    for meta in &header.tensors {
+        let start = meta.offset as usize;
+        let end = start + meta.nbytes as usize;
+        if end > payload.len() {
+            bail!("tensor {} overruns payload", meta.name);
+        }
+        let bytes = &payload[start..end];
+        if meta.packed {
+            let n: usize = meta.shape.iter().product();
+            let codes = unpack_ternary(bytes, n);
+            model.load_packed(&meta.name, &codes)?;
+        } else {
+            let v = le_to_f32(bytes);
+            model.load_f32(&meta.name, &v)?;
+        }
+    }
+    Ok(LoadedMem {
         model,
         tokenizer,
         phase: header.phase,

@@ -243,8 +243,20 @@ fn rename_snap(old_name: &str, new_name: &str) -> Result<(PathBuf, PathBuf)> {
 }
 
 pub fn run_chat(args: ChatArgs) -> Result<()> {
-    let device = setup_device(!args.cpu)?;
     let path = resolve_model(&args.model)?;
+    let magic =
+        checkpoint::peek_magic(&path).with_context(|| format!("peek {}", path.display()))?;
+    if &magic == checkpoint::MAGIC_MEM {
+        return run_chat_memory(args, path);
+    }
+    if &magic != checkpoint::MAGIC {
+        bail!(
+            "{} is not an Ullis checkpoint (magic {:x?}; want ULLIS03 or ULLIS04). Pass packed.bin or last.bin, not model_card.json.",
+            path.display(),
+            magic
+        );
+    }
+    let device = setup_device(!args.cpu)?;
     let loaded =
         checkpoint::load(&path, device).with_context(|| format!("load {}", path.display()))?;
     let mut model = loaded.model;
@@ -294,16 +306,207 @@ pub fn run_chat(args: ChatArgs) -> Result<()> {
     )
 }
 
+fn run_chat_memory(args: ChatArgs, path: PathBuf) -> Result<()> {
+    let loaded =
+        checkpoint::load_memory(&path).with_context(|| format!("load {}", path.display()))?;
+    let mut model = loaded.model;
+    let mut tokenizer = loaded.tokenizer;
+    println!(
+        "loaded {} (memory)  {}  context_len={}",
+        path.display(),
+        model.param_report(),
+        args.context_len.max(model.cfg.seq_len)
+    );
+    if let Some(p) = args.prompt {
+        print_banner();
+        memory_generate(
+            &mut model,
+            &mut tokenizer,
+            &p,
+            &args.system,
+            args.thinking,
+            args.max_new,
+            args.temperature,
+        )?;
+        return Ok(());
+    }
+    print_banner();
+    let stdin = io::stdin();
+    loop {
+        print!("ullis▸ ");
+        let _ = io::stdout().flush();
+        let mut line = String::new();
+        if stdin.read_line(&mut line)? == 0 {
+            break;
+        }
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        if line == "/exit" || line == "/quit" {
+            break;
+        }
+        if line == "/help" {
+            println!("{HELP}");
+            continue;
+        }
+        memory_generate(
+            &mut model,
+            &mut tokenizer,
+            line,
+            &args.system,
+            args.thinking,
+            args.max_new,
+            args.temperature,
+        )?;
+    }
+    Ok(())
+}
+
+fn memory_generate(
+    model: &mut crate::memory::UllisMemory,
+    tokenizer: &mut BpeTokenizer,
+    prompt: &str,
+    system: &str,
+    thinking: ThinkingMode,
+    max_new: usize,
+    temperature: f32,
+) -> Result<()> {
+    let seq_len = model.cfg.seq_len;
+    let think_budget = thinking.think_budget(seq_len);
+    // Default clap temp 0.7 is noise at CE~7; greedy unless the user picked another value.
+    let temperature = if (temperature - 0.7).abs() < 1e-4 {
+        0.0
+    } else {
+        temperature
+    };
+    let seed = if think_budget == 0 {
+        pack_record(system, prompt, None, Some(""))
+    } else {
+        let mut s = pack_record(system, prompt, None, None);
+        s.push_str(TAG_THINKING);
+        s.push('\n');
+        s
+    };
+    let mut ctx = tokenizer.encode(&seed, false, false);
+    trim_ctx(&mut ctx, seq_len);
+    let mut caches = model.new_cache();
+    let mut fed = 0usize;
+    let mut rng = rand::rngs::StdRng::from_os_rng();
+    let eos = tokenizer.eos_id;
+    let color = use_color();
+    let mut paint = PaintScan::new(think_budget > 0);
+    let mut stdout = io::stdout();
+    let mut emitted_ids: Vec<u32> = Vec::new();
+
+    let run = |n: usize,
+               tokenizer: &mut BpeTokenizer,
+               model: &mut crate::memory::UllisMemory,
+               ctx: &mut Vec<u32>,
+               caches: &mut Vec<crate::memory::LayerCache>,
+               fed: &mut usize,
+               rng: &mut rand::rngs::StdRng,
+               paint: &mut PaintScan,
+               stdout: &mut io::Stdout,
+               emitted_ids: &mut Vec<u32>,
+               stop_on_think_end: bool|
+     -> Result<bool> {
+        let mut dec = StreamDecoder::new(tokenizer);
+        for _ in 0..n {
+            let nxt = model.next_token(ctx, temperature, rng, caches, fed)?;
+            ctx.push(nxt);
+            emitted_ids.push(nxt);
+            let piece = dec.push(nxt);
+            if !piece.is_empty() {
+                emit_ops(stdout, color, &paint.feed(&piece))?;
+            }
+            if nxt == eos || nxt <= 2 {
+                let tail = dec.flush();
+                if !tail.is_empty() {
+                    emit_ops(stdout, color, &paint.feed(&tail))?;
+                }
+                return Ok(true);
+            }
+            let m = emitted_ids.len();
+            if m >= 4 && emitted_ids[m - 4..].iter().all(|&t| t == nxt) {
+                break;
+            }
+            if m >= 16 && emitted_ids[m - 16..m - 8] == emitted_ids[m - 8..] {
+                break;
+            }
+            if stop_on_think_end && (piece.contains(TAG_THINK_END) || piece.contains(TAG_OUTPUT)) {
+                break;
+            }
+        }
+        let tail = dec.flush();
+        if !tail.is_empty() {
+            emit_ops(stdout, color, &paint.feed(&tail))?;
+        }
+        Ok(false)
+    };
+
+    if think_budget > 0 {
+        let done = run(
+            think_budget,
+            tokenizer,
+            model,
+            &mut ctx,
+            &mut caches,
+            &mut fed,
+            &mut rng,
+            &mut paint,
+            &mut stdout,
+            &mut emitted_ids,
+            true,
+        )?;
+        if !done && paint.lane == Lane::Think {
+            emit_ops(&mut stdout, color, &paint.feed(TAG_THINK_END))?;
+            let closer = format!("{TAG_THINK_END}\n{TAG_OUTPUT}\n");
+            ctx.extend(tokenizer.encode(&closer, false, false));
+            trim_ctx(&mut ctx, seq_len);
+            caches = model.new_cache();
+            fed = 0;
+        }
+    }
+    let _ = run(
+        max_new,
+        tokenizer,
+        model,
+        &mut ctx,
+        &mut caches,
+        &mut fed,
+        &mut rng,
+        &mut paint,
+        &mut stdout,
+        &mut emitted_ids,
+        false,
+    )?;
+    emit_ops(&mut stdout, color, &[PaintOp::Reset])?;
+    stdout.flush()?;
+    println!();
+    Ok(())
+}
+
 fn resolve_model(p: &Path) -> Result<PathBuf> {
     if p.is_dir() {
-        let cand = p.join("packed.bin");
-        if cand.exists() {
-            return Ok(cand);
+        for name in ["packed.bin", "last.bin", "phase4.bin", "phase3.bin"] {
+            let cand = p.join(name);
+            if cand.exists() {
+                return Ok(cand);
+            }
         }
-        let cand = p.join("last.bin");
-        if cand.exists() {
-            return Ok(cand);
-        }
+        anyhow::bail!(
+            "no checkpoint in {} (expected packed.bin or last.bin)",
+            p.display()
+        );
+    }
+    if !p.exists() {
+        let as_dir = p.parent().unwrap_or(p);
+        anyhow::bail!(
+            "checkpoint not found: {} (dir {} has packed.bin/last.bin?)",
+            p.display(),
+            as_dir.display()
+        );
     }
     Ok(p.to_path_buf())
 }

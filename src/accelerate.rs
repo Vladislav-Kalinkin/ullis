@@ -491,6 +491,32 @@ extern "C" {
         ldc: i32,
     );
     fn cblas_saxpy(n: i32, alpha: f32, x: *const f32, incx: i32, y: *mut f32, incy: i32);
+    fn cblas_sgemv(
+        order: i32,
+        trans: i32,
+        m: i32,
+        n: i32,
+        alpha: f32,
+        a: *const f32,
+        lda: i32,
+        x: *const f32,
+        incx: i32,
+        beta: f32,
+        y: *mut f32,
+        incy: i32,
+    );
+    fn cblas_sger(
+        order: i32,
+        m: i32,
+        n: i32,
+        alpha: f32,
+        x: *const f32,
+        incx: i32,
+        y: *const f32,
+        incy: i32,
+        a: *mut f32,
+        lda: i32,
+    );
     fn vDSP_vadd(
         a: *const f32,
         ia: vDSP_Stride,
@@ -630,6 +656,182 @@ pub fn sgemm_tn(
         return Ok(());
     }
     sgemm_tn_inner(m, n, k, alpha, a, b, beta, c)
+}
+
+/// Row-major `y = alpha * op(A) x + beta * y`.
+/// `A` is `[m, n]`. `trans=false` → `op(A)=A` (`x` len `n`, `y` len `m`);
+/// `trans=true` → `op(A)=Aᵀ` (`x` len `m`, `y` len `n`).
+pub fn sgemv(
+    trans: bool,
+    m: usize,
+    n: usize,
+    alpha: f32,
+    a: &[f32],
+    x: &[f32],
+    beta: f32,
+    y: &mut [f32],
+) -> Result<()> {
+    if a.len() < m.saturating_mul(n) {
+        bail!("sgemv A len {} < m*n {}", a.len(), m * n);
+    }
+    let (x_len, y_len) = if trans { (m, n) } else { (n, m) };
+    if x.len() < x_len {
+        bail!("sgemv x len {} < {x_len}", x.len());
+    }
+    if y.len() < y_len {
+        bail!("sgemv y len {} < {y_len}", y.len());
+    }
+    if m == 0 || n == 0 {
+        return Ok(());
+    }
+    sgemv_inner(trans, m, n, alpha, a, x, beta, y)
+}
+
+/// Row-major rank-1: `A[m, n] += alpha * x[m] * y[n]ᵀ`.
+pub fn sger(m: usize, n: usize, alpha: f32, x: &[f32], y: &[f32], a: &mut [f32]) -> Result<()> {
+    if a.len() < m.saturating_mul(n) {
+        bail!("sger A len {} < m*n {}", a.len(), m * n);
+    }
+    if x.len() < m {
+        bail!("sger x len {} < m {m}", x.len());
+    }
+    if y.len() < n {
+        bail!("sger y len {} < n {n}", y.len());
+    }
+    if m == 0 || n == 0 || alpha == 0.0 {
+        return Ok(());
+    }
+    sger_inner(m, n, alpha, x, y, a)
+}
+
+#[cfg(target_os = "macos")]
+fn sgemv_inner(
+    trans: bool,
+    m: usize,
+    n: usize,
+    alpha: f32,
+    a: &[f32],
+    x: &[f32],
+    beta: f32,
+    y: &mut [f32],
+) -> Result<()> {
+    let m_i = i32_dim(m, "m")?;
+    let n_i = i32_dim(n, "n")?;
+    let ta = if trans { CBLAS_TRANS } else { CBLAS_NO_TRANS };
+    unsafe {
+        cblas_sgemv(
+            CBLAS_ROW_MAJOR,
+            ta,
+            m_i,
+            n_i,
+            alpha,
+            a.as_ptr(),
+            n_i,
+            x.as_ptr(),
+            1,
+            beta,
+            y.as_mut_ptr(),
+            1,
+        );
+    }
+    Ok(())
+}
+
+#[cfg(not(target_os = "macos"))]
+fn sgemv_inner(
+    trans: bool,
+    m: usize,
+    n: usize,
+    alpha: f32,
+    a: &[f32],
+    x: &[f32],
+    beta: f32,
+    y: &mut [f32],
+) -> Result<()> {
+    sgemv_naive(trans, m, n, alpha, a, x, beta, y);
+    Ok(())
+}
+
+#[cfg(any(test, not(target_os = "macos")))]
+fn sgemv_naive(
+    trans: bool,
+    m: usize,
+    n: usize,
+    alpha: f32,
+    a: &[f32],
+    x: &[f32],
+    beta: f32,
+    y: &mut [f32],
+) {
+    if trans {
+        if beta == 0.0 {
+            y[..n].fill(0.0);
+        } else if beta != 1.0 {
+            for yi in &mut y[..n] {
+                *yi *= beta;
+            }
+        }
+        for i in 0..m {
+            let s = alpha * x[i];
+            if s == 0.0 {
+                continue;
+            }
+            let row = &a[i * n..i * n + n];
+            for j in 0..n {
+                y[j] += s * row[j];
+            }
+        }
+    } else {
+        for i in 0..m {
+            let row = &a[i * n..i * n + n];
+            let mut acc = 0.0f32;
+            for j in 0..n {
+                acc += row[j] * x[j];
+            }
+            y[i] = alpha * acc + beta * y[i];
+        }
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn sger_inner(m: usize, n: usize, alpha: f32, x: &[f32], y: &[f32], a: &mut [f32]) -> Result<()> {
+    let m_i = i32_dim(m, "m")?;
+    let n_i = i32_dim(n, "n")?;
+    unsafe {
+        cblas_sger(
+            CBLAS_ROW_MAJOR,
+            m_i,
+            n_i,
+            alpha,
+            x.as_ptr(),
+            1,
+            y.as_ptr(),
+            1,
+            a.as_mut_ptr(),
+            n_i,
+        );
+    }
+    Ok(())
+}
+
+#[cfg(not(target_os = "macos"))]
+fn sger_inner(m: usize, n: usize, alpha: f32, x: &[f32], y: &[f32], a: &mut [f32]) -> Result<()> {
+    sger_naive(m, n, alpha, x, y, a);
+    Ok(())
+}
+
+#[cfg(any(test, not(target_os = "macos")))]
+fn sger_naive(m: usize, n: usize, alpha: f32, x: &[f32], y: &[f32], a: &mut [f32]) {
+    for i in 0..m {
+        let s = alpha * x[i];
+        if s == 0.0 {
+            continue;
+        }
+        let row = &mut a[i * n..i * n + n];
+        for j in 0..n {
+            row[j] += s * y[j];
+        }
+    }
 }
 
 #[cfg(target_os = "macos")]
@@ -2151,6 +2353,36 @@ mod tests {
     }
 
     #[test]
+    fn sgemv_sger_match_naive() {
+        let m = 5usize;
+        let n = 7usize;
+        let a: Vec<f32> = (0..m * n).map(|i| (i as f32) * 0.1 - 1.3).collect();
+        let x: Vec<f32> = (0..n).map(|i| (i as f32) * 0.2 + 0.4).collect();
+        let xt: Vec<f32> = (0..m).map(|i| (i as f32) * -0.15 + 0.7).collect();
+        let mut y = vec![0.3f32; m];
+        let mut y_ref = y.clone();
+        sgemv(false, m, n, 1.25, &a, &x, 0.5, &mut y).unwrap();
+        sgemv_naive(false, m, n, 1.25, &a, &x, 0.5, &mut y_ref);
+        for (a, b) in y.iter().zip(&y_ref) {
+            assert!((a - b).abs() < 1e-5, "{a} vs {b}");
+        }
+        let mut yt = vec![-0.2f32; n];
+        let mut yt_ref = yt.clone();
+        sgemv(true, m, n, -0.75, &a, &xt, 0.25, &mut yt).unwrap();
+        sgemv_naive(true, m, n, -0.75, &a, &xt, 0.25, &mut yt_ref);
+        for (a, b) in yt.iter().zip(&yt_ref) {
+            assert!((a - b).abs() < 1e-5, "{a} vs {b}");
+        }
+        let mut g = a.clone();
+        let mut g_ref = a.clone();
+        sger(m, n, 0.4, &xt, &x, &mut g).unwrap();
+        sger_naive(m, n, 0.4, &xt, &x, &mut g_ref);
+        for (a, b) in g.iter().zip(&g_ref) {
+            assert!((a - b).abs() < 1e-5, "{a} vs {b}");
+        }
+    }
+
+    #[test]
     fn apply_topk_keeps_k_and_zeros_rest() {
         let mut g = vec![0.1f32, 0.7, 0.2, 0.5, 0.1, 0.4];
         apply_topk_gates(&mut g, 2, 3, 1);
@@ -2304,7 +2536,8 @@ mod tests {
 
     #[test]
     fn bwd_tok_par_packs_multiple_tokens_at_d256_g4() {
-        let spec = MobKanSpec::new(384, 256, 256, 4, 3, 1, 3, 3, 1, false, false, 1.5, 0.7).unwrap();
+        let spec =
+            MobKanSpec::new(384, 256, 256, 4, 3, 1, 3, 3, 1, false, false, 1.5, 0.7).unwrap();
         assert!(
             spec.bwd_tok_par() >= 2,
             "tok_par={} (want ≥2 at G=4 so tokens are not fully serial)",

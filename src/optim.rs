@@ -149,3 +149,70 @@ impl SgdMomentum {
         Ok(())
     }
 }
+
+/// SGD+momentum over a list of `(weight, grad)` slices. Used by `--arch memory`.
+#[derive(Debug)]
+pub struct DenseSgd {
+    pub lr: f32,
+    pub momentum: f32,
+    pub max_norm: f32,
+    vel: Vec<Vec<f32>>,
+}
+
+impl DenseSgd {
+    pub fn new(lens: &[usize], lr: f64, momentum: f64, max_norm: f64) -> Self {
+        Self {
+            lr: lr as f32,
+            momentum: momentum as f32,
+            max_norm: max_norm as f32,
+            vel: lens.iter().map(|&n| vec![0.0f32; n]).collect(),
+        }
+    }
+
+    pub fn clip_scale(&self, sq: f32) -> f32 {
+        if self.max_norm > 0.0 {
+            let n = sq.sqrt();
+            if n > self.max_norm {
+                self.max_norm / n
+            } else {
+                1.0
+            }
+        } else {
+            1.0
+        }
+    }
+
+    pub fn update_slice(&mut self, i: usize, w: &mut [f32], g: &[f32], scale: f32) {
+        if i >= self.vel.len() {
+            self.vel.resize(i + 1, Vec::new());
+        }
+        if self.vel[i].len() != w.len() {
+            self.vel[i] = vec![0.0f32; w.len()];
+        }
+        let lr = self.lr;
+        let mu = self.momentum;
+        let vel = &mut self.vel[i];
+        let n = w.len().min(g.len());
+        for j in 0..n {
+            vel[j] = vel[j] * mu + g[j] * scale;
+            w[j] -= lr * vel[j];
+        }
+    }
+
+    pub fn step(&mut self, params: &mut [(&mut [f32], &[f32])]) -> Result<()> {
+        if params.len() != self.vel.len() {
+            self.vel = params.iter().map(|(w, _)| vec![0.0f32; w.len()]).collect();
+        }
+        let mut sq = 0.0f32;
+        for (_, g) in params.iter() {
+            for &v in *g {
+                sq += v * v;
+            }
+        }
+        let scale = self.clip_scale(sq);
+        for (i, (w, g)) in params.iter_mut().enumerate() {
+            self.update_slice(i, w, g, scale);
+        }
+        Ok(())
+    }
+}
