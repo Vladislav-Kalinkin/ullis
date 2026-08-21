@@ -462,6 +462,7 @@ pub struct UllisKan {
     pub last_entropy: f32,
     pub last_router_entropy: f32,
     pub last_aux: f32,
+    pub last_mask: f32,
     pub last_fwd_ms: f32,
     pub last_ce_ms: f32,
     pub last_bwd_ms: f32,
@@ -470,9 +471,10 @@ pub struct UllisKan {
 impl UllisKan {
     pub fn new(cfg: TrainConfig, device: SovereignDevice) -> Result<Self> {
         let mut rng = crate::device::rng_from_seed(cfg.seed);
+        let embed_std = (cfg.d_model as f32).sqrt().recip();
         let mut embed = SovereignTensor::from_vec(
             vec![cfg.vocab_size, cfg.d_model],
-            randn(cfg.vocab_size * cfg.d_model, 1.0, &mut rng),
+            randn(cfg.vocab_size * cfg.d_model, embed_std, &mut rng),
         )?;
         let mut blocks = Vec::with_capacity(cfg.n_layers);
         for _ in 0..cfg.n_layers {
@@ -501,6 +503,7 @@ impl UllisKan {
             last_entropy: 0.0,
             last_router_entropy: 0.0,
             last_aux: 0.0,
+            last_mask: 0.0,
             last_fwd_ms: 0.0,
             last_ce_ms: 0.0,
             last_bwd_ms: 0.0,
@@ -727,8 +730,11 @@ impl UllisKan {
     ) -> Result<f32> {
         let _guard = TrainStepGuard::enter();
         self.zero_grad();
-        for blk in &mut self.blocks {
-            blk.ff.set_hot_fp32(true)?;
+        let metal_fp16 = self.device.is_metal() && self.cfg.master == MasterDtype::Fp16;
+        if !metal_fp16 {
+            for blk in &mut self.blocks {
+                blk.ff.set_hot_fp32(true)?;
+            }
         }
         let v = self.cfg.vocab_size;
         let d = self.cfg.d_model;
@@ -760,6 +766,8 @@ impl UllisKan {
         self.last_ce_ms = t_ce.elapsed().as_secs_f32() * 1e3;
         self.last_ce = loss - entropy_coef.max(0.0) * mean_h;
         self.last_entropy = mean_h;
+        let n_sup = mask.iter().filter(|&&m| m != 0).count();
+        self.last_mask = n_sup as f32 / n.max(1) as f32;
         if l1 > 0.0 {
             loss += l1 * self.l1_penalty();
         }
@@ -832,8 +840,10 @@ impl UllisKan {
         self.last_aux = if an == 0 { 0.0 } else { aux / an as f32 };
         loss += self.last_aux;
         self.last_bwd_ms = t_bwd.elapsed().as_secs_f32() * 1e3;
-        for blk in &mut self.blocks {
-            blk.ff.set_hot_fp32(false)?;
+        if !metal_fp16 {
+            for blk in &mut self.blocks {
+                blk.ff.set_hot_fp32(false)?;
+            }
         }
         Ok(loss)
     }

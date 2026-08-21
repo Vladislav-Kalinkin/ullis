@@ -47,6 +47,7 @@ impl MobKanSpec {
     /// Practical in-tile cap. Threadgroup scratch allows ~480 at G=16; 256 is conservative.
     pub const TILE_IN: u32 = 256;
     pub const OUT_TILE: u32 = 32;
+    /// Token-tile width. Production fused-bwd launches `ceil(n / N_TILE)` TGs.
     pub const N_TILE: u32 = 16;
     /// 32 KiB threadgroup / 4 bytes. Scratch is `TIN + TIN·G + K`.
     pub const TG_SCRATCH_FLOATS: u32 = 8192;
@@ -104,7 +105,11 @@ impl MobKanSpec {
     pub fn choose_tile_in(in_f: u32, g: u32, k: u32) -> u32 {
         let k = k.max(1);
         let denom = 1u32.saturating_add(g).max(1);
-        let max_tin = Self::TG_SCRATCH_FLOATS.saturating_sub(k) / denom;
+        // Reserve TILE_IN floats for the QAT `d_base[out_f]` cache.
+        let max_tin = Self::TG_SCRATCH_FLOATS
+            .saturating_sub(k)
+            .saturating_sub(Self::TILE_IN)
+            / denom;
         in_f.min(Self::TILE_IN).min(max_tin.max(1)).max(1)
     }
 
@@ -296,11 +301,39 @@ impl MobKanSpec {
         self.coarse != 0 || self.gr == 0 || self.k == 0
     }
 
-    pub fn scratch_floats(&self) -> usize {
+    /// Threadgroup floats for one rematerialized token (no `d_base`).
+    pub fn scratch_token_floats(&self) -> usize {
         let tin = self.tile_in_us();
         let k = self.k_us().max(1);
-        // x[TIN] + ψ[TIN·G] + gates[K] + φ[TIN] + ρ[K·TIN] + d_base[OUT_TILE]
-        tin + tin * self.g_us() + k + tin + k * tin + self.out_tile_us()
+        // x[TIN] + ψ[TIN·G] + gates[K] + φ[TIN] + ρ[K·TIN]
+        tin + tin * self.g_us() + k + tin + k * tin
+    }
+
+    /// How many tokens a fused-bwd TG can rematerialize at once (2D threads).
+    /// Slot 0 keeps `d_base[out]`; extra slots pack behind it. Cap 4.
+    pub fn bwd_tok_par(&self) -> u32 {
+        let one = self.scratch_token_floats().saturating_add(self.out_us());
+        let extra = self.scratch_token_floats().max(1);
+        let budget = Self::TG_SCRATCH_FLOATS as usize;
+        if one > budget {
+            return 1;
+        }
+        let par = 1 + (budget - one) / extra;
+        (par.max(1).min(self.n_tile_us()).min(4)) as u32
+    }
+
+    /// Forward TG scratch: one token + `d_base[out]`. Must stay small so
+    /// 384 token-TGs keep occupancy. Bwd extra slots live in [`Self::scratch_floats`].
+    pub fn scratch_floats_fwd(&self) -> usize {
+        self.scratch_token_floats().saturating_add(self.out_us())
+    }
+
+    pub fn scratch_floats(&self) -> usize {
+        let extra = self.scratch_token_floats();
+        let par = self.bwd_tok_par() as usize;
+        extra
+            .saturating_add(self.out_us())
+            .saturating_add(extra.saturating_mul(par.saturating_sub(1)))
     }
 
     pub fn n_tiles(&self) -> usize {
@@ -314,8 +347,9 @@ impl MobKanSpec {
 
 /// Host/device layout of one in-tile fused-bwd partial slab.
 ///
-/// Grid is `(n_tiles, out_tiles)`. Each TG owns `N_TILE` tokens × `OUT_TILE`
-/// outputs × current `TIN`. Reduce is a host sum (no atomics).
+/// Grid is `(n_tiles, out_tiles)`. Base / dx / dg stay unique per output or
+/// token. Shared / routed / dss / dsr / dc are **one copy per TG** (threads
+/// atomic-add). Reduce is a host sum.
 #[derive(Clone, Copy, Debug)]
 pub struct BwdPartialLayout {
     pub n_tiles: usize,
@@ -353,26 +387,24 @@ impl BwdPartialLayout {
         let g = spec.g_us();
         let mut off = 0usize;
         let off_base = off;
+        // Unique per output: threads do not share a base row.
         off += tg.saturating_mul(ot).saturating_mul(tin);
         let off_shared = off;
-        off += tg.saturating_mul(ot).saturating_mul(tin).saturating_mul(gs);
+        // Compact: one [TIN, gs] per TG. Threads atomic-add (not ot copies).
+        off += tg.saturating_mul(tin).saturating_mul(gs);
         let off_routed = off;
-        off += tg
-            .saturating_mul(k)
-            .saturating_mul(ot)
-            .saturating_mul(tin)
-            .saturating_mul(gr);
+        off += tg.saturating_mul(k).saturating_mul(tin).saturating_mul(gr);
         let off_dx = off;
         off += tg.saturating_mul(nt).saturating_mul(tin);
         let off_dsb = off;
         off += tg.saturating_mul(ot);
         let off_dss = off;
-        off += tg.saturating_mul(ot).saturating_mul(tin);
+        off += tg.saturating_mul(tin);
         let off_dsr = off;
-        off += tg.saturating_mul(k).saturating_mul(ot).saturating_mul(tin);
+        off += tg.saturating_mul(k).saturating_mul(tin);
         let off_dc = off;
-        // Per in-tile lane so TG threads do not serialize `dCenters`.
-        off += tg.saturating_mul(tin).saturating_mul(g);
+        // Compact: one [G] per TG.
+        off += tg.saturating_mul(g);
         let off_dg = off;
         // Unique slot per output in the tile so TG threads do not race on dg.
         off += tg.saturating_mul(nt).saturating_mul(ot).saturating_mul(k);
@@ -1937,52 +1969,57 @@ pub fn reduce_bwd_partials(
             for lo in 0..otn {
                 let o = o0 + lo;
                 let base_row = layout.off_base + (tg * ot_max + lo) * tin_cap;
-                let sh_row = layout.off_shared + (tg * ot_max + lo) * tin_cap * layout.gs;
-                for i in 0..tin {
-                    grads.grad_base[o * in_f + in0 + i] += part[base_row + i];
-                    if gs > 0 {
-                        let dst = (in0 + i) * gs;
-                        let src = sh_row + i * layout.gs;
-                        for gi in 0..gs {
-                            grads.grad_shared[dst + gi] += part[src + gi];
-                        }
-                    }
-                }
+                saxpy(
+                    1.0,
+                    &part[base_row..base_row + tin],
+                    &mut grads.grad_base[o * in_f + in0..o * in_f + in0 + tin],
+                )?;
                 grads.grad_scale_base[o] += part[layout.off_dsb + tg * ot_max + lo];
-                let dss = layout.off_dss + (tg * ot_max + lo) * tin_cap;
-                for i in 0..tin {
-                    grads.grad_scale_shared[in0 + i] += part[dss + i];
-                }
-                if routed {
-                    for e in 0..k {
-                        let rr = layout.off_routed
-                            + (((tg * layout.k + e) * ot_max + lo) * tin_cap) * layout.gr;
-                        for i in 0..tin {
-                            let dst = (e * in_f + in0 + i) * gr.max(1);
-                            let src = rr + i * layout.gr;
-                            for gi in 0..gr {
-                                grads.grad_routed[dst + gi] += part[src + gi];
-                            }
-                        }
-                        let dsr = layout.off_dsr + ((tg * layout.k + e) * ot_max + lo) * tin_cap;
-                        for i in 0..tin {
-                            grads.grad_scale_routed[e * in_f + in0 + i] += part[dsr + i];
-                        }
-                    }
+            }
+            if gs > 0 {
+                let sh_row = layout.off_shared + tg * tin_cap * layout.gs;
+                saxpy(
+                    1.0,
+                    &part[sh_row..sh_row + tin * layout.gs],
+                    &mut grads.grad_shared[(in0 * gs)..(in0 + tin) * gs],
+                )?;
+            }
+            let dss = layout.off_dss + tg * tin_cap;
+            saxpy(
+                1.0,
+                &part[dss..dss + tin],
+                &mut grads.grad_scale_shared[in0..in0 + tin],
+            )?;
+            if routed {
+                for e in 0..k {
+                    let rr = layout.off_routed + ((tg * layout.k + e) * tin_cap) * layout.gr;
+                    let gr_a = gr.max(1);
+                    saxpy(
+                        1.0,
+                        &part[rr..rr + tin * layout.gr],
+                        &mut grads.grad_routed
+                            [((e * in_f + in0) * gr_a)..(e * in_f + in0 + tin) * gr_a],
+                    )?;
+                    let dsr = layout.off_dsr + (tg * layout.k + e) * tin_cap;
+                    saxpy(
+                        1.0,
+                        &part[dsr..dsr + tin],
+                        &mut grads.grad_scale_routed[e * in_f + in0..e * in_f + in0 + tin],
+                    )?;
                 }
             }
             for lt in 0..tn {
                 let t = t0 + lt;
                 let dx_row = layout.off_dx + (tg * nt_max + lt) * tin_cap;
-                for i in 0..tin {
-                    grads.dx[t * in_f + in0 + i] += part[dx_row + i];
-                }
+                saxpy(
+                    1.0,
+                    &part[dx_row..dx_row + tin],
+                    &mut grads.dx[t * in_f + in0..t * in_f + in0 + tin],
+                )?;
             }
-            for i in 0..tin {
-                let dc_row = layout.off_dc + (tg * tin_cap + i) * g;
-                for gi in 0..g {
-                    grads.grad_centers[gi] += part[dc_row + gi];
-                }
+            let dc_row = layout.off_dc + tg * g;
+            for gi in 0..g {
+                grads.grad_centers[gi] += part[dc_row + gi];
             }
         }
     }
@@ -2236,6 +2273,18 @@ mod tests {
     }
 
     #[test]
+    fn bwd_n_tile_keeps_occupancy_at_d256_train_shape() {
+        let spec =
+            MobKanSpec::new(384, 256, 256, 12, 8, 4, 3, 8, 1, false, false, 1.5, 0.7).unwrap();
+        assert_eq!(spec.n_tile, MobKanSpec::N_TILE);
+        assert!(
+            spec.n_tiles() > 1,
+            "n_tiles={} (need occupancy)",
+            spec.n_tiles()
+        );
+    }
+
+    #[test]
     fn spec_lifts_in_f_above_tile_cap() {
         let spec = MobKanSpec::new(2, 512, 64, 4, 3, 1, 3, 3, 1, false, false, 1.5, 0.7).unwrap();
         assert_eq!(spec.in_f, 512);
@@ -2243,9 +2292,39 @@ mod tests {
         assert!(spec.in_f > MobKanSpec::MAX_IN);
         assert_eq!(spec.out_tile, MobKanSpec::OUT_TILE);
         assert!(spec.out_f > spec.out_tile);
+        let extra = 256 + 256 * 4 + 3 + 256 + 3 * 256;
+        let par = spec.bwd_tok_par() as usize;
+        assert_eq!(spec.scratch_floats_fwd(), extra + spec.out_us());
         assert_eq!(
             spec.scratch_floats(),
-            256 + 256 * 4 + 3 + 256 + 3 * 256 + spec.out_tile_us()
+            extra + spec.out_us() + extra * par.saturating_sub(1)
+        );
+        assert!(spec.scratch_floats() <= MobKanSpec::TG_SCRATCH_FLOATS as usize);
+    }
+
+    #[test]
+    fn bwd_tok_par_packs_multiple_tokens_at_d256_g4() {
+        let spec = MobKanSpec::new(384, 256, 256, 4, 3, 1, 3, 3, 1, false, false, 1.5, 0.7).unwrap();
+        assert!(
+            spec.bwd_tok_par() >= 2,
+            "tok_par={} (want ≥2 at G=4 so tokens are not fully serial)",
+            spec.bwd_tok_par()
+        );
+        assert!(
+            spec.scratch_floats_fwd() < spec.scratch_floats(),
+            "fwd scratch must stay 1-token so occupancy does not collapse"
+        );
+    }
+
+    #[test]
+    fn bwd_partial_compact_stays_small_at_d256_g12() {
+        let spec =
+            MobKanSpec::new(384, 256, 256, 12, 8, 4, 3, 8, 1, false, false, 1.5, 0.7).unwrap();
+        let layout = BwdPartialLayout::from_spec(&spec);
+        let mb = (layout.floats * 4) as f64 / (1024.0 * 1024.0);
+        assert!(
+            mb < 24.0,
+            "compact fused-bwd slab {mb:.1} MB (want < 24 at d=256 G=12 n=384)"
         );
     }
 

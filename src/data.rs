@@ -94,48 +94,208 @@ pub fn pack_record(
     s
 }
 
+fn encode_record_parts(
+    tokenizer: &mut BpeTokenizer,
+    rec: &ChatRecord,
+) -> (Vec<u32>, Vec<u32>, Vec<u32>) {
+    let prefix = tokenizer.encode(
+        &pack_record(&rec.system, &rec.user, None, None),
+        false,
+        false,
+    );
+    let think = tokenizer.encode(
+        &format!("{TAG_THINKING}\n{}\n{TAG_THINK_END}\n", rec.thinking.trim()),
+        false,
+        false,
+    );
+    let mut output = tokenizer.encode(
+        &format!("{TAG_OUTPUT}\n{}\n", rec.output.trim()),
+        false,
+        false,
+    );
+    output.push(tokenizer.eos_id);
+    (prefix, think, output)
+}
+
+fn tail(xs: &[u32], n: usize) -> &[u32] {
+    if xs.len() <= n {
+        xs
+    } else {
+        &xs[xs.len() - n..]
+    }
+}
+
+fn head(xs: &[u32], n: usize) -> &[u32] {
+    if xs.len() <= n {
+        xs
+    } else {
+        &xs[..n]
+    }
+}
+
+fn mask_pref_sup(n_pref: usize, n_total: usize) -> Vec<u8> {
+    let mut mask = vec![0u8; n_total];
+    for m in mask.iter_mut().skip(n_pref.min(n_total)) {
+        *m = 1;
+    }
+    if n_total > 0 && mask.iter().all(|&m| m == 0) {
+        mask.fill(1);
+    }
+    mask
+}
+
+/// `context` is mask-0 (system+user, or earlier thinking used only as
+/// condition). `body` is mask-1. Fits in `keep` tokens. Context is the tail
+/// (most recent tokens); body is head or tail as requested.
+fn pack_ctx_body(
+    context: &[u32],
+    body: &[u32],
+    keep: usize,
+    body_from_head: bool,
+) -> (Vec<u32>, Vec<u8>) {
+    if keep == 0 {
+        return (Vec::new(), Vec::new());
+    }
+    if context.len() + body.len() <= keep {
+        let mut ids = Vec::with_capacity(context.len() + body.len());
+        ids.extend_from_slice(context);
+        ids.extend_from_slice(body);
+        let n_ctx = context.len();
+        return (ids, mask_pref_sup(n_ctx, n_ctx + body.len()));
+    }
+    if context.len() < keep {
+        // Prefix fits: keep it whole and fill the rest with the body so a
+        // T=96 window still conditions on the user turn.
+        let body_part = if body_from_head {
+            head(body, keep - context.len())
+        } else {
+            tail(body, keep - context.len())
+        };
+        let n_ctx = context.len();
+        let mut ids = Vec::with_capacity(n_ctx + body_part.len());
+        ids.extend_from_slice(context);
+        ids.extend_from_slice(body_part);
+        let n = ids.len();
+        return (ids, mask_pref_sup(n_ctx, n));
+    }
+    // Prefix itself longer than the window: tail of the user turn plus body.
+    // Never spend the whole window on the unmasked prefix.
+    let min_ctx = if context.is_empty() {
+        0
+    } else {
+        8.min(context.len()).min(keep / 4)
+    };
+    let mut body_budget = keep.saturating_sub(min_ctx).min(body.len());
+    if body_budget == 0 && !body.is_empty() {
+        body_budget = 1.min(keep);
+    }
+    let body_part = if body_from_head {
+        head(body, body_budget)
+    } else {
+        tail(body, body_budget)
+    };
+    let ctx_part = tail(context, keep.saturating_sub(body_part.len()));
+    let n_ctx = ctx_part.len();
+    let mut ids = Vec::with_capacity(n_ctx + body_part.len());
+    ids.extend_from_slice(ctx_part);
+    ids.extend_from_slice(body_part);
+    let mask = mask_pref_sup(n_ctx, ids.len());
+    (ids, mask)
+}
+
+fn push_unique_window(windows: &mut Vec<(Vec<u32>, Vec<u8>)>, ids: Vec<u32>, mask: Vec<u8>) {
+    if ids.is_empty() || mask.iter().all(|&m| m == 0) {
+        return;
+    }
+    if windows.iter().any(|(w, _)| w == &ids) {
+        return;
+    }
+    windows.push((ids, mask));
+}
+
 /// Encode a packed record. Loss mask is 1 on thinking+output (the trajectory
 /// the KAN layer must predict) and 0 on the system+user prefix.
 ///
-/// Long traces are clipped to `seq_len + 1` keeping the user→thinking boundary
-/// (head of thinking + output), so a `T=96` window still sees the user turn.
+/// Long traces are clipped to `seq_len + 1`. The user prefix is taken from the
+/// **tail** so a huge problem statement cannot push thinking+output out of the
+/// window. This is the first honest window (start of thinking); the stream
+/// also emits answer-side windows via [`encode_supervised_windows`].
 pub fn encode_supervised(
     tokenizer: &mut BpeTokenizer,
     rec: &ChatRecord,
     seq_len: usize,
 ) -> (Vec<u32>, Vec<u8>) {
-    let think_span = format!("{TAG_THINKING}\n{}\n{TAG_THINK_END}\n", rec.thinking.trim());
-    let out_span = format!("{TAG_OUTPUT}\n{}\n", rec.output.trim());
+    encode_supervised_windows(tokenizer, rec, seq_len)
+        .into_iter()
+        .next()
+        .unwrap_or_else(|| (Vec::new(), Vec::new()))
+}
 
-    let mut ids = tokenizer.encode(
-        &pack_record(&rec.system, &rec.user, None, None),
-        false,
-        false,
-    );
-    let prefix_len = ids.len();
-    ids.extend(tokenizer.encode(&think_span, false, false));
-    ids.extend(tokenizer.encode(&out_span, false, false));
-    ids.push(tokenizer.eos_id);
-    let keep = seq_len.saturating_add(1).max(prefix_len.saturating_add(8));
-    if ids.len() > keep {
-        let mut clipped = ids[..prefix_len.min(keep)].to_vec();
-        let budget = keep.saturating_sub(clipped.len());
-        let rest = &ids[prefix_len..];
-        if rest.len() > budget {
-            clipped.extend_from_slice(&rest[..budget]);
-        } else {
-            clipped.extend_from_slice(rest);
+/// Honest supervised windows of length `≤ seq_len+1`.
+///
+/// A causal LM only learns tokens with mask=1. For traces longer than the
+/// context we emit a small set of **contiguous** windows that cover:
+/// 1. start of thinking (conditioned on the user-prefix tail)
+/// 2. the answer (conditioned on the thinking tail)
+/// 3. optionally a mid-thinking slice, and the output tail if the solution
+///    itself exceeds the window
+///
+/// The previous clip kept `prefix_len+8` tokens, so a 2k-token user turn
+/// filled the ring with mask-0 tokens and CE logged as `0.0000`.
+pub fn encode_supervised_windows(
+    tokenizer: &mut BpeTokenizer,
+    rec: &ChatRecord,
+    seq_len: usize,
+) -> Vec<(Vec<u32>, Vec<u8>)> {
+    let keep = seq_len.saturating_add(1).max(1);
+    let (prefix, think, output) = encode_record_parts(tokenizer, rec);
+    let full_len = prefix.len() + think.len() + output.len();
+    if full_len <= keep {
+        let mut ids = Vec::with_capacity(full_len);
+        ids.extend_from_slice(&prefix);
+        ids.extend_from_slice(&think);
+        ids.extend_from_slice(&output);
+        return vec![(ids, mask_pref_sup(prefix.len(), full_len))];
+    }
+
+    let mut windows = Vec::with_capacity(4);
+    let start_body = if think.is_empty() {
+        output.as_slice()
+    } else {
+        think.as_slice()
+    };
+    let (ids, mask) = pack_ctx_body(&prefix, start_body, keep, true);
+    push_unique_window(&mut windows, ids, mask);
+
+    if !output.is_empty() {
+        let mut ctx = Vec::with_capacity(prefix.len() + think.len());
+        ctx.extend_from_slice(&prefix);
+        ctx.extend_from_slice(&think);
+        let (ids, mask) = pack_ctx_body(&ctx, &output, keep, true);
+        push_unique_window(&mut windows, ids, mask);
+        if output.len() > keep / 2 {
+            let (ids, mask) = pack_ctx_body(&ctx, &output, keep, false);
+            push_unique_window(&mut windows, ids, mask);
         }
-        ids = clipped;
     }
-    let mut mask = vec![0u8; ids.len()];
-    for m in mask.iter_mut().skip(prefix_len.min(ids.len())) {
-        *m = 1;
+
+    if think.len() > keep.saturating_mul(2) {
+        let start = (think.len() - keep) / 2;
+        let slice = think[start..start + keep].to_vec();
+        let n = slice.len();
+        push_unique_window(&mut windows, slice, vec![1u8; n]);
     }
-    if mask.iter().all(|&m| m == 0) {
-        mask.fill(1);
+
+    if windows.is_empty() {
+        let mut ids = Vec::with_capacity(full_len);
+        ids.extend_from_slice(&prefix);
+        ids.extend_from_slice(&think);
+        ids.extend_from_slice(&output);
+        let ids = tail(&ids, keep).to_vec();
+        let n = ids.len();
+        windows.push((ids, vec![1u8; n]));
     }
-    (ids, mask)
+    windows
 }
 
 /// Cache-line aligned, compacting token+mask ring. Occupancy is always a
@@ -387,7 +547,7 @@ pub fn warn_corpus_homogeneity(path: impl AsRef<Path>) -> Result<()> {
     }
     if mean_think > 1500.0 {
         eprintln!(
-            "warn: {} mean thinking {:.0} chars — records are clipped to seq_len so the user prefix stays in-window",
+            "warn: {} mean thinking {:.0} chars — packing seq_len windows (prefix tail + think head / think tail + output) so CE is not a silent 0",
             path.display(),
             mean_think
         );
@@ -488,8 +648,19 @@ impl JsonlStream {
         let Some(rec) = parse_jsonl_line(trimmed) else {
             return Ok(true);
         };
-        let (ids, mask) = encode_supervised(&mut self.tokenizer, &rec, self.seq_len);
-        self.push_ids(ids, mask);
+        let keep = self.seq_len.saturating_add(1);
+        let eos = self.tokenizer.eos_id;
+        let mut windows = encode_supervised_windows(&mut self.tokenizer, &rec, self.seq_len);
+        if windows.len() > 1 {
+            windows.shuffle(&mut self.rng);
+        }
+        for (mut ids, mut mask) in windows {
+            while ids.len() < keep {
+                ids.push(eos);
+                mask.push(0);
+            }
+            self.push_ids(ids, mask);
+        }
         self.lines_seen += 1;
         Ok(true)
     }
@@ -517,31 +688,30 @@ impl JsonlStream {
     }
 
     /// Next `(x, y, loss_mask)` — shifted LM, mask aligned with `y`.
+    ///
+    /// Windows are consumed from the front of the ring (each record is packed
+    /// as one or more `seq_len+1` chunks). Leading mask-0 prefix is skipped
+    /// so a step never reports `ce=0` on an unsupervised problem statement.
     pub fn next_seq(&mut self) -> Result<(Vec<u32>, Vec<u32>, Vec<u8>)> {
-        self.refill()?;
-        while self.flash.len() < self.seq_len + 1 {
-            self.flash.push(self.tokenizer.eos_id, 0);
+        let need = self.seq_len + 1;
+        let mut skipped = 0usize;
+        loop {
+            self.refill()?;
+            while self.flash.len() < need {
+                self.flash.push(self.tokenizer.eos_id, 0);
+            }
+            let (chunk, mchunk) = self.flash.window(0, need);
+            let n_sup = mchunk[1..].iter().filter(|&&m| m != 0).count();
+            if n_sup > 0 || skipped > self.seq_len.saturating_mul(8) {
+                let x = chunk[..self.seq_len].to_vec();
+                let y = chunk[1..].to_vec();
+                let loss_mask = mchunk[1..].to_vec();
+                self.flash.drain_front(need.min(self.flash.len()));
+                return Ok((x, y, loss_mask));
+            }
+            self.flash.drain_front(1.min(self.flash.len()));
+            skipped += 1;
         }
-        let max_start = self.flash.len() - self.seq_len - 1;
-        // Prefer the left of the buffer (user→thinking boundary after clip).
-        let start = if max_start == 0 {
-            0
-        } else if self.rng.random::<f32>() < 0.55 {
-            0
-        } else if self.rng.random::<f32>() < 0.5 {
-            max_start
-        } else {
-            self.rng.random_range(0..=max_start)
-        };
-        let (chunk, mchunk) = self.flash.window(start, self.seq_len + 1);
-        let x = chunk[..self.seq_len].to_vec();
-        let y = chunk[1..].to_vec();
-        let loss_mask = mchunk[1..].to_vec();
-        if self.rng.random::<f32>() < 0.05 {
-            let drain = (start + 16).min(self.flash.len());
-            self.flash.drain_front(drain);
-        }
-        Ok((x, y, loss_mask))
     }
 
     pub fn next_batch(&mut self, batch: usize) -> Result<(Vec<u32>, Vec<u32>, Vec<u8>)> {
@@ -688,6 +858,61 @@ mod tests {
             "user prefix must be masked off so the window still conditions on it"
         );
         assert!(mask.contains(&1));
+    }
+
+    #[test]
+    fn encode_supervised_does_not_keep_overlong_prefix() {
+        let mut tok = crate::tokenizer::train_wordpiece(&[], 1024, 1).unwrap();
+        let rec = ChatRecord {
+            system: "sys".into(),
+            user: "problem statement ".repeat(400),
+            thinking: "reason ".repeat(400),
+            output: "fn add(a: i32, b: i32) -> i32 { a + b }".into(),
+        };
+        let seq = 48usize;
+        let windows = encode_supervised_windows(&mut tok, &rec, seq);
+        assert!(!windows.is_empty());
+        for (ids, mask) in &windows {
+            assert!(ids.len() <= seq + 1, "window len {}", ids.len());
+            assert!(
+                mask.iter().any(|&m| m != 0),
+                "honest window must have supervised tokens"
+            );
+        }
+        let out_ids = tok.encode(
+            &format!("{TAG_OUTPUT}\n{}\n", rec.output.trim()),
+            false,
+            false,
+        );
+        let has_output = windows.iter().any(|(ids, _)| {
+            ids.windows(out_ids.len()).any(|w| w == out_ids.as_slice())
+                || out_ids.iter().any(|t| ids.contains(t))
+        });
+        assert!(has_output, "some window must include the answer");
+    }
+
+    #[test]
+    fn next_seq_skips_unsupervised_prefix_on_long_user() {
+        let tok = crate::tokenizer::train_wordpiece(&[], 1024, 1).unwrap();
+        let rec = ChatRecord {
+            system: "sys".into(),
+            user: "user turn ".repeat(200),
+            thinking: "think step ".repeat(200),
+            output: "fn ok() {}".into(),
+        };
+        let line = serde_json::to_string(&rec).unwrap();
+        let dir = std::env::temp_dir();
+        let path = dir.join(format!(
+            "ullis-honest-train-{}-{}.jsonl",
+            std::process::id(),
+            rec.user.len()
+        ));
+        std::fs::write(&path, format!("{line}\n")).unwrap();
+        let mut stream = JsonlStream::open(&path, tok, 32, 1).unwrap();
+        let (_x, _y, mask) = stream.next_seq().unwrap();
+        let n_sup = mask.iter().filter(|&&m| m != 0).count();
+        let _ = std::fs::remove_file(&path);
+        assert!(n_sup > 0, "next_seq must not return an all-zero CE mask");
     }
 
     #[test]

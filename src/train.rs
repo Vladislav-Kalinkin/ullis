@@ -308,10 +308,11 @@ pub fn train(args: TrainArgs) -> Result<PathBuf> {
                     let avg = running / n_seen.max(1) as f32;
                     let fp = train_footprint(&model, &opt, phase);
                     println!(
-                        "  {name} e{epoch} s{step:04} loss={avg:.4} ce={:.4} H={:.3} Hr={:.3} rss={:.1}MB{} tok/s={:.0} G={} zero={:.2} +={:.2} -={:.2} fwd={:.1}ms ce={:.1}ms bwd={:.1}ms waits={}",
+                        "  {name} e{epoch} s{step:04} loss={avg:.4} ce={:.4} H={:.3} Hr={:.3} mask={:.2} rss={:.1}MB{} tok/s={:.0} G={} zero={:.2} +={:.2} -={:.2} fwd={:.1}ms ce={:.1}ms bwd={:.1}ms waits={}",
                         model.last_ce,
                         model.last_entropy,
                         model.last_router_entropy,
+                        model.last_mask,
                         fp.rss_mb,
                         fp.format_fields(),
                         thru.tok_s(),

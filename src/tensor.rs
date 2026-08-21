@@ -217,6 +217,8 @@ pub struct FusedKanTensors<'a> {
     pub scale_base: &'a SovereignTensor,
     pub scale_shared: &'a SovereignTensor,
     pub scale_routed: &'a SovereignTensor,
+    pub weight_half: bool,
+    pub half: Option<HalfWeightBufs<'a>>,
 }
 
 /// Bindings for one fused MoB-KAN backward launch.
@@ -235,6 +237,101 @@ pub struct FusedKanBwdTensors<'a> {
     pub grads: FusedBwdGrads<'a>,
     pub lambda_r: f32,
     pub aux_coef: f32,
+    pub weight_half: bool,
+    pub half: Option<HalfWeightBufs<'a>>,
+}
+
+/// FP16 master weights aliased as Shared `half` buffers. Compute promotes to float.
+pub struct HalfWeightBufs<'a> {
+    pub base: &'a HalfWire,
+    pub shared: &'a HalfWire,
+    pub routed: Option<&'a HalfWire>,
+    pub router: Option<&'a HalfWire>,
+}
+
+/// Page-aligned `u16` slab wrapped as a Metal Shared buffer of `half`.
+pub struct HalfWire {
+    #[cfg(target_os = "macos")]
+    gpu: Option<GpuSlot>,
+    slab: PageSlab,
+    n: usize,
+}
+
+impl std::fmt::Debug for HalfWire {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("HalfWire").field("n", &self.n).finish()
+    }
+}
+
+impl HalfWire {
+    fn new(n: usize, gpu: &SovereignDevice) -> Result<Self> {
+        let bytes = n.saturating_mul(2).max(16);
+        let mut t = Self {
+            #[cfg(target_os = "macos")]
+            gpu: None,
+            slab: PageSlab::new(bytes)?,
+            n,
+        };
+        t.attach(gpu)?;
+        Ok(t)
+    }
+
+    pub fn reuse_u16<'a>(
+        slot: &'a mut Option<Self>,
+        data: &[u16],
+        gpu: &SovereignDevice,
+    ) -> Result<&'a mut Self> {
+        let n = data.len();
+        let ok = slot.as_ref().is_some_and(|t| t.n == n);
+        if !ok {
+            if let Some(old) = slot.as_mut() {
+                old.detach_gpu();
+            }
+            *slot = Some(Self::new(n, gpu)?);
+        }
+        let t = slot
+            .as_mut()
+            .ok_or_else(|| anyhow::anyhow!("half wire slot"))?;
+        t.as_u16_mut()?.copy_from_slice(data);
+        t.attach(gpu)?;
+        Ok(t)
+    }
+
+    fn as_u16_mut(&mut self) -> Result<&mut [u16]> {
+        self.slab.u16_at_mut(self.n)
+    }
+
+    fn attach(&mut self, gpu: &SovereignDevice) -> Result<()> {
+        #[cfg(target_os = "macos")]
+        {
+            let Some(mtl) = gpu.mtl_device() else {
+                return Ok(());
+            };
+            if self.gpu.is_some() {
+                return Ok(());
+            }
+            let buffer = device::wrap_shared_bytes_no_copy(mtl, self.slab.as_bytes())?;
+            self.gpu = Some(GpuSlot { buffer });
+            Ok(())
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            let _ = gpu;
+            Ok(())
+        }
+    }
+
+    fn detach_gpu(&mut self) {
+        #[cfg(target_os = "macos")]
+        {
+            self.gpu = None;
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    pub fn metal_buffer(&self) -> Option<&metal::Buffer> {
+        self.gpu.as_ref().map(|s| &s.buffer)
+    }
 }
 
 /// Run fused backward. Metal writes TG-private partials and the host reduces;
@@ -248,8 +345,21 @@ pub fn fused_mob_kan_bwd(
     spec.validate()?;
     check_len(tensors.x, spec.x_len(), "x")?;
     check_len(tensors.dy, spec.y_len(), "dy")?;
-    check_len(tensors.w_base, spec.w_base_len(), "w_base")?;
-    check_len(tensors.w_shared, spec.w_shared_len(), "w_shared")?;
+    if tensors.weight_half {
+        let h = tensors
+            .half
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("half weights missing"))?;
+        if h.base.n != spec.w_base_len() {
+            bail!("half w_base {} != {}", h.base.n, spec.w_base_len());
+        }
+        if h.shared.n != spec.w_shared_len() {
+            bail!("half w_shared {} != {}", h.shared.n, spec.w_shared_len());
+        }
+    } else {
+        check_len(tensors.w_base, spec.w_base_len(), "w_base")?;
+        check_len(tensors.w_shared, spec.w_shared_len(), "w_shared")?;
+    }
     check_len(tensors.centers, spec.centers_len(), "centers")?;
     check_len(tensors.inv_widths, spec.centers_len(), "inv_widths")?;
     match gpu.backend() {
@@ -259,6 +369,9 @@ pub fn fused_mob_kan_bwd(
 }
 
 fn fused_bwd_cpu(spec: &MobKanSpec, tensors: FusedKanBwdTensors<'_>) -> Result<(f32, f32)> {
+    if tensors.weight_half {
+        bail!("fp16 master compute is Metal-only");
+    }
     let FusedKanBwdTensors {
         x,
         dy,
@@ -274,6 +387,8 @@ fn fused_bwd_cpu(spec: &MobKanSpec, tensors: FusedKanBwdTensors<'_>) -> Result<(
         grads,
         lambda_r,
         aux_coef,
+        weight_half: _,
+        half: _,
     } = tensors;
     let empty: &[f32] = &[];
     let wr = w_routed.map_or(empty, SovereignTensor::as_slice);
@@ -319,6 +434,8 @@ fn fused_bwd_metal(
         mut grads,
         lambda_r,
         aux_coef,
+        weight_half,
+        half,
     } = tensors;
     if spec.packed != 0 {
         grads.dx[..spec.x_len()].fill(0.0);
@@ -346,9 +463,6 @@ fn fused_bwd_metal(
     let dummy = gpu.dummy_buffer();
     let tin_max = spec.tile_in_us();
     let mut in0 = 0usize;
-    // One wait per in-tile: host `reduce_bwd_partials` reads `part` immediately.
-    // Coalescing waits needs a part slab per tile (or a device reduce). At
-    // default d=32, TIN covers `in`, so this loop is a single dispatch.
     while in0 < spec.in_us() {
         let tin = tin_max.min(spec.in_us() - in0);
         part.as_mut_slice().fill(0.0);
@@ -359,12 +473,24 @@ fn fused_bwd_metal(
             let dyb = dy
                 .metal_buffer()
                 .ok_or_else(|| anyhow::anyhow!("dy has no Metal buffer"))?;
-            let w_base_b = w_base
-                .metal_buffer()
-                .ok_or_else(|| anyhow::anyhow!("w_base has no Metal buffer"))?;
-            let w_shared_b = w_shared
-                .metal_buffer()
-                .ok_or_else(|| anyhow::anyhow!("w_shared has no Metal buffer"))?;
+            let w_base_b = if weight_half {
+                half.as_ref()
+                    .and_then(|h| h.base.metal_buffer())
+                    .ok_or_else(|| anyhow::anyhow!("half w_base has no Metal buffer"))?
+            } else {
+                w_base
+                    .metal_buffer()
+                    .ok_or_else(|| anyhow::anyhow!("w_base has no Metal buffer"))?
+            };
+            let w_shared_b = if weight_half {
+                half.as_ref()
+                    .and_then(|h| h.shared.metal_buffer())
+                    .ok_or_else(|| anyhow::anyhow!("half w_shared has no Metal buffer"))?
+            } else {
+                w_shared
+                    .metal_buffer()
+                    .ok_or_else(|| anyhow::anyhow!("w_shared has no Metal buffer"))?
+            };
             let centers_b = centers
                 .metal_buffer()
                 .ok_or_else(|| anyhow::anyhow!("centers has no Metal buffer"))?;
@@ -380,18 +506,44 @@ fn fused_bwd_metal(
             let sr = scale_routed
                 .metal_buffer()
                 .ok_or_else(|| anyhow::anyhow!("scale_routed has no Metal buffer"))?;
-            let w_routed_b = w_routed
-                .and_then(SovereignTensor::metal_buffer)
-                .unwrap_or(dummy);
-            let router_b = router
-                .and_then(SovereignTensor::metal_buffer)
-                .unwrap_or(dummy);
+            let w_routed_b = if weight_half {
+                half.as_ref()
+                    .and_then(|h| h.routed.and_then(HalfWire::metal_buffer))
+                    .unwrap_or(dummy)
+            } else {
+                w_routed
+                    .and_then(SovereignTensor::metal_buffer)
+                    .unwrap_or(dummy)
+            };
+            let router_b = if weight_half {
+                half.as_ref()
+                    .and_then(|h| h.router.and_then(HalfWire::metal_buffer))
+                    .unwrap_or(dummy)
+            } else {
+                router
+                    .and_then(SovereignTensor::metal_buffer)
+                    .unwrap_or(dummy)
+            };
             let part_b = part
                 .metal_buffer()
                 .ok_or_else(|| anyhow::anyhow!("part has no Metal buffer"))?;
             gpu.dispatch_fused_mob_kan_bwd(
-                spec, in0 as u32, tin as u32, xb, dyb, w_base_b, w_shared_b, w_routed_b, router_b,
-                centers_b, inv_b, sb, ss, sr, part_b,
+                spec,
+                in0 as u32,
+                tin as u32,
+                xb,
+                dyb,
+                w_base_b,
+                w_shared_b,
+                w_routed_b,
+                router_b,
+                centers_b,
+                inv_b,
+                sb,
+                ss,
+                sr,
+                part_b,
+                weight_half,
             )?;
         }
         reduce_bwd_partials(spec, &layout, in0, tin, part.as_slice(), &mut grads)?;
@@ -432,8 +584,6 @@ pub fn fused_mob_kan_step(
     spec.validate()?;
     check_len(tensors.x, spec.x_len(), "x")?;
     check_len(tensors.y, spec.y_len(), "y")?;
-    check_len(tensors.w_base, spec.w_base_len(), "w_base")?;
-    check_len(tensors.w_shared, spec.w_shared_len(), "w_shared")?;
     check_len(tensors.centers, spec.centers_len(), "centers")?;
     check_len(tensors.inv_widths, spec.centers_len(), "inv_widths")?;
     check_len(tensors.scale_base, spec.scale_vec_len(), "scale_base")?;
@@ -442,20 +592,54 @@ pub fn fused_mob_kan_step(
         spec.scale_shared_len(),
         "scale_shared",
     )?;
+    if tensors.weight_half {
+        let h = tensors
+            .half
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("half weights missing"))?;
+        if h.base.n != spec.w_base_len() {
+            bail!("half w_base {} != {}", h.base.n, spec.w_base_len());
+        }
+        if h.shared.n != spec.w_shared_len() {
+            bail!("half w_shared {} != {}", h.shared.n, spec.w_shared_len());
+        }
+    } else {
+        check_len(tensors.w_base, spec.w_base_len(), "w_base")?;
+        check_len(tensors.w_shared, spec.w_shared_len(), "w_shared")?;
+    }
     if !spec.mask_routed() {
-        let wr = tensors
-            .w_routed
-            .ok_or_else(|| anyhow::anyhow!("w_routed required"))?;
-        let rt = tensors
-            .router
-            .ok_or_else(|| anyhow::anyhow!("router required"))?;
-        check_len(wr, spec.w_routed_len(), "w_routed")?;
-        check_len(rt, spec.router_len(), "router")?;
         check_len(
             tensors.scale_routed,
             spec.scale_routed_len(),
             "scale_routed",
         )?;
+        if tensors.weight_half {
+            let h = tensors
+                .half
+                .as_ref()
+                .ok_or_else(|| anyhow::anyhow!("half weights missing"))?;
+            let wr = h
+                .routed
+                .ok_or_else(|| anyhow::anyhow!("half w_routed required"))?;
+            let rt = h
+                .router
+                .ok_or_else(|| anyhow::anyhow!("half router required"))?;
+            if wr.n != spec.w_routed_len() {
+                bail!("half w_routed {} != {}", wr.n, spec.w_routed_len());
+            }
+            if rt.n != spec.router_len() {
+                bail!("half router {} != {}", rt.n, spec.router_len());
+            }
+        } else {
+            let wr = tensors
+                .w_routed
+                .ok_or_else(|| anyhow::anyhow!("w_routed required"))?;
+            let rt = tensors
+                .router
+                .ok_or_else(|| anyhow::anyhow!("router required"))?;
+            check_len(wr, spec.w_routed_len(), "w_routed")?;
+            check_len(rt, spec.router_len(), "router")?;
+        }
     }
 
     match gpu.backend() {
@@ -472,6 +656,9 @@ fn check_len(t: &SovereignTensor, n: usize, name: &str) -> Result<()> {
 }
 
 fn fused_cpu(spec: &MobKanSpec, tensors: FusedKanTensors<'_>) -> Result<()> {
+    if tensors.weight_half {
+        bail!("fp16 master compute is Metal-only");
+    }
     let empty: &[f32] = &[];
     let wr = tensors.w_routed.map_or(empty, SovereignTensor::as_slice);
     let rt = tensors.router.map_or(empty, SovereignTensor::as_slice);
@@ -507,14 +694,42 @@ fn fused_metal(
             .y
             .metal_buffer()
             .ok_or_else(|| anyhow::anyhow!("y has no Metal buffer; call attach()"))?;
-        let w_base = tensors
-            .w_base
-            .metal_buffer()
-            .ok_or_else(|| anyhow::anyhow!("w_base has no Metal buffer"))?;
-        let w_shared = tensors
-            .w_shared
-            .metal_buffer()
-            .ok_or_else(|| anyhow::anyhow!("w_shared has no Metal buffer"))?;
+        let dummy = gpu.dummy_buffer();
+        let (w_base, w_shared, w_routed, router) = if tensors.weight_half {
+            let h = tensors
+                .half
+                .as_ref()
+                .ok_or_else(|| anyhow::anyhow!("half weights missing"))?;
+            (
+                h.base
+                    .metal_buffer()
+                    .ok_or_else(|| anyhow::anyhow!("half w_base has no Metal buffer"))?,
+                h.shared
+                    .metal_buffer()
+                    .ok_or_else(|| anyhow::anyhow!("half w_shared has no Metal buffer"))?,
+                h.routed.and_then(HalfWire::metal_buffer).unwrap_or(dummy),
+                h.router.and_then(HalfWire::metal_buffer).unwrap_or(dummy),
+            )
+        } else {
+            (
+                tensors
+                    .w_base
+                    .metal_buffer()
+                    .ok_or_else(|| anyhow::anyhow!("w_base has no Metal buffer"))?,
+                tensors
+                    .w_shared
+                    .metal_buffer()
+                    .ok_or_else(|| anyhow::anyhow!("w_shared has no Metal buffer"))?,
+                tensors
+                    .w_routed
+                    .and_then(SovereignTensor::metal_buffer)
+                    .unwrap_or(dummy),
+                tensors
+                    .router
+                    .and_then(SovereignTensor::metal_buffer)
+                    .unwrap_or(dummy),
+            )
+        };
         let centers = tensors
             .centers
             .metal_buffer()
@@ -535,15 +750,6 @@ fn fused_metal(
             .scale_routed
             .metal_buffer()
             .ok_or_else(|| anyhow::anyhow!("scale_routed has no Metal buffer"))?;
-        let dummy = gpu.dummy_buffer();
-        let w_routed = tensors
-            .w_routed
-            .and_then(SovereignTensor::metal_buffer)
-            .unwrap_or(dummy);
-        let router = tensors
-            .router
-            .and_then(SovereignTensor::metal_buffer)
-            .unwrap_or(dummy);
 
         gpu.dispatch_fused_mob_kan(
             spec,
@@ -558,6 +764,7 @@ fn fused_metal(
             scale_base,
             scale_shared,
             scale_routed,
+            tensors.weight_half,
         )?;
     }
     Ok(())
@@ -631,6 +838,8 @@ mod tests {
                 scale_base: &scale_base,
                 scale_shared: &scale_shared,
                 scale_routed: &scale_routed,
+                weight_half: false,
+                half: None,
             },
         )
         .unwrap();
@@ -708,6 +917,8 @@ mod tests {
                 scale_base: &scale_base,
                 scale_shared: &scale_shared,
                 scale_routed: &scale_routed,
+                weight_half: false,
+                half: None,
             },
         )
         .unwrap();
@@ -727,6 +938,8 @@ mod tests {
                 scale_base: &scale_base,
                 scale_shared: &scale_shared,
                 scale_routed: &scale_routed,
+                weight_half: false,
+                half: None,
             },
         )
         .unwrap();

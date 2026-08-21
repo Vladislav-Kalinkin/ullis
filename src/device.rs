@@ -56,6 +56,8 @@ struct MetalInner {
     queue: metal::CommandQueue,
     pipeline: metal::ComputePipelineState,
     pipeline_bwd: metal::ComputePipelineState,
+    pipeline_half: metal::ComputePipelineState,
+    pipeline_bwd_half: metal::ComputePipelineState,
     embed_i8: metal::ComputePipelineState,
     logits_i8: metal::ComputePipelineState,
     dummy: metal::Buffer,
@@ -138,6 +140,28 @@ impl PageSlab {
     /// First `n` f32s. The slab pointer is 16 KiB-aligned, so this is always
     /// a valid f32 view of the prefix (never a mid-slab Metal wrap).
     #[allow(clippy::cast_ptr_alignment)]
+    pub fn u16_at(&self, n: usize) -> Result<&[u16]> {
+        let need = n
+            .checked_mul(2)
+            .ok_or_else(|| anyhow::anyhow!("u16 slice overflow"))?;
+        if need > self.bytes {
+            bail!("u16 slice {n} overruns {} byte slab", self.bytes);
+        }
+        Ok(unsafe { std::slice::from_raw_parts(self.ptr.as_ptr().cast::<u16>(), n) })
+    }
+
+    #[allow(clippy::cast_ptr_alignment)]
+    pub fn u16_at_mut(&mut self, n: usize) -> Result<&mut [u16]> {
+        let need = n
+            .checked_mul(2)
+            .ok_or_else(|| anyhow::anyhow!("u16 slice overflow"))?;
+        if need > self.bytes {
+            bail!("u16 slice {n} overruns {} byte slab", self.bytes);
+        }
+        Ok(unsafe { std::slice::from_raw_parts_mut(self.ptr.as_ptr().cast::<u16>(), n) })
+    }
+
+    #[allow(clippy::cast_ptr_alignment)]
     pub fn f32_at(&self, n: usize) -> Result<&[f32]> {
         let need = n
             .checked_mul(4)
@@ -185,6 +209,8 @@ struct MobKanBwdLaunch {
     n_tiles: u32,
     out_tiles: u32,
     tin: u32,
+    tok_par: u32,
+    pad: [u32; 3],
 }
 
 impl std::fmt::Debug for SovereignDevice {
@@ -287,6 +313,7 @@ impl SovereignDevice {
         scale_base: &metal::Buffer,
         scale_shared: &metal::Buffer,
         scale_routed: &metal::Buffer,
+        weight_half: bool,
     ) -> Result<()> {
         spec.validate()?;
         let inner = self
@@ -294,8 +321,13 @@ impl SovereignDevice {
             .as_ref()
             .ok_or_else(|| anyhow::anyhow!("dispatch on CPU device"))?;
 
-        let scratch_bytes = (spec.scratch_floats().max(4) * 4) as u64;
-        let tpg = threadgroup_width(&inner.pipeline, spec.out_f as u64, spec.out_tile as u64);
+        let scratch_bytes = (spec.scratch_floats_fwd().max(4) * 4) as u64;
+        let pso = if weight_half {
+            &inner.pipeline_half
+        } else {
+            &inner.pipeline
+        };
+        let tpg = threadgroup_width(pso, spec.out_f as u64, spec.out_tile as u64);
         let groups = metal::MTLSize::new(u64::from(spec.n), 1, 1);
         let threads = metal::MTLSize::new(tpg, 1, 1);
 
@@ -303,7 +335,7 @@ impl SovereignDevice {
             let cmd = inner.queue.new_command_buffer();
             cmd.set_label("ullis.mob_kan.fused");
             let enc = cmd.new_compute_command_encoder();
-            enc.set_compute_pipeline_state(&inner.pipeline);
+            enc.set_compute_pipeline_state(pso);
             enc.set_buffer(0, Some(x), 0);
             enc.set_buffer(1, Some(y), 0);
             enc.set_buffer(2, Some(w_base), 0);
@@ -354,28 +386,41 @@ impl SovereignDevice {
         scale_shared: &metal::Buffer,
         scale_routed: &metal::Buffer,
         part: &metal::Buffer,
+        weight_half: bool,
     ) -> Result<()> {
         spec.validate()?;
         let inner = self
             .metal
             .as_ref()
             .ok_or_else(|| anyhow::anyhow!("dispatch on CPU device"))?;
+        let tok_par = spec.bwd_tok_par().max(1);
         let launch = MobKanBwdLaunch {
             spec: *spec,
             in0,
             n_tiles: spec.n_tiles() as u32,
             out_tiles: spec.out_tiles() as u32,
             tin,
+            tok_par,
+            pad: [0; 3],
         };
         let scratch_bytes = (spec.scratch_floats().max(4) * 4) as u64;
-        let tpg = threadgroup_width(&inner.pipeline_bwd, spec.out_f as u64, spec.out_tile as u64);
+        let pso = if weight_half {
+            &inner.pipeline_bwd_half
+        } else {
+            &inner.pipeline_bwd
+        };
+        let tpg_y = u64::from(tok_par).max(1);
+        let cap = pso.max_total_threads_per_threadgroup().max(1);
+        let tpg_x = threadgroup_width(pso, spec.out_f as u64, spec.out_tile as u64)
+            .min(cap / tpg_y)
+            .max(1);
         let groups = metal::MTLSize::new(u64::from(launch.n_tiles), u64::from(launch.out_tiles), 1);
-        let threads = metal::MTLSize::new(tpg, 1, 1);
+        let threads = metal::MTLSize::new(tpg_x, tpg_y, 1);
         with_autorelease(|| {
             let cmd = inner.queue.new_command_buffer();
             cmd.set_label("ullis.mob_kan.fused_bwd");
             let enc = cmd.new_compute_command_encoder();
-            enc.set_compute_pipeline_state(&inner.pipeline_bwd);
+            enc.set_compute_pipeline_state(pso);
             enc.set_buffer(0, Some(x), 0);
             enc.set_buffer(1, Some(dy), 0);
             enc.set_buffer(2, Some(w_base), 0);
@@ -540,49 +585,59 @@ fn compile_metal(flags: DeviceFlags) -> Result<MetalInner> {
         // Explicit sub-allocation compiler flag: fused gradient checkpointing.
         // Injected as an MSL preprocessor define so metal-rs 0.29 does not need
         // an NSDictionary for `setPreprocessorMacros`.
-        let src = format!(
-            "#define ULLIS_FUSED_GRAD_CKPT {}\n{}",
-            u32::from(flags.fused_grad_ckpt),
-            FUSED_MSL
-        );
-        let library = device
-            .new_library_with_source(&src, &opts)
-            .map_err(|e| anyhow::anyhow!("MSL compile: {e}"))?;
-        let function = library
-            .get_function("ullis_mob_kan_fused_step", None)
-            .map_err(|e| anyhow::anyhow!("MSL function: {e}"))?;
-        let pipeline = device
-            .new_compute_pipeline_state_with_function(&function)
-            .map_err(|e| anyhow::anyhow!("PSO: {e}"))?;
-        let bwd_fn = library
-            .get_function("ullis_mob_kan_fused_bwd", None)
-            .map_err(|e| anyhow::anyhow!("MSL bwd: {e}"))?;
-        let pipeline_bwd = device
-            .new_compute_pipeline_state_with_function(&bwd_fn)
-            .map_err(|e| anyhow::anyhow!("PSO bwd: {e}"))?;
-        let embed_fn = library
-            .get_function("ullis_i8_embed_lookup", None)
-            .map_err(|e| anyhow::anyhow!("MSL embed i8: {e}"))?;
-        let embed_i8 = device
-            .new_compute_pipeline_state_with_function(&embed_fn)
-            .map_err(|e| anyhow::anyhow!("PSO embed i8: {e}"))?;
-        let logits_fn = library
-            .get_function("ullis_i8_tied_logits", None)
-            .map_err(|e| anyhow::anyhow!("MSL logits i8: {e}"))?;
-        let logits_i8 = device
-            .new_compute_pipeline_state_with_function(&logits_fn)
-            .map_err(|e| anyhow::anyhow!("PSO logits i8: {e}"))?;
+        let lib = compile_fused_library(&device, &opts, flags, false)?;
+        let lib_h = compile_fused_library(&device, &opts, flags, true)?;
+        let pipeline = pso_fn(&device, &lib, "ullis_mob_kan_fused_step")?;
+        let pipeline_bwd = pso_fn(&device, &lib, "ullis_mob_kan_fused_bwd")?;
+        let pipeline_half = pso_fn(&device, &lib_h, "ullis_mob_kan_fused_step")?;
+        let pipeline_bwd_half = pso_fn(&device, &lib_h, "ullis_mob_kan_fused_bwd")?;
+        let embed_i8 = pso_fn(&device, &lib, "ullis_i8_embed_lookup")?;
+        let logits_i8 = pso_fn(&device, &lib, "ullis_i8_tied_logits")?;
         let dummy = alloc_shared_f32_buffer(&device, 8)?;
         Ok(MetalInner {
             device,
             queue,
             pipeline,
             pipeline_bwd,
+            pipeline_half,
+            pipeline_bwd_half,
             embed_i8,
             logits_i8,
             dummy,
         })
     })
+}
+
+#[cfg(target_os = "macos")]
+fn compile_fused_library(
+    device: &metal::Device,
+    opts: &metal::CompileOptions,
+    flags: DeviceFlags,
+    w_half: bool,
+) -> Result<metal::Library> {
+    let src = format!(
+        "#define ULLIS_FUSED_GRAD_CKPT {}\n#define ULLIS_W_HALF {}\n{}",
+        u32::from(flags.fused_grad_ckpt),
+        u32::from(w_half),
+        FUSED_MSL
+    );
+    device
+        .new_library_with_source(&src, opts)
+        .map_err(|e| anyhow::anyhow!("MSL compile half={w_half}: {e}"))
+}
+
+#[cfg(target_os = "macos")]
+fn pso_fn(
+    device: &metal::Device,
+    lib: &metal::Library,
+    name: &str,
+) -> Result<metal::ComputePipelineState> {
+    let function = lib
+        .get_function(name, None)
+        .map_err(|e| anyhow::anyhow!("MSL function {name}: {e}"))?;
+    device
+        .new_compute_pipeline_state_with_function(&function)
+        .map_err(|e| anyhow::anyhow!("PSO {name}: {e}"))
 }
 
 #[cfg(target_os = "macos")]
@@ -719,6 +774,15 @@ using namespace metal;
 #ifndef ULLIS_FUSED_GRAD_CKPT
 #define ULLIS_FUSED_GRAD_CKPT 0
 #endif
+#ifndef ULLIS_W_HALF
+#define ULLIS_W_HALF 0
+#endif
+#if ULLIS_W_HALF
+typedef half wgt_t;
+#else
+typedef float wgt_t;
+#endif
+inline float ld_w(wgt_t w) { return float(w); }
 
 struct MobKanSpec {
     uint n;
@@ -790,10 +854,10 @@ inline float apply_w(float w, float delta, float scale, uint qat, uint packed) {
     return w;
 }
 
-inline float row_delta(device const float* row, uint cols, float ratio) {
+inline float row_delta(device const wgt_t* row, uint cols, float ratio) {
     float s = 0.0f;
     for (uint i = 0; i < cols; ++i) {
-        s += fabs(row[i]);
+        s += fabs(ld_w(row[i]));
     }
     float inv = 1.0f / float(max(cols, 1u));
     return ratio * s * inv;
@@ -835,21 +899,41 @@ inline void bump_pair(float x, float c, float inv, float dpsi, thread float* dx,
     *dc += du * (inv * sgn);
 }
 
+// tok_par>1: several tokens in one TG accumulate into the same dW slot.
+inline void atomic_add_f(device float* p, float v) {
+    if (v == 0.0f) {
+        return;
+    }
+    device atomic_uint* a = (device atomic_uint*)p;
+    uint old = atomic_load_explicit(a, memory_order_relaxed);
+    while (true) {
+        uint neu = as_type<uint>(as_type<float>(old) + v);
+        if (atomic_compare_exchange_weak_explicit(
+                a, &old, neu, memory_order_relaxed, memory_order_relaxed)) {
+            return;
+        }
+    }
+}
+
 struct MobKanBwdLaunch {
     MobKanSpec p;
     uint in0;
     uint n_tiles;
     uint out_tiles;
     uint tin;
+    uint tok_par;
+    uint pad1;
+    uint pad2;
+    uint pad3;
 };
 
 kernel void ullis_mob_kan_fused_step(
     device const float* x            [[buffer(0)]],
     device       float* y            [[buffer(1)]],
-    device const float* w_base       [[buffer(2)]],
-    device const float* w_shared     [[buffer(3)]],
-    device const float* w_routed     [[buffer(4)]],
-    device const float* router       [[buffer(5)]],
+    device const wgt_t* w_base       [[buffer(2)]],
+    device const wgt_t* w_shared     [[buffer(3)]],
+    device const wgt_t* w_routed     [[buffer(4)]],
+    device const wgt_t* router       [[buffer(5)]],
     device const float* centers      [[buffer(6)]],
     device const float* scale_base   [[buffer(7)]],
     device const float* scale_shared [[buffer(8)]],
@@ -879,6 +963,7 @@ kernel void ullis_mob_kan_fused_step(
     threadgroup float* gate_s = scratch + tin_cap + tin_cap * g;
     threadgroup float* phi_s = gate_s + max(p.k, 1u);
     threadgroup float* rho_s = phi_s + tin_cap;
+    threadgroup float* dbase_s = rho_s + max(p.k, 1u) * tin_cap;
 #if ULLIS_FUSED_GRAD_CKPT
     (void)0;
 #endif
@@ -894,9 +979,9 @@ kernel void ullis_mob_kan_fused_step(
         float m = -INFINITY;
         for (uint e = 0; e < k; ++e) {
             float s = 0.0f;
-            device const float* wr = router + e * in_f;
+            device const wgt_t* wr = router + e * in_f;
             for (uint i = 0; i < in_f; ++i) {
-                s += x_n[i] * wr[i];
+                s += x_n[i] * ld_w(wr[i]);
             }
             logits[e] = s;
             m = max(m, s);
@@ -925,6 +1010,13 @@ kernel void ullis_mob_kan_fused_step(
     (void)sh_len;
     (void)rt_len;
 
+    if (qat != 0u) {
+        for (uint o = tid; o < out_f; o += tpg) {
+            dbase_s[o] = row_delta(w_base + o * in_f, in_f, p.delta_ratio);
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
     for (uint in0 = 0u; in0 < in_f; in0 += tin_cap) {
         uint tin = min(tin_cap, in_f - in0);
         for (uint i = tid; i < tin; i += tpg) {
@@ -947,21 +1039,21 @@ kernel void ullis_mob_kan_fused_step(
 
         for (uint i = tid; i < tin; i += tpg) {
             float phi = 0.0f;
-            device const float* ws_i = w_shared + (in0 + i) * gs;
+            device const wgt_t* ws_i = w_shared + (in0 + i) * gs;
             float d_sh = (qat != 0u) ? row_delta(ws_i, gs, p.delta_ratio) : 0.0f;
             float ss = (qat != 0u || packed != 0u) ? scale_shared[in0 + i] : 1.0f;
             for (uint gi = 0; gi < g_use; ++gi) {
-                phi += bump_s[i * g + gi] * apply_w(ws_i[gi], d_sh, ss, qat, packed);
+                phi += bump_s[i * g + gi] * apply_w(ld_w(ws_i[gi]), d_sh, ss, qat, packed);
             }
             phi_s[i] = phi;
             if (routed) {
                 for (uint e = 0; e < k; ++e) {
-                    device const float* wr = w_routed + (e * in_f + in0 + i) * max(gr, 1u);
+                    device const wgt_t* wr = w_routed + (e * in_f + in0 + i) * max(gr, 1u);
                     float d_rt = (qat != 0u) ? row_delta(wr, gr, p.delta_ratio) : 0.0f;
                     float sr = (qat != 0u || packed != 0u) ? scale_routed[e * in_f + in0 + i] : 1.0f;
                     float mix = 0.0f;
                     for (uint gi = 0; gi < gr; ++gi) {
-                        mix += bump_s[i * g + gs + gi] * apply_w(wr[gi], d_rt, sr, qat, packed);
+                        mix += bump_s[i * g + gs + gi] * apply_w(ld_w(wr[gi]), d_rt, sr, qat, packed);
                     }
                     rho_s[e * tin_cap + i] = mix;
                 }
@@ -973,8 +1065,8 @@ kernel void ullis_mob_kan_fused_step(
             uint o_end = min(o0 + otile, out_f);
             for (uint o = o0 + tid; o < o_end; o += tpg) {
                 float acc = (in0 == 0u) ? 0.0f : y[gid * out_f + o];
-                device const float* wb = w_base + o * in_f;
-                float d_base = (qat != 0u) ? row_delta(wb, in_f, p.delta_ratio) : 0.0f;
+                device const wgt_t* wb = w_base + o * in_f;
+                float d_base = (qat != 0u) ? dbase_s[o] : 0.0f;
                 float sb = (qat != 0u || packed != 0u) ? scale_base[o] : 1.0f;
                 for (uint i = 0; i < tin; ++i) {
                     float u = x_s[i] + phi_s[i];
@@ -983,7 +1075,7 @@ kernel void ullis_mob_kan_fused_step(
                             u += gate_s[e] * rho_s[e * tin_cap + i];
                         }
                     }
-                    acc += u * apply_w(wb[in0 + i], d_base, sb, qat, packed);
+                    acc += u * apply_w(ld_w(wb[in0 + i]), d_base, sb, qat, packed);
                 }
                 y[gid * out_f + o] = acc;
             }
@@ -995,10 +1087,10 @@ kernel void ullis_mob_kan_fused_step(
 kernel void ullis_mob_kan_fused_bwd(
     device const float* x            [[buffer(0)]],
     device const float* dy           [[buffer(1)]],
-    device const float* w_base       [[buffer(2)]],
-    device const float* w_shared     [[buffer(3)]],
-    device const float* w_routed     [[buffer(4)]],
-    device const float* router       [[buffer(5)]],
+    device const wgt_t* w_base       [[buffer(2)]],
+    device const wgt_t* w_shared     [[buffer(3)]],
+    device const wgt_t* w_routed     [[buffer(4)]],
+    device const wgt_t* router       [[buffer(5)]],
     device const float* centers      [[buffer(6)]],
     device const float* scale_base   [[buffer(7)]],
     device const float* scale_shared [[buffer(8)]],
@@ -1019,6 +1111,8 @@ kernel void ullis_mob_kan_fused_bwd(
     }
     const uint tid0 = tid.x;
     const uint tpgx = max(tpg.x, 1u);
+    const uint py = tid.y;
+    const uint tok_par = max(L.tok_par, 1u);
     const uint n = p.n;
     const uint in_f = p.in_f;
     const uint out_f = p.out_f;
@@ -1040,11 +1134,16 @@ kernel void ullis_mob_kan_fused_bwd(
     const uint tn = min(nt_cap, n - t0);
     const uint otn = min(ot_cap, out_f - o0);
 
-    threadgroup float* x_s = scratch;
-    threadgroup float* bump_s = scratch + tin_cap;
-    threadgroup float* gate_s = scratch + tin_cap + tin_cap * g;
+    const uint per = tin_cap + tin_cap * g + max(p.k, 1u) + tin_cap + max(p.k, 1u) * tin_cap;
+    threadgroup float* slot = (py == 0u)
+        ? scratch
+        : scratch + per + p.out_f + (py - 1u) * per;
+    threadgroup float* x_s = slot;
+    threadgroup float* bump_s = slot + tin_cap;
+    threadgroup float* gate_s = slot + tin_cap + tin_cap * g;
     threadgroup float* phi_s = gate_s + max(p.k, 1u);
     threadgroup float* rho_s = phi_s + tin_cap;
+    threadgroup float* dbase_s = scratch + per;
 
     const uint qat = (p.phase >= 3u && p.packed == 0u) ? 1u : 0u;
     const uint packed = p.packed;
@@ -1063,32 +1162,43 @@ kernel void ullis_mob_kan_fused_bwd(
     const uint off_base = off;
     off += ntg * ot_cap * tin_cap;
     const uint off_shared = off;
-    off += ntg * ot_cap * tin_cap * gs_a;
+    off += ntg * tin_cap * gs_a;
     const uint off_routed = off;
-    off += ntg * k_a * ot_cap * tin_cap * gr_a;
+    off += ntg * k_a * tin_cap * gr_a;
     const uint off_dx = off;
     off += ntg * nt_cap * tin_cap;
     const uint off_dsb = off;
     off += ntg * ot_cap;
     const uint off_dss = off;
-    off += ntg * ot_cap * tin_cap;
+    off += ntg * tin_cap;
     const uint off_dsr = off;
-    off += ntg * k_a * ot_cap * tin_cap;
+    off += ntg * k_a * tin_cap;
     const uint off_dc = off;
-    off += ntg * tin_cap * g;
+    off += ntg * g;
     const uint off_dg = off;
 
-    for (uint lt = 0u; lt < tn; ++lt) {
-        uint t = t0 + lt;
+    if (qat != 0u && py == 0u) {
+        for (uint lo = tid0; lo < otn; lo += tpgx) {
+            uint o = o0 + lo;
+            dbase_s[lo] = row_delta(w_base + o * in_f, in_f, p.delta_ratio);
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    const uint niter = (tn + tok_par - 1u) / tok_par;
+    for (uint it = 0u; it < niter; ++it) {
+        uint lt = it * tok_par + py;
+        const bool live = lt < tn;
+        uint t = t0 + (live ? lt : 0u);
         device const float* x_n = x + t * in_f;
-        if (routed && tid0 == 0u) {
+        if (live && routed && tid0 == 0u) {
             float logits[4];
             float m = -INFINITY;
             for (uint e = 0u; e < k; ++e) {
                 float s = 0.0f;
-                device const float* wr = router + e * in_f;
+                device const wgt_t* wr = router + e * in_f;
                 for (uint i = 0u; i < in_f; ++i) {
-                    s += x_n[i] * wr[i];
+                    s += x_n[i] * ld_w(wr[i]);
                 }
                 logits[e] = s;
                 m = max(m, s);
@@ -1107,12 +1217,15 @@ kernel void ullis_mob_kan_fused_bwd(
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
+        if (live) {
         for (uint i = tid0; i < tin; i += tpgx) {
             x_s[i] = x_n[in0 + i];
+        }
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
         const uint n_bumps = tin * g;
+        if (live) {
         for (uint idx = tid0; idx < n_bumps; idx += tpgx) {
             uint i = idx / g;
             uint gi = idx - i * g;
@@ -1123,45 +1236,47 @@ kernel void ullis_mob_kan_fused_bwd(
             float z = (x_s[i] - centers[gi]) * inv;
             bump_s[idx] = relu_sq(1.0f - fabs(z));
         }
+        }
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
-        if (edge != 0u) {
+        if (live && edge != 0u) {
             for (uint i = tid0; i < tin; i += tpgx) {
                 float phi = 0.0f;
-                device const float* ws_i = w_shared + (in0 + i) * gs;
+                device const wgt_t* ws_i = w_shared + (in0 + i) * gs;
                 float d_sh_i = (qat != 0u) ? row_delta(ws_i, gs, p.delta_ratio) : 0.0f;
                 float ssi = (scale_on != 0u) ? scale_shared[in0 + i] : 1.0f;
                 for (uint gi = 0u; gi < g_use; ++gi) {
-                    phi += bump_s[i * g + gi] * qw_of(ws_i[gi], d_sh_i, ssi, qat, packed);
+                    phi += bump_s[i * g + gi] * qw_of(ld_w(ws_i[gi]), d_sh_i, ssi, qat, packed);
                 }
                 phi_s[i] = phi;
                 if (routed) {
                     for (uint e = 0u; e < k; ++e) {
-                        device const float* wr = w_routed + (e * in_f + in0 + i) * gr_a;
+                        device const wgt_t* wr = w_routed + (e * in_f + in0 + i) * gr_a;
                         float d_rt_i = (qat != 0u) ? row_delta(wr, gr, p.delta_ratio) : 0.0f;
                         float sri = (scale_on != 0u) ? scale_routed[e * in_f + in0 + i] : 1.0f;
                         float mix = 0.0f;
                         for (uint gi = 0u; gi < gr; ++gi) {
-                            mix += bump_s[i * g + gs + gi] * qw_of(wr[gi], d_rt_i, sri, qat, packed);
+                            mix += bump_s[i * g + gs + gi] * qw_of(ld_w(wr[gi]), d_rt_i, sri, qat, packed);
                         }
                         rho_s[e * tin_cap + i] = mix;
                     }
                 }
             }
-            threadgroup_barrier(mem_flags::mem_threadgroup);
         }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
 
+        if (live) {
         for (uint lo = tid0; lo < otn; lo += tpgx) {
             uint o = o0 + lo;
             float go = dy[t * out_f + o];
             float sbo = (scale_on != 0u) ? scale_base[o] : 1.0f;
-            device const float* wb = w_base + o * in_f;
-            float d_base = (qat != 0u) ? row_delta(wb, in_f, p.delta_ratio) : 0.0f;
+            device const wgt_t* wb = w_base + o * in_f;
+            float d_base = (qat != 0u) ? dbase_s[lo] : 0.0f;
             float dsb_acc = 0.0f;
             device float* pb = part + off_base + (tg * ot_cap + lo) * tin_cap;
-            device float* ps = part + off_shared + (tg * ot_cap + lo) * tin_cap * gs_a;
+            device float* ps = part + off_shared + tg * tin_cap * gs_a;
             if (edge != 0u) {
-                device float* dss_row = part + off_dss + (tg * ot_cap + lo) * tin_cap;
+                device float* dss_row = part + off_dss + tg * tin_cap;
                 for (uint i = 0u; i < tin; ++i) {
                     float u = x_s[i] + phi_s[i];
                     if (routed) {
@@ -1169,58 +1284,58 @@ kernel void ullis_mob_kan_fused_bwd(
                             u += gate_s[e] * rho_s[e * tin_cap + i];
                         }
                     }
-                    float w = wb[in0 + i];
+                    float w = ld_w(wb[in0 + i]);
                     float qw = qw_of(w, d_base, sbo, qat, packed);
                     float ste = (qat != 0u) ? ste_w(w) : 1.0f;
-                    pb[i] += go * u * sbo * ste;
+                    atomic_add_f(pb + i, go * u * sbo * ste);
                     if (scale_on != 0u) {
                         float code = (sbo != 0.0f) ? (qw / sbo) : 0.0f;
                         dsb_acc += go * u * code;
                     }
                     float du = go * qw;
-                    device const float* ws_i = w_shared + (in0 + i) * gs;
+                    device const wgt_t* ws_i = w_shared + (in0 + i) * gs;
                     float d_sh_i = (qat != 0u) ? row_delta(ws_i, gs, p.delta_ratio) : 0.0f;
                     float ssi = (scale_on != 0u) ? scale_shared[in0 + i] : 1.0f;
                     for (uint gi = 0u; gi < g_use; ++gi) {
                         float b = bump_s[i * g + gi];
-                        float ww = ws_i[gi];
+                        float ww = ld_w(ws_i[gi]);
                         float qs = qw_of(ww, d_sh_i, ssi, qat, packed);
                         float ste_s = (qat != 0u) ? ste_w(ww) : 1.0f;
-                        ps[i * gs_a + gi] += du * b * ssi * ste_s;
+                        atomic_add_f(ps + i * gs_a + gi, du * b * ssi * ste_s);
                         if (scale_on != 0u) {
                             float code = (ssi != 0.0f) ? (qs / ssi) : 0.0f;
-                            dss_row[i] += du * b * code;
+                            atomic_add_f(dss_row + i, du * b * code);
                         }
                     }
                 }
-                part[off_dsb + tg * ot_cap + lo] += dsb_acc;
+                atomic_add_f(part + off_dsb + tg * ot_cap + lo, dsb_acc);
                 if (routed) {
                     for (uint e = 0u; e < k; ++e) {
                         float gate = gate_s[e];
                         device float* pr = part + off_routed
-                            + (((tg * k_a + e) * ot_cap + lo) * tin_cap) * gr_a;
+                            + ((tg * k_a + e) * tin_cap) * gr_a;
                         device float* dsr_row = part + off_dsr
-                            + ((tg * k_a + e) * ot_cap + lo) * tin_cap;
+                            + (tg * k_a + e) * tin_cap;
                         float mix_dg = 0.0f;
                         for (uint i = 0u; i < tin; ++i) {
-                            float qw = qw_of(wb[in0 + i], d_base, sbo, qat, packed);
+                            float qw = qw_of(ld_w(wb[in0 + i]), d_base, sbo, qat, packed);
                             float du = go * qw;
                             mix_dg += du * rho_s[e * tin_cap + i];
                             if (gate <= 0.0f) {
                                 continue;
                             }
-                            device const float* wr = w_routed + (e * in_f + in0 + i) * gr_a;
+                            device const wgt_t* wr = w_routed + (e * in_f + in0 + i) * gr_a;
                             float d_rt_i = (qat != 0u) ? row_delta(wr, gr, p.delta_ratio) : 0.0f;
                             float sri = (scale_on != 0u) ? scale_routed[e * in_f + in0 + i] : 1.0f;
                             for (uint gi = 0u; gi < gr; ++gi) {
                                 float b = bump_s[i * g + gs + gi];
-                                float ww = wr[gi];
+                                float ww = ld_w(wr[gi]);
                                 float qr = qw_of(ww, d_rt_i, sri, qat, packed);
                                 float ste_r = (qat != 0u) ? ste_w(ww) : 1.0f;
-                                pr[i * gr_a + gi] += du * gate * b * sri * ste_r;
+                                atomic_add_f(pr + i * gr_a + gi, du * gate * b * sri * ste_r);
                                 if (scale_on != 0u) {
                                     float code = (sri != 0.0f) ? (qr / sri) : 0.0f;
-                                    dsr_row[i] += du * gate * b * code;
+                                    atomic_add_f(dsr_row + i, du * gate * b * code);
                                 }
                             }
                         }
@@ -1229,33 +1344,33 @@ kernel void ullis_mob_kan_fused_bwd(
                 }
             } else {
                 float sso = (scale_on != 0u) ? scale_shared[o] : 1.0f;
-                device const float* ws = w_shared + o * sh_len;
+                device const wgt_t* ws = w_shared + o * sh_len;
                 float d_sh = (qat != 0u) ? row_delta(ws, sh_len, p.delta_ratio) : 0.0f;
                 float dss_acc = 0.0f;
                 for (uint i = 0u; i < tin; ++i) {
                     float xv = x_s[i];
-                    float w = wb[in0 + i];
+                    float w = ld_w(wb[in0 + i]);
                     float qw = qw_of(w, d_base, sbo, qat, packed);
                     float ste = (qat != 0u) ? ste_w(w) : 1.0f;
-                    pb[i] += go * xv * sbo * ste;
+                    atomic_add_f(pb + i, go * xv * sbo * ste);
                     if (scale_on != 0u) {
                         float code = (sbo != 0.0f) ? (qw / sbo) : 0.0f;
                         dsb_acc += go * xv * code;
                     }
                     for (uint gi = 0u; gi < g_use; ++gi) {
                         float b = bump_s[i * g + gi];
-                        float ww = ws[(in0 + i) * gs + gi];
+                        float ww = ld_w(ws[(in0 + i) * gs + gi]);
                         float qs = qw_of(ww, d_sh, sso, qat, packed);
                         float ste_s = (qat != 0u) ? ste_w(ww) : 1.0f;
-                        ps[i * gs_a + gi] += go * b * sso * ste_s;
+                        atomic_add_f(ps + i * gs_a + gi, go * b * sso * ste_s);
                         if (scale_on != 0u) {
                             float code = (sso != 0.0f) ? (qs / sso) : 0.0f;
                             dss_acc += go * b * code;
                         }
                     }
                 }
-                part[off_dsb + tg * ot_cap + lo] += dsb_acc;
-                part[off_dss + tg * ot_cap + lo] += dss_acc;
+                atomic_add_f(part + off_dsb + tg * ot_cap + lo, dsb_acc);
+                atomic_add_f(part + off_dss + tg * tin_cap, dss_acc);
 
                 if (routed) {
                     for (uint e = 0u; e < k; ++e) {
@@ -1264,19 +1379,19 @@ kernel void ullis_mob_kan_fused_bwd(
                             continue;
                         }
                         float sre = (scale_on != 0u) ? scale_routed[e * out_f + o] : 1.0f;
-                        device const float* wr = w_routed + (e * out_f + o) * rt_len;
+                        device const wgt_t* wr = w_routed + (e * out_f + o) * rt_len;
                         float d_rt = (qat != 0u) ? row_delta(wr, rt_len, p.delta_ratio) : 0.0f;
                         float mix = 0.0f;
                         float dsr_acc = 0.0f;
                         device float* pr = part + off_routed
-                            + (((tg * k_a + e) * ot_cap + lo) * tin_cap) * gr_a;
+                            + ((tg * k_a + e) * tin_cap) * gr_a;
                         for (uint i = 0u; i < tin; ++i) {
                             for (uint gi = 0u; gi < gr; ++gi) {
                                 float b = bump_s[i * g + gs + gi];
-                                float ww = wr[(in0 + i) * gr + gi];
+                                float ww = ld_w(wr[(in0 + i) * gr + gi]);
                                 float qr = qw_of(ww, d_rt, sre, qat, packed);
                                 float ste_r = (qat != 0u) ? ste_w(ww) : 1.0f;
-                                pr[i * gr_a + gi] += go * gate * b * sre * ste_r;
+                                atomic_add_f(pr + i * gr_a + gi, go * gate * b * sre * ste_r);
                                 if (scale_on != 0u) {
                                     float code = (sre != 0.0f) ? (qr / sre) : 0.0f;
                                     dsr_acc += go * gate * b * code;
@@ -1284,14 +1399,16 @@ kernel void ullis_mob_kan_fused_bwd(
                                 mix += b * qr;
                             }
                         }
-                        part[off_dsr + (tg * k_a + e) * ot_cap + lo] += dsr_acc;
+                        atomic_add_f(part + off_dsr + (tg * k_a + e) * tin_cap, dsr_acc);
                         part[off_dg + (((tg * nt_cap + lt) * ot_cap + lo) * k_a) + e] += go * mix;
                     }
                 }
             }
         }
+        }
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
+        if (live) {
         for (uint i = tid0; i < tin; i += tpgx) {
             float xv = x_s[i];
             float acc = 0.0f;
@@ -1304,16 +1421,16 @@ kernel void ullis_mob_kan_fused_bwd(
                     uint o = o0 + lo;
                     float go = dy[t * out_f + o];
                     float sbo = (scale_on != 0u) ? scale_base[o] : 1.0f;
-                    device const float* wb = w_base + o * in_f;
-                    float d_base = (qat != 0u) ? row_delta(wb, in_f, p.delta_ratio) : 0.0f;
-                    acc += go * qw_of(wb[in0 + i], d_base, sbo, qat, packed);
+                    device const wgt_t* wb = w_base + o * in_f;
+                    float d_base = (qat != 0u) ? dbase_s[lo] : 0.0f;
+                    acc += go * qw_of(ld_w(wb[in0 + i]), d_base, sbo, qat, packed);
                 }
                 float du = acc;
-                device const float* ws_i = w_shared + (in0 + i) * gs;
+                device const wgt_t* ws_i = w_shared + (in0 + i) * gs;
                 float d_sh_i = (qat != 0u) ? row_delta(ws_i, gs, p.delta_ratio) : 0.0f;
                 float ssi = (scale_on != 0u) ? scale_shared[in0 + i] : 1.0f;
                 for (uint gi = 0u; gi < g_use; ++gi) {
-                    float qs = qw_of(ws_i[gi], d_sh_i, ssi, qat, packed);
+                    float qs = qw_of(ld_w(ws_i[gi]), d_sh_i, ssi, qat, packed);
                     float inv = inv_widths[gi];
                     if (inv <= 0.0f || !isfinite(inv)) {
                         inv = p.inv_width;
@@ -1326,11 +1443,11 @@ kernel void ullis_mob_kan_fused_bwd(
                         if (gate <= 0.0f) {
                             continue;
                         }
-                        device const float* wr = w_routed + (e * in_f + in0 + i) * gr_a;
+                        device const wgt_t* wr = w_routed + (e * in_f + in0 + i) * gr_a;
                         float d_rt_i = (qat != 0u) ? row_delta(wr, gr, p.delta_ratio) : 0.0f;
                         float sri = (scale_on != 0u) ? scale_routed[e * in_f + in0 + i] : 1.0f;
                         for (uint gi = 0u; gi < gr; ++gi) {
-                            float qr = qw_of(wr[gi], d_rt_i, sri, qat, packed);
+                            float qr = qw_of(ld_w(wr[gi]), d_rt_i, sri, qat, packed);
                             float inv = inv_widths[gs + gi];
                             if (inv <= 0.0f || !isfinite(inv)) {
                                 inv = p.inv_width;
@@ -1352,16 +1469,16 @@ kernel void ullis_mob_kan_fused_bwd(
                     float go = dy[t * out_f + o];
                     float sbo = (scale_on != 0u) ? scale_base[o] : 1.0f;
                     float sso = (scale_on != 0u) ? scale_shared[o] : 1.0f;
-                    device const float* wb = w_base + o * in_f;
-                    device const float* ws = w_shared + o * sh_len;
-                    float d_base = (qat != 0u) ? row_delta(wb, in_f, p.delta_ratio) : 0.0f;
+                    device const wgt_t* wb = w_base + o * in_f;
+                    device const wgt_t* ws = w_shared + o * sh_len;
+                    float d_base = (qat != 0u) ? dbase_s[lo] : 0.0f;
                     float d_sh = (qat != 0u) ? row_delta(ws, sh_len, p.delta_ratio) : 0.0f;
-                    float qw = qw_of(wb[in0 + i], d_base, sbo, qat, packed);
+                    float qw = qw_of(ld_w(wb[in0 + i]), d_base, sbo, qat, packed);
                     acc += go * qw;
                     for (uint gi = 0u; gi < g_use; ++gi) {
                         float b = bump_s[i * g + gi];
                         (void)b;
-                        float ww = ws[(in0 + i) * gs + gi];
+                        float ww = ld_w(ws[(in0 + i) * gs + gi]);
                         float qs = qw_of(ww, d_sh, sso, qat, packed);
                         float inv = inv_widths[gi];
                         if (inv <= 0.0f || !isfinite(inv)) {
@@ -1376,10 +1493,10 @@ kernel void ullis_mob_kan_fused_bwd(
                                 continue;
                             }
                             float sre = (scale_on != 0u) ? scale_routed[e * out_f + o] : 1.0f;
-                            device const float* wr = w_routed + (e * out_f + o) * rt_len;
+                            device const wgt_t* wr = w_routed + (e * out_f + o) * rt_len;
                             float d_rt = (qat != 0u) ? row_delta(wr, rt_len, p.delta_ratio) : 0.0f;
                             for (uint gi = 0u; gi < gr; ++gi) {
-                                float ww = wr[(in0 + i) * gr + gi];
+                                float ww = ld_w(wr[(in0 + i) * gr + gi]);
                                 float qr = qw_of(ww, d_rt, sre, qat, packed);
                                 float inv = inv_widths[gs + gi];
                                 if (inv <= 0.0f || !isfinite(inv)) {
@@ -1399,10 +1516,10 @@ kernel void ullis_mob_kan_fused_bwd(
                 }
             }
             part[off_dx + (tg * nt_cap + lt) * tin_cap + i] += acc;
-            device float* dc_row = part + off_dc + (tg * tin_cap + i) * g;
             for (uint gi = 0u; gi < g; ++gi) {
-                dc_row[gi] += dc_add[gi];
+                atomic_add_f(part + off_dc + tg * g + gi, dc_add[gi]);
             }
+        }
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
     }
@@ -1581,7 +1698,7 @@ mod tests {
         write_shared_f32_buffer(&bsr, &scale_routed).unwrap();
 
         gpu.dispatch_fused_mob_kan(
-            &spec, &bx, &by, &bwb, &bws, &bwr, &brt, &bc, &biw, &bsb, &bss, &bsr,
+            &spec, &bx, &by, &bwb, &bws, &bwr, &brt, &bc, &biw, &bsb, &bss, &bsr, false,
         )
         .unwrap();
         let mut y_gpu = vec![0.0f32; spec.y_len()];
@@ -1664,7 +1781,7 @@ mod tests {
         write_shared_f32_buffer(&bsr, &scale_routed).unwrap();
 
         gpu.dispatch_fused_mob_kan(
-            &spec, &bx, &by, &bwb, &bws, &bwr, &brt, &bc, &biw, &bsb, &bss, &bsr,
+            &spec, &bx, &by, &bwb, &bws, &bwr, &brt, &bc, &biw, &bsb, &bss, &bsr, false,
         )
         .unwrap();
         let mut y_gpu = vec![0.0f32; spec.y_len()];

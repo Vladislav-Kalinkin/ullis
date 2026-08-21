@@ -428,6 +428,36 @@ fn streamed_tied_ce_chunked_stable_at_wide_v() {
 }
 
 #[test]
+fn streamed_tied_ce_does_not_floor_at_ln_eps() {
+    let n = 1usize;
+    let d = 2usize;
+    let v = 4usize;
+    // Peaked logits: hidden · embed[0] >> others, target is token 3.
+    let hidden = vec![50.0f32, 0.0];
+    let embed = vec![
+        50.0, 0.0, // tok 0
+        0.0, 0.0, // tok 1
+        0.0, 0.0, // tok 2
+        0.0, 0.0, // tok 3 (target)
+    ];
+    let targets = [3u32];
+    let mask = [1u8];
+    let mut dh = vec![0.0f32; n * d];
+    let mut de = vec![0.0f32; v * d];
+    let mut row = Vec::new();
+    let (loss, _) = ullis::mixers::streamed_tied_ce_acc(
+        &hidden, &embed, n, d, v, &targets, &mask, 0.0, &mut dh, &mut de, &mut row,
+    )
+    .unwrap();
+    let floor = -1e-12f32.ln();
+    assert!(
+        loss > floor + 1.0,
+        "stable CE must exceed −ln(1e-12)={floor}, got {loss}"
+    );
+    assert!(loss.is_finite());
+}
+
+#[test]
 fn moe_topk_dense_matches_full_softmax() {
     let gpu = SovereignDevice::open(false).unwrap();
     let mut rng = ullis::device::rng_from_seed(3);
@@ -560,6 +590,30 @@ fn fp16_master_matches_snapped_fp32_tape() {
         }
     }
     assert!(m < 1e-4, "fp16 master vs snapped fp32 max|Δgrad|={m}");
+}
+
+#[test]
+fn metal_fp16_master_matches_cpu_fp16() {
+    let metal = SovereignDevice::open(true).unwrap();
+    if !metal.is_metal() {
+        return;
+    }
+    let cpu = SovereignDevice::open(false).unwrap();
+    let mut rng = ullis::device::rng_from_seed(11);
+    let mut layer_cpu = TernaryKanLinear::new(16, 16, 4, true, 3, 0.7, &mut rng).unwrap();
+    let mut rng = ullis::device::rng_from_seed(11);
+    let mut layer_gpu = TernaryKanLinear::new(16, 16, 4, true, 3, 0.7, &mut rng).unwrap();
+    layer_cpu.enable_fp16_master();
+    layer_gpu.enable_fp16_master();
+    let x = ullis::mixers::randn(4 * 16, 1.0, &mut ullis::device::rng_from_seed(12));
+    let y_cpu = layer_cpu.forward(&cpu, &x, 4).unwrap();
+    let y_gpu = layer_gpu.forward(&metal, &x, 4).unwrap();
+    let max = y_cpu
+        .iter()
+        .zip(y_gpu.iter())
+        .map(|(a, b)| (a - b).abs())
+        .fold(0.0f32, f32::max);
+    assert!(max < 2e-2, "metal half vs cpu fp16 max|Δ|={max}");
 }
 
 #[test]
@@ -728,6 +782,8 @@ fn fused_bwd_metal_matches_cpu_d32() {
     let cpu = SovereignDevice::open(false).unwrap();
     let err = layer_bwd_pair(&cpu, &metal, 32, 32, 8, true, 1);
     assert!(err < 1e-4, "metal fused vs host d=32 max|Δ|={err}");
+    let err = layer_bwd_pair(&cpu, &metal, 32, 32, 8, true, 3);
+    assert!(err < 1e-4, "metal fused vs host d=32 qat max|Δ|={err}");
 }
 
 #[test]

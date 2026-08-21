@@ -391,6 +391,7 @@ pub fn streamed_tied_ce_acc(
     let mut m = vec![f32::NEG_INFINITY; n_live];
     let mut z = vec![0.0f32; n_live];
     let mut entropy_row = vec![0.0f32; n_live];
+    let mut logit_y = vec![0.0f32; n_live];
     let mut dh_live = vec![0.0f32; n_live.saturating_mul(d)];
     let mut g = vec![0.0f32; need];
 
@@ -414,10 +415,15 @@ pub fn streamed_tied_ce_acc(
         let loc = &mut logits_row[..need];
         let vc = gemm_chunk(v0, loc)?;
         for r in 0..n_live {
+            let i = live[r];
+            let y = (targets[i] as usize).min(v.saturating_sub(1));
             let row = &loc[r * vc..(r + 1) * vc];
             let mx = row.iter().copied().fold(f32::NEG_INFINITY, f32::max);
             if mx > m[r] {
                 m[r] = mx;
+            }
+            if y >= v0 && y < v0 + vc {
+                logit_y[r] = row[y - v0];
             }
         }
         v0 += vc;
@@ -460,6 +466,10 @@ pub fn streamed_tied_ce_acc(
     }
 
     let mut loss = 0.0f32;
+    for r in 0..n_live {
+        // Stable CE: −(z_y − m) + log Σ e^{z−m}. Never floors at −ln(1e-12)=27.63.
+        loss += -(logit_y[r] - m[r]) + z[r].max(1e-20).ln();
+    }
     v0 = 0;
     while v0 < v {
         let loc = &mut logits_row[..need];
@@ -475,9 +485,6 @@ pub fn streamed_tied_ce_acc(
             for t in 0..vc {
                 let tok = v0 + t;
                 let p = (row[t] - mr).exp() * inv_z;
-                if tok == y {
-                    loss += -p.max(1e-12).ln();
-                }
                 let mut gk = p;
                 if tok == y {
                     gk -= 1.0;

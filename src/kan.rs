@@ -102,6 +102,10 @@ pub struct TernaryKanLinear {
     pub(crate) f16_shared: Option<Vec<u16>>,
     pub(crate) f16_routed: Option<Vec<u16>>,
     pub(crate) f16_router: Option<Vec<u16>>,
+    half_base: Option<crate::tensor::HalfWire>,
+    half_shared: Option<crate::tensor::HalfWire>,
+    half_routed: Option<crate::tensor::HalfWire>,
+    half_router: Option<crate::tensor::HalfWire>,
     pub grad_base: Vec<f32>,
     pub grad_shared: Vec<f32>,
     pub grad_routed: Vec<f32>,
@@ -200,6 +204,10 @@ impl TernaryKanLinear {
             f16_shared: None,
             f16_routed: None,
             f16_router: None,
+            half_base: None,
+            half_shared: None,
+            half_routed: None,
+            half_router: None,
             grad_base: Vec::new(),
             grad_shared: Vec::new(),
             grad_routed: Vec::new(),
@@ -423,16 +431,46 @@ impl TernaryKanLinear {
         stash_tensor(&mut self.router, &mut self.f16_router);
     }
 
+    fn uses_half_metal(&self, gpu: &SovereignDevice) -> bool {
+        gpu.is_metal() && self.master == MasterDtype::Fp16 && !self.packed
+    }
+
+    fn refresh_half_wires(&mut self, gpu: &SovereignDevice) -> Result<()> {
+        if self.f16_base.is_none() {
+            self.stash_master();
+        }
+        let Some(base) = self.f16_base.as_ref() else {
+            bail!("fp16 master has no base bits");
+        };
+        let Some(shared) = self.f16_shared.as_ref() else {
+            bail!("fp16 master has no shared bits");
+        };
+        crate::tensor::HalfWire::reuse_u16(&mut self.half_base, base, gpu)?;
+        crate::tensor::HalfWire::reuse_u16(&mut self.half_shared, shared, gpu)?;
+        if let Some(bits) = self.f16_routed.as_ref() {
+            crate::tensor::HalfWire::reuse_u16(&mut self.half_routed, bits, gpu)?;
+        }
+        if let Some(bits) = self.f16_router.as_ref() {
+            crate::tensor::HalfWire::reuse_u16(&mut self.half_router, bits, gpu)?;
+        }
+        Ok(())
+    }
+
+    fn half_bufs(&self) -> Option<crate::tensor::HalfWeightBufs<'_>> {
+        Some(crate::tensor::HalfWeightBufs {
+            base: self.half_base.as_ref()?,
+            shared: self.half_shared.as_ref()?,
+            routed: self.half_routed.as_ref(),
+            router: self.half_router.as_ref(),
+        })
+    }
+
     fn observe_routing(&mut self, x: &[f32], n: usize) -> Result<()> {
         if self.n_routed == 0 || n == 0 || self.router.is_none() {
             return Ok(());
         }
-        let rt = self
-            .router
-            .as_ref()
-            .map(SovereignTensor::as_slice)
-            .unwrap_or(&[])
-            .to_vec();
+        let rt_store = stored_f32(&self.router, &self.f16_router);
+        let rt = rt_store.as_deref().unwrap_or(&[]).to_vec();
         let k = self.n_experts.max(1);
         let mut z = vec![0.0f32; n * k];
         sgemm_nt(n, k, self.in_features, 1.0, x, &rt, 0.0, &mut z)?;
@@ -592,7 +630,12 @@ impl TernaryKanLinear {
         if y.len() < spec.y_len() {
             bail!("kan y len {} < {}", y.len(), spec.y_len());
         }
-        self.hydrate(Some(gpu))?;
+        let half = self.uses_half_metal(gpu);
+        if half {
+            self.refresh_half_wires(gpu)?;
+        } else {
+            self.hydrate(Some(gpu))?;
+        }
         self.observe_routing(x, n)?;
         let r = if gpu.is_metal() {
             self.forward_metal(gpu, &spec, x, n, y, xt, yt)
@@ -690,6 +733,28 @@ impl TernaryKanLinear {
                     scale_base: &self.scale_base,
                     scale_shared: &self.scale_shared,
                     scale_routed: &self.scale_routed,
+                    weight_half: false,
+                    half: None,
+                },
+            )?;
+        } else if self.uses_half_metal(gpu) {
+            fused_mob_kan_step(
+                gpu,
+                spec,
+                FusedKanTensors {
+                    x: xt,
+                    y: yt,
+                    w_base: self.weight_base.as_ref().unwrap_or(&self.scale_base),
+                    w_shared: self.weight_shared.as_ref().unwrap_or(&self.scale_shared),
+                    w_routed: self.weight_routed.as_ref(),
+                    router: self.router.as_ref(),
+                    centers: &self.centers,
+                    inv_widths: &self.inv_widths,
+                    scale_base: &self.scale_base,
+                    scale_shared: &self.scale_shared,
+                    scale_routed: &self.scale_routed,
+                    weight_half: true,
+                    half: self.half_bufs(),
                 },
             )?;
         } else {
@@ -716,6 +781,8 @@ impl TernaryKanLinear {
                     scale_base: &self.scale_base,
                     scale_shared: &self.scale_shared,
                     scale_routed: &self.scale_routed,
+                    weight_half: false,
+                    half: None,
                 },
             )?;
         }
@@ -1171,20 +1238,47 @@ impl TernaryKanLinear {
             dx[..spec.x_len()].fill(0.0);
             return Ok(());
         }
-        self.hydrate(Some(gpu))?;
+        let half = self.uses_half_metal(gpu);
+        if half {
+            self.refresh_half_wires(gpu)?;
+        } else {
+            self.hydrate(Some(gpu))?;
+        }
         self.bind(gpu)?;
         let xt_t = SovereignTensor::reuse_for(xt, vec![n, self.in_features], gpu)?;
         xt_t.as_mut_slice().copy_from_slice(&x[..spec.x_len()]);
         let dy_t = SovereignTensor::reuse_for(dyt, vec![n, self.out_features], gpu)?;
         dy_t.as_mut_slice().copy_from_slice(&dy[..spec.y_len()]);
-        let w_base = self
-            .weight_base
-            .as_ref()
-            .ok_or_else(|| anyhow::anyhow!("weight_base"))?;
-        let w_shared = self
-            .weight_shared
-            .as_ref()
-            .ok_or_else(|| anyhow::anyhow!("weight_shared"))?;
+        let router_host = if half {
+            stored_f32(&self.router, &self.f16_router).map(|c| {
+                SovereignTensor::from_vec(
+                    vec![self.n_experts.max(1), self.in_features],
+                    c.into_owned(),
+                )
+            })
+        } else {
+            None
+        };
+        let router_host = router_host.transpose()?;
+        let w_base = self.weight_base.as_ref().unwrap_or(&self.scale_base);
+        let w_shared = self.weight_shared.as_ref().unwrap_or(&self.scale_shared);
+        let router_ref = router_host.as_ref().or(self.router.as_ref());
+        let half_bufs = if half {
+            Some(crate::tensor::HalfWeightBufs {
+                base: self
+                    .half_base
+                    .as_ref()
+                    .ok_or_else(|| anyhow::anyhow!("half base"))?,
+                shared: self
+                    .half_shared
+                    .as_ref()
+                    .ok_or_else(|| anyhow::anyhow!("half shared"))?,
+                routed: self.half_routed.as_ref(),
+                router: self.half_router.as_ref(),
+            })
+        } else {
+            None
+        };
         let (entropy, aux) = fused_mob_kan_bwd(
             gpu,
             &spec,
@@ -1194,7 +1288,7 @@ impl TernaryKanLinear {
                 w_base,
                 w_shared,
                 w_routed: self.weight_routed.as_ref(),
-                router: self.router.as_ref(),
+                router: router_ref,
                 centers: &self.centers,
                 inv_widths: &self.inv_widths,
                 scale_base: &self.scale_base,
@@ -1217,6 +1311,8 @@ impl TernaryKanLinear {
                 } else {
                     self.moe_aux
                 },
+                weight_half: half,
+                half: half_bufs,
             },
             part,
         )?;

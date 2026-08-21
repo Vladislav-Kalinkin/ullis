@@ -75,6 +75,7 @@ module_name_repetitions = "allow"
 must_use_candidate = "allow"
 missing_errors_doc = "allow"
 missing_panics_doc = "allow"
+multiple_crate_versions = "allow"
 doc_markdown = "allow"
 # Numeric / tensor code is unreadable under these pedantic rules.
 many_single_char_names = "allow"
