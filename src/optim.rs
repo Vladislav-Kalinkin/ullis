@@ -44,11 +44,7 @@ impl SgdMomentum {
             vel.push(vec![0.0f32; w.len()]);
         });
         let vel_q8 = if model.cfg.mom == MomDtype::Q8 {
-            Some(
-                vel.iter()
-                    .map(|v| (vec![0i8; v.len()], 1e-12f32))
-                    .collect(),
-            )
+            Some(vel.iter().map(|v| (vec![0i8; v.len()], 1e-12f32)).collect())
         } else {
             None
         };

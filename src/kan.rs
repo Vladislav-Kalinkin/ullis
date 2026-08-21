@@ -5,10 +5,10 @@ use std::borrow::Cow;
 use anyhow::{bail, Result};
 
 use crate::accelerate::{
-    apply_topk_gates, bump_grads, bump_inv_widths, mob_kan_fused_cpu, relu_bumps, sgemm_nt,
-    softmax_rows, switch_aux, ternarize_row, FusedBwdGrads, MobKanSpec,
+    apply_topk_gates, bump_grads, bump_inv_widths, mob_kan_fused_bwd_cpu, mob_kan_fused_cpu,
+    relu_bumps, sgemm_nt, softmax_rows, switch_aux, ternarize_row, FusedBwdGrads, MobKanSpec,
 };
-use crate::config::{split_basis, MasterDtype};
+use crate::config::{split_basis, KanFactor, MasterDtype};
 use crate::device::{prefer_host_bwd, SovereignDevice};
 use crate::gauss::project_spline_coeffs;
 use crate::mixers::{rand_kaiming, rand_uniform};
@@ -119,9 +119,12 @@ pub struct TernaryKanLinear {
     pub last_router_entropy: f32,
     pub moe_topk: u32,
     pub moe_aux: f32,
+    pub kan_factor: KanFactor,
     pub last_aux: f32,
     pub last_route_hits: Vec<u32>,
     pub last_route_tokens: u32,
+    /// Keep FP32 working copies live across fwd/bwd of one train step.
+    pub hot_fp32: bool,
 }
 
 impl TernaryKanLinear {
@@ -151,24 +154,19 @@ impl TernaryKanLinear {
             rand_kaiming(out_features, in_features, rng),
         )?;
         let weight_shared = SovereignTensor::from_vec(
-            vec![out_features, in_features * n_shared],
-            rand_uniform(out_features * in_features * n_shared, -0.05, 0.05, rng),
+            vec![in_features, n_shared],
+            rand_uniform(in_features * n_shared, -0.05, 0.05, rng),
         )?;
         let (weight_routed, router, scale_routed) = if n_routed > 0 && n_experts > 0 {
             let wr = SovereignTensor::from_vec(
-                vec![n_experts, out_features, in_features * n_routed],
-                rand_uniform(
-                    n_experts * out_features * in_features * n_routed,
-                    -0.05,
-                    0.05,
-                    rng,
-                ),
+                vec![n_experts, in_features, n_routed],
+                rand_uniform(n_experts * in_features * n_routed, -0.05, 0.05, rng),
             )?;
             let rt = SovereignTensor::from_vec(
                 vec![n_experts, in_features],
                 rand_uniform(n_experts * in_features, -0.02, 0.02, rng),
             )?;
-            let sr = SovereignTensor::fill(vec![n_experts, out_features], 1.0)?;
+            let sr = SovereignTensor::fill(vec![n_experts * in_features], 1.0)?;
             (Some(wr), Some(rt), sr)
         } else {
             (None, None, SovereignTensor::fill(vec![out_features], 1.0)?)
@@ -195,7 +193,7 @@ impl TernaryKanLinear {
             weight_routed,
             router,
             scale_base: SovereignTensor::fill(vec![out_features], 1.0)?,
-            scale_shared: SovereignTensor::fill(vec![out_features], 1.0)?,
+            scale_shared: SovereignTensor::fill(vec![in_features], 1.0)?,
             scale_routed,
             packed_codes: None,
             f16_base: None,
@@ -217,9 +215,11 @@ impl TernaryKanLinear {
             last_router_entropy: 0.0,
             moe_topk: 0,
             moe_aux: 0.01,
+            kan_factor: KanFactor::SharedEdge,
             last_aux: 0.0,
             last_route_hits: vec![0; n_experts.max(1)],
             last_route_tokens: 0,
+            hot_fp32: false,
         };
         layer.reset_grads();
         Ok(layer)
@@ -227,19 +227,105 @@ impl TernaryKanLinear {
 
     fn reset_grads(&mut self) {
         self.grad_base = vec![0.0; self.out_features * self.in_features];
-        self.grad_shared = vec![0.0; self.out_features * self.in_features * self.n_shared.max(1)];
-        let rt = self.n_experts.max(1) * self.out_features * self.in_features * self.n_routed;
-        self.grad_routed = vec![0.0; rt];
+        self.grad_shared = vec![0.0; self.shared_numel()];
+        self.grad_routed = vec![0.0; self.routed_numel()];
         self.grad_router = vec![0.0; self.n_experts.max(1) * self.in_features];
         self.grad_centers = vec![0.0; self.n_basis];
         self.grad_scale_base = vec![0.0; self.out_features];
-        self.grad_scale_shared = vec![0.0; self.out_features];
-        let sr = if self.n_routed > 0 {
-            self.n_experts.max(1) * self.out_features
+        self.grad_scale_shared = vec![0.0; self.scale_shared_len()];
+        self.grad_scale_routed = vec![0.0; self.scale_routed_len()];
+    }
+
+    fn shared_edge(&self) -> bool {
+        self.kan_factor.shared_edge()
+    }
+
+    fn shared_shape(&self) -> Vec<usize> {
+        let gs = self.n_shared.max(1);
+        if self.shared_edge() {
+            vec![self.in_features, gs]
+        } else {
+            vec![self.out_features, self.in_features * gs]
+        }
+    }
+
+    fn shared_numel(&self) -> usize {
+        let gs = self.n_shared.max(1);
+        if self.shared_edge() {
+            self.in_features * gs
+        } else {
+            self.out_features * self.in_features * gs
+        }
+    }
+
+    fn routed_shape(&self) -> Vec<usize> {
+        let k = self.n_experts.max(1);
+        if self.shared_edge() {
+            vec![k, self.in_features, self.n_routed]
+        } else {
+            vec![k, self.out_features, self.in_features * self.n_routed]
+        }
+    }
+
+    fn routed_numel(&self) -> usize {
+        let k = self.n_experts.max(1);
+        if self.shared_edge() {
+            k * self.in_features * self.n_routed
+        } else {
+            k * self.out_features * self.in_features * self.n_routed
+        }
+    }
+
+    fn scale_shared_len(&self) -> usize {
+        if self.shared_edge() {
+            self.in_features
         } else {
             self.out_features
-        };
-        self.grad_scale_routed = vec![0.0; sr];
+        }
+    }
+
+    fn scale_routed_len(&self) -> usize {
+        if self.n_routed == 0 {
+            return self.out_features;
+        }
+        let k = self.n_experts.max(1);
+        if self.shared_edge() {
+            k * self.in_features
+        } else {
+            k * self.out_features
+        }
+    }
+
+    /// Rebuild spline storage for `--kan-factor`. Unfactored layout is a no-op
+    /// when already `None`.
+    pub fn apply_kan_factor(&mut self, factor: KanFactor, rng: &mut impl rand::Rng) -> Result<()> {
+        if self.packed {
+            bail!("cannot change kan-factor of a packed layer");
+        }
+        if self.kan_factor == factor && self.grad_shared.len() == self.shared_numel() {
+            return Ok(());
+        }
+        self.hydrate(None)?;
+        self.kan_factor = factor;
+        let shared = rand_uniform(self.shared_numel(), -0.05, 0.05, rng);
+        if let Some(w) = self.weight_shared.as_mut() {
+            w.detach_gpu();
+        }
+        self.weight_shared = Some(SovereignTensor::from_vec(self.shared_shape(), shared)?);
+        self.scale_shared.detach_gpu();
+        self.scale_shared = SovereignTensor::fill(vec![self.scale_shared_len()], 1.0)?;
+        if self.n_routed > 0 && self.n_experts > 0 {
+            let routed = rand_uniform(self.routed_numel(), -0.05, 0.05, rng);
+            if let Some(w) = self.weight_routed.as_mut() {
+                w.detach_gpu();
+            }
+            self.weight_routed = Some(SovereignTensor::from_vec(self.routed_shape(), routed)?);
+            self.scale_routed.detach_gpu();
+            self.scale_routed = SovereignTensor::fill(vec![self.scale_routed_len()], 1.0)?;
+        }
+        self.reset_grads();
+        self.stash_master();
+        Ok(())
     }
 
     pub fn zero_grad(&mut self) {
@@ -302,23 +388,11 @@ impl TernaryKanLinear {
             vec![self.out_features, self.in_features],
             gpu,
         )?;
-        hydrate_tensor(
-            &mut self.weight_shared,
-            &self.f16_shared,
-            vec![self.out_features, self.in_features * self.n_shared.max(1)],
-            gpu,
-        )?;
+        let shared_shape = self.shared_shape();
+        hydrate_tensor(&mut self.weight_shared, &self.f16_shared, shared_shape, gpu)?;
         if self.n_routed > 0 {
-            hydrate_tensor(
-                &mut self.weight_routed,
-                &self.f16_routed,
-                vec![
-                    self.n_experts.max(1),
-                    self.out_features,
-                    self.in_features * self.n_routed,
-                ],
-                gpu,
-            )?;
+            let routed_shape = self.routed_shape();
+            hydrate_tensor(&mut self.weight_routed, &self.f16_routed, routed_shape, gpu)?;
             hydrate_tensor(
                 &mut self.router,
                 &self.f16_router,
@@ -329,8 +403,18 @@ impl TernaryKanLinear {
         Ok(())
     }
 
+    pub fn set_hot_fp32(&mut self, hot: bool) -> Result<()> {
+        self.hot_fp32 = hot;
+        if hot {
+            self.hydrate(None)?;
+        } else {
+            self.stash_master();
+        }
+        Ok(())
+    }
+
     pub fn stash_master(&mut self) {
-        if self.master != MasterDtype::Fp16 || self.packed {
+        if self.hot_fp32 || self.master != MasterDtype::Fp16 || self.packed {
             return;
         }
         stash_tensor(&mut self.weight_base, &mut self.f16_base);
@@ -343,7 +427,12 @@ impl TernaryKanLinear {
         if self.n_routed == 0 || n == 0 || self.router.is_none() {
             return Ok(());
         }
-        let rt = self.router.as_ref().map(SovereignTensor::as_slice).unwrap_or(&[]).to_vec();
+        let rt = self
+            .router
+            .as_ref()
+            .map(SovereignTensor::as_slice)
+            .unwrap_or(&[])
+            .to_vec();
         let k = self.n_experts.max(1);
         let mut z = vec![0.0f32; n * k];
         sgemm_nt(n, k, self.in_features, 1.0, x, &rt, 0.0, &mut z)?;
@@ -403,18 +492,29 @@ impl TernaryKanLinear {
             self.delta_ratio,
         )?;
         self.scale_base.as_mut_slice().copy_from_slice(&sb);
-        let ss = fit_scale(
-            shared.as_slice(),
-            self.out_features,
-            self.in_features * self.n_shared.max(1),
-            self.delta_ratio,
-        )?;
+        let (sh_rows, sh_cols) = if self.shared_edge() {
+            (self.in_features, self.n_shared.max(1))
+        } else {
+            (self.out_features, self.in_features * self.n_shared.max(1))
+        };
+        let ss = fit_scale(shared.as_slice(), sh_rows, sh_cols, self.delta_ratio)?;
+        if self.scale_shared.numel() != ss.len() {
+            self.scale_shared.detach_gpu();
+            self.scale_shared = SovereignTensor::from_vec(vec![ss.len()], ss.clone())?;
+        }
         self.scale_shared.as_mut_slice().copy_from_slice(&ss);
         if let Some(routed) = &self.weight_routed {
             let k = self.n_experts.max(1);
-            let rows = k * self.out_features;
-            let cols = self.in_features * self.n_routed;
+            let (rows, cols) = if self.shared_edge() {
+                (k * self.in_features, self.n_routed.max(1))
+            } else {
+                (k * self.out_features, self.in_features * self.n_routed)
+            };
             let s = fit_scale(routed.as_slice(), rows, cols, self.delta_ratio)?;
+            if self.scale_routed.numel() != s.len() {
+                self.scale_routed.detach_gpu();
+                self.scale_routed = SovereignTensor::from_vec(vec![s.len()], s.clone())?;
+            }
             self.scale_routed.as_mut_slice().copy_from_slice(&s);
         }
         Ok(())
@@ -452,7 +552,8 @@ impl TernaryKanLinear {
         } else {
             self.moe_topk.min(k as u32)
         };
-        spec.with_topk(tk)
+        spec.with_kan_factor(self.kan_factor.as_u32())?
+            .with_topk(tk)
     }
 
     pub fn forward(&mut self, gpu: &SovereignDevice, x: &[f32], n: usize) -> Result<Vec<f32>> {
@@ -498,7 +599,9 @@ impl TernaryKanLinear {
         } else {
             self.forward_cpu(&spec, x, y)
         };
-        self.stash_master();
+        if !self.hot_fp32 {
+            self.stash_master();
+        }
         r
     }
 
@@ -659,6 +762,28 @@ impl TernaryKanLinear {
             return Ok(());
         }
         self.hydrate(None)?;
+        let r = if self.shared_edge() {
+            self.backward_into_shared_edge(x, dy, n, mode, dx, bumps)
+        } else {
+            self.backward_into_unfactored(x, dy, n, mode, dx, bumps, q_row)
+        };
+        if !self.hot_fp32 {
+            self.stash_master();
+        }
+        r
+    }
+
+    fn backward_into_unfactored(
+        &mut self,
+        x: &[f32],
+        dy: &[f32],
+        n: usize,
+        mode: KanEvalMode,
+        dx: &mut [f32],
+        bumps: &mut [f32],
+        q_row: &mut Vec<f32>,
+    ) -> Result<()> {
+        let spec = self.spec(n, mode)?;
         let in_f = self.in_features;
         let out_f = self.out_features;
         let g = self.n_basis;
@@ -889,7 +1014,11 @@ impl TernaryKanLinear {
                 }
                 t0 = t1;
             }
-            let aux_coef = if spec.dense_router() { 0.0 } else { self.moe_aux };
+            let aux_coef = if spec.dense_router() {
+                0.0
+            } else {
+                self.moe_aux
+            };
             let (aux, dp) = if aux_coef > 0.0 {
                 switch_aux(&gates, &mix_gates, n, k, aux_coef)
             } else {
@@ -943,6 +1072,70 @@ impl TernaryKanLinear {
             self.last_aux = aux;
         }
 
+        self.observe_residuals();
+        if self.phase >= 3 {
+            self.grad_centers.fill(0.0);
+        }
+        Ok(())
+    }
+
+    fn backward_into_shared_edge(
+        &mut self,
+        x: &[f32],
+        dy: &[f32],
+        n: usize,
+        mode: KanEvalMode,
+        dx: &mut [f32],
+        _bumps: &mut [f32],
+    ) -> Result<()> {
+        let spec = self.spec(n, mode)?;
+        let (base, shared, routed, router) = {
+            let w = self.weight_views()?;
+            (
+                w.base.to_vec(),
+                w.shared.to_vec(),
+                w.routed.unwrap_or(&[]).to_vec(),
+                w.router.unwrap_or(&[]).to_vec(),
+            )
+        };
+        let centers = self.centers.as_slice().to_vec();
+        let inv_w = self.inv_widths.as_slice().to_vec();
+        let sb = self.scale_base.as_slice().to_vec();
+        let ss = self.scale_shared.as_slice().to_vec();
+        let sr = self.scale_routed.as_slice().to_vec();
+        let (entropy, aux) = mob_kan_fused_bwd_cpu(
+            &spec,
+            x,
+            &base,
+            &shared,
+            &routed,
+            &router,
+            &centers,
+            &inv_w,
+            &sb,
+            &ss,
+            &sr,
+            dy,
+            self.router_entropy_coef,
+            if spec.dense_router() {
+                0.0
+            } else {
+                self.moe_aux
+            },
+            FusedBwdGrads {
+                dx,
+                grad_base: &mut self.grad_base,
+                grad_shared: &mut self.grad_shared,
+                grad_routed: &mut self.grad_routed,
+                grad_router: &mut self.grad_router,
+                grad_centers: &mut self.grad_centers,
+                grad_scale_base: &mut self.grad_scale_base,
+                grad_scale_shared: &mut self.grad_scale_shared,
+                grad_scale_routed: &mut self.grad_scale_routed,
+            },
+        )?;
+        self.last_router_entropy = entropy;
+        self.last_aux = aux;
         self.observe_residuals();
         if self.phase >= 3 {
             self.grad_centers.fill(0.0);
@@ -1019,7 +1212,11 @@ impl TernaryKanLinear {
                     grad_scale_routed: &mut self.grad_scale_routed,
                 },
                 lambda_r: self.router_entropy_coef,
-                aux_coef: if spec.dense_router() { 0.0 } else { self.moe_aux },
+                aux_coef: if spec.dense_router() {
+                    0.0
+                } else {
+                    self.moe_aux
+                },
             },
             part,
         )?;
@@ -1029,7 +1226,9 @@ impl TernaryKanLinear {
         if self.phase >= 3 {
             self.grad_centers.fill(0.0);
         }
-        self.stash_master();
+        if !self.hot_fp32 {
+            self.stash_master();
+        }
         Ok(())
     }
 
@@ -1150,7 +1349,14 @@ impl TernaryKanLinear {
         for i in 0..self.in_features {
             let mut acc = 0.0f32;
             let mut n = 0u32;
-            if self.grad_shared.len() == self.out_features * cols {
+            if self.shared_edge() && self.grad_shared.len() == cols {
+                let base = i * gs;
+                for gi in 0..gs {
+                    let g = self.grad_shared[base + gi];
+                    acc += g * g;
+                    n += 1;
+                }
+            } else if self.grad_shared.len() == self.out_features * cols {
                 for o in 0..self.out_features {
                     let base = o * cols + i * gs;
                     for gi in 0..gs {
@@ -1199,52 +1405,97 @@ impl TernaryKanLinear {
             .as_slice()
             .to_vec();
         let k = self.n_experts.max(1);
+        let edge = self.shared_edge();
         let mut projected: Vec<Vec<f32>> = Vec::with_capacity(k);
         for e in 0..k {
-            let full = concat_spline(
-                &base_shared,
-                self.weight_routed.as_ref().map(SovereignTensor::as_slice),
-                e,
-                old_shared,
-                old_routed,
-                self.out_features,
-                self.in_features,
-                old_g,
-            );
+            let (full, out_p, in_p) = if edge {
+                (
+                    concat_spline_edge(
+                        &base_shared,
+                        self.weight_routed.as_ref().map(SovereignTensor::as_slice),
+                        e,
+                        old_shared,
+                        old_routed,
+                        self.in_features,
+                        old_g,
+                    ),
+                    1usize,
+                    self.in_features,
+                )
+            } else {
+                (
+                    concat_spline(
+                        &base_shared,
+                        self.weight_routed.as_ref().map(SovereignTensor::as_slice),
+                        e,
+                        old_shared,
+                        old_routed,
+                        self.out_features,
+                        self.in_features,
+                        old_g,
+                    ),
+                    self.out_features,
+                    self.in_features,
+                )
+            };
             let lifted = project_spline_coeffs(
                 &old_centers,
                 &old_inv,
                 &new_centers,
                 &new_inv,
                 &full,
-                self.out_features,
-                self.in_features,
+                out_p,
+                in_p,
             )?;
             projected.push(lifted);
         }
 
-        let mut shared_sum = vec![0.0f32; self.out_features * self.in_features * ns];
+        let mut shared_sum = if edge {
+            vec![0.0f32; self.in_features * ns]
+        } else {
+            vec![0.0f32; self.out_features * self.in_features * ns]
+        };
         let mut routed_slices: Vec<Vec<f32>> = Vec::new();
         for p in &projected {
-            for o in 0..self.out_features {
+            if edge {
                 for i in 0..self.in_features {
-                    let cube = o * (self.in_features * n_basis) + i * n_basis;
-                    let sh = o * (self.in_features * ns) + i * ns;
+                    let cube = i * n_basis;
+                    let sh = i * ns;
                     for gi in 0..ns {
                         shared_sum[sh + gi] += p[cube + gi];
                     }
                 }
-            }
-            if nr > 0 {
-                let mut rt = vec![0.0f32; self.out_features * self.in_features * nr];
+            } else {
                 for o in 0..self.out_features {
                     for i in 0..self.in_features {
-                        let cube = o * (self.in_features * n_basis) + i * n_basis + ns;
-                        let dst = o * (self.in_features * nr) + i * nr;
-                        rt[dst..dst + nr].copy_from_slice(&p[cube..cube + nr]);
+                        let cube = o * (self.in_features * n_basis) + i * n_basis;
+                        let sh = o * (self.in_features * ns) + i * ns;
+                        for gi in 0..ns {
+                            shared_sum[sh + gi] += p[cube + gi];
+                        }
                     }
                 }
-                routed_slices.push(rt);
+            }
+            if nr > 0 {
+                if edge {
+                    let mut rt = vec![0.0f32; self.in_features * nr];
+                    for i in 0..self.in_features {
+                        let cube = i * n_basis + ns;
+                        let dst = i * nr;
+                        rt[dst..dst + nr].copy_from_slice(&p[cube..cube + nr]);
+                    }
+                    routed_slices.push(rt);
+                } else {
+                    let mut rt = vec![0.0f32; self.out_features * self.in_features * nr];
+                    for o in 0..self.out_features {
+                        for i in 0..self.in_features {
+                            let cube = o * (self.in_features * n_basis) + i * n_basis + ns;
+                            let dst = o * (self.in_features * nr) + i * nr;
+                            rt[dst..dst + nr].copy_from_slice(&p[cube..cube + nr]);
+                        }
+                    }
+                    routed_slices.push(rt);
+                }
             }
         }
         let inv_k = 1.0 / k as f32;
@@ -1272,20 +1523,18 @@ impl TernaryKanLinear {
         self.n_shared = ns;
         self.n_routed = nr;
         self.knot_energy = vec![0.0; n_basis];
-        self.weight_shared = Some(SovereignTensor::from_vec(
-            vec![self.out_features, self.in_features * ns],
-            shared_sum,
-        )?);
+        self.weight_shared = Some(SovereignTensor::from_vec(self.shared_shape(), shared_sum)?);
         if nr > 0 && !routed_slices.is_empty() {
-            let mut stacked = vec![0.0f32; k * self.out_features * self.in_features * nr];
-            let row = self.out_features * self.in_features * nr;
+            let row = if edge {
+                self.in_features * nr
+            } else {
+                self.out_features * self.in_features * nr
+            };
+            let mut stacked = vec![0.0f32; k * row];
             for (e, sl) in routed_slices.iter().enumerate() {
                 stacked[e * row..(e + 1) * row].copy_from_slice(sl);
             }
-            self.weight_routed = Some(SovereignTensor::from_vec(
-                vec![k, self.out_features, self.in_features * nr],
-                stacked,
-            )?);
+            self.weight_routed = Some(SovereignTensor::from_vec(self.routed_shape(), stacked)?);
             if self.router.is_none() {
                 let mut rng = crate::device::rng_from_seed(0);
                 self.router = Some(SovereignTensor::from_vec(
@@ -1293,8 +1542,9 @@ impl TernaryKanLinear {
                     rand_uniform(k * self.in_features, -0.02, 0.02, &mut rng),
                 )?);
             }
-            if self.scale_routed.shape().len() == 1 {
-                self.scale_routed = SovereignTensor::fill(vec![k, self.out_features], 1.0)?;
+            if self.scale_routed.numel() != self.scale_routed_len() {
+                self.scale_routed.detach_gpu();
+                self.scale_routed = SovereignTensor::fill(vec![self.scale_routed_len()], 1.0)?;
             }
         } else {
             self.weight_routed = None;
@@ -1343,19 +1593,20 @@ impl TernaryKanLinear {
             self.in_features,
             self.delta_ratio,
         )?;
-        let shared = ternarize_hard(
-            shared_w.as_ref(),
-            self.out_features,
-            self.in_features * self.n_shared.max(1),
-            self.delta_ratio,
-        )?;
+        let (sh_rows, sh_cols) = if self.shared_edge() {
+            (self.in_features, self.n_shared.max(1))
+        } else {
+            (self.out_features, self.in_features * self.n_shared.max(1))
+        };
+        let shared = ternarize_hard(shared_w.as_ref(), sh_rows, sh_cols, self.delta_ratio)?;
         let routed = if let Some(w) = stored_f32(&self.weight_routed, &self.f16_routed) {
-            codes_to_i8(&ternarize_hard(
-                w.as_ref(),
-                self.n_experts.max(1) * self.out_features,
-                self.in_features * self.n_routed,
-                self.delta_ratio,
-            )?)
+            let k = self.n_experts.max(1);
+            let (rows, cols) = if self.shared_edge() {
+                (k * self.in_features, self.n_routed.max(1))
+            } else {
+                (k * self.out_features, self.in_features * self.n_routed)
+            };
+            codes_to_i8(&ternarize_hard(w.as_ref(), rows, cols, self.delta_ratio)?)
         } else {
             Vec::new()
         };
@@ -1395,19 +1646,9 @@ impl TernaryKanLinear {
         let sf: Vec<f32> = s.iter().map(|&c| c as f32).collect();
         let rf: Vec<f32> = r.iter().map(|&c| c as f32).collect();
         let code_base = SovereignTensor::from_vec(vec![self.out_features, self.in_features], bf)?;
-        let code_shared = SovereignTensor::from_vec(
-            vec![self.out_features, self.in_features * self.n_shared.max(1)],
-            sf,
-        )?;
+        let code_shared = SovereignTensor::from_vec(self.shared_shape(), sf)?;
         let code_routed = if !r.is_empty() && self.n_routed > 0 {
-            Some(SovereignTensor::from_vec(
-                vec![
-                    self.n_experts.max(1),
-                    self.out_features,
-                    self.in_features * self.n_routed,
-                ],
-                rf,
-            )?)
+            Some(SovereignTensor::from_vec(self.routed_shape(), rf)?)
         } else {
             None
         };
@@ -1467,7 +1708,7 @@ impl TernaryKanLinear {
                     "packed_shared".into(),
                     NamedBlob::Packed {
                         bytes: p.packed_shared.clone(),
-                        shape: vec![self.out_features, self.in_features * self.n_shared.max(1)],
+                        shape: self.shared_shape(),
                     },
                 ));
                 if !p.packed_routed.is_empty() && self.n_routed > 0 {
@@ -1475,11 +1716,7 @@ impl TernaryKanLinear {
                         "packed_routed".into(),
                         NamedBlob::Packed {
                             bytes: p.packed_routed.clone(),
-                            shape: vec![
-                                self.n_experts.max(1),
-                                self.out_features,
-                                self.in_features * self.n_routed,
-                            ],
+                            shape: self.routed_shape(),
                         },
                     ));
                 }
@@ -1497,18 +1734,14 @@ impl TernaryKanLinear {
                 "weight_shared",
                 &self.weight_shared,
                 &self.f16_shared,
-                vec![self.out_features, self.in_features * self.n_shared.max(1)],
+                self.shared_shape(),
             );
             push_stored(
                 &mut out,
                 "weight_routed",
                 &self.weight_routed,
                 &self.f16_routed,
-                vec![
-                    self.n_experts.max(1),
-                    self.out_features,
-                    self.in_features * self.n_routed.max(1),
-                ],
+                self.routed_shape(),
             );
         }
         Ok(out)
@@ -1669,6 +1902,34 @@ fn linspace(lo: f32, hi: f32, n: usize) -> Vec<f32> {
     }
     let step = (hi - lo) / (n as f32 - 1.0);
     (0..n).map(|i| lo + step * i as f32).collect()
+}
+
+fn concat_spline_edge(
+    shared: &[f32],
+    routed: Option<&[f32]>,
+    expert: usize,
+    n_shared: usize,
+    n_routed: usize,
+    in_f: usize,
+    g: usize,
+) -> Vec<f32> {
+    let ns = n_shared.max(1);
+    let mut full = vec![0.0f32; in_f * g];
+    for i in 0..in_f {
+        let dst = i * g;
+        let sh = i * ns;
+        let take = ns.min(g);
+        full[dst..dst + take].copy_from_slice(&shared[sh..sh + take]);
+        if n_routed > 0 {
+            if let Some(rt) = routed {
+                let src = (expert * in_f + i) * n_routed;
+                let d = dst + ns;
+                let n = n_routed.min(g.saturating_sub(ns));
+                full[d..d + n].copy_from_slice(&rt[src..src + n]);
+            }
+        }
+    }
+    full
 }
 
 fn concat_spline(

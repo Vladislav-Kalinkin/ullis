@@ -6,8 +6,21 @@
 #![allow(unsafe_code)]
 
 use std::mem::{size_of, MaybeUninit};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::OnceLock;
 use std::time::Instant;
+
+static GPU_WAITS: AtomicU64 = AtomicU64::new(0);
+
+/// Count a Metal `wait_until_completed` on the fused/i8 path.
+pub fn record_gpu_wait() {
+    GPU_WAITS.fetch_add(1, Ordering::Relaxed);
+}
+
+/// Swap-out the wait counter (HUD).
+pub fn take_gpu_waits() -> u64 {
+    GPU_WAITS.swap(0, Ordering::Relaxed)
+}
 
 use crate::quant::TernaryHist;
 

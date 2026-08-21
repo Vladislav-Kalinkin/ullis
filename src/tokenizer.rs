@@ -39,9 +39,7 @@ pub const MAX_VOCAB: u32 = 1_048_576;
 /// [`BpeTokenizer::new`] so encode/decode math stays cheap.
 pub fn validate_vocab_size(vocab_size: u32) -> Result<u32> {
     if vocab_size < MIN_VOCAB {
-        bail!(
-            "vocab-size {vocab_size} is below the hard minimum {MIN_VOCAB}"
-        );
+        bail!("vocab-size {vocab_size} is below the hard minimum {MIN_VOCAB}");
     }
     if vocab_size > MAX_VOCAB {
         bail!("vocab-size {vocab_size} exceeds the absolute ceiling {MAX_VOCAB}");
@@ -916,58 +914,137 @@ fn collect_atoms(vocab_size: u32) -> Vec<String> {
 }
 
 /// Byte-fallback WordPiece trainer. Seeds occupy single ids; remaining slots
-/// are filled by frequency pair-merges on the corpus.
+/// are filled by frequency pair-merges on unique pretokenized chunks.
+///
+/// The previous trainer rescanned the whole corpus (byte ids) on every merge.
+/// At `V=65536` and a ~20 MB JSONL that is tens of thousands of O(N) passes
+/// and looks like a hang after `metal_hello`. This path BPE-s unique
+/// whitespace chunks with incremental pair counts.
 pub fn train_wordpiece(texts: &[String], vocab_size: u32, seed: u64) -> Result<BpeTokenizer> {
-    use rand::seq::SliceRandom;
+    use std::collections::BinaryHeap;
+    use std::io::Write;
 
-    let mut rng = crate::device::rng_from_seed(seed);
+    let _ = seed;
     let atoms = collect_atoms(vocab_size);
-    let mut corpus: Vec<String> = texts.iter().filter(|t| !t.is_empty()).cloned().collect();
-    if corpus.is_empty() {
-        corpus.push(ATOMS_SORTED.join(""));
-    }
-    corpus.shuffle(&mut rng);
-
-    let proto = BpeTokenizer::new_with_atoms(vocab_size, Vec::new(), atoms.clone(), None)?;
+    let mut proto = BpeTokenizer::new_with_atoms(vocab_size, Vec::new(), atoms.clone(), None)?;
     let mut next_id = BYTE_OFFSET + 256 + proto.atoms.len() as u32;
-    let mut pair_to_id: HashMap<(u32, u32), u32> = HashMap::new();
-    let mut merges: Vec<(u32, u32)> = Vec::new();
-    let mut seqs: Vec<Vec<u32>> = Vec::new();
-    {
-        let mut p = proto;
-        for t in &corpus {
-            seqs.push(p.encode_bytes(t.as_bytes()));
+    if next_id >= vocab_size {
+        return BpeTokenizer::new_with_atoms(vocab_size, Vec::new(), atoms, None);
+    }
+
+    let mut chunk_freq: HashMap<Vec<u8>, u32> = HashMap::new();
+    if texts.iter().all(|t| t.is_empty()) {
+        *chunk_freq
+            .entry(ATOMS_SORTED.join("").into_bytes())
+            .or_insert(0) += 1;
+        for atom in ATOMS_SORTED.iter() {
+            *chunk_freq.entry(atom.as_bytes().to_vec()).or_insert(0) += 1;
+        }
+    } else {
+        for t in texts {
+            for chunk in t.split_inclusive(char::is_whitespace) {
+                if chunk.is_empty() {
+                    continue;
+                }
+                *chunk_freq.entry(chunk.as_bytes().to_vec()).or_insert(0) += 1;
+            }
         }
     }
 
-    while next_id < vocab_size {
-        let mut counts: HashMap<(u32, u32), u32> = HashMap::new();
-        for seq in &seqs {
-            if seq.len() < 2 {
-                continue;
-            }
-            for w in seq.windows(2) {
-                *counts.entry((w[0], w[1])).or_insert(0) += 1;
-            }
-        }
-        if counts.is_empty() {
-            break;
-        }
-        let ((a, b), count) = counts
-            .into_iter()
-            .max_by_key(|(_, c)| *c)
-            .expect("non-empty");
-        if count < 2 {
-            break;
-        }
-        if let Some(&nid) = pair_to_id.get(&(a, b)) {
-            seqs = seqs.iter().map(|s| apply_merge(s, a, b, nid)).collect();
+    let mut words: Vec<Vec<u32>> = Vec::with_capacity(chunk_freq.len());
+    let mut freqs: Vec<u32> = Vec::with_capacity(chunk_freq.len());
+    for (chunk, f) in chunk_freq {
+        if f == 0 {
             continue;
         }
-        pair_to_id.insert((a, b), next_id);
+        words.push(proto.encode_bytes(&chunk));
+        freqs.push(f);
+    }
+
+    let mut pair_count: HashMap<(u32, u32), u64> = HashMap::new();
+    let mut pair_occ: HashMap<(u32, u32), Vec<u32>> = HashMap::new();
+    let mut heap: BinaryHeap<(u64, u32, u32)> = BinaryHeap::new();
+    for (wi, (sym, &freq)) in words.iter().zip(freqs.iter()).enumerate() {
+        let f = u64::from(freq);
+        for w in sym.windows(2) {
+            let p = (w[0], w[1]);
+            *pair_count.entry(p).or_insert(0) += f;
+            pair_occ.entry(p).or_default().push(wi as u32);
+        }
+    }
+    for (&(a, b), &c) in &pair_count {
+        if c >= 2 {
+            heap.push((c, a, b));
+        }
+    }
+
+    let mut merges: Vec<(u32, u32)> = Vec::new();
+    let start_id = next_id;
+    let mut seen_words = vec![0u32; words.len()];
+    let mut stamp = 1u32;
+    while next_id < vocab_size {
+        let Some((cnt, a, b)) = heap.pop() else {
+            break;
+        };
+        if pair_count.get(&(a, b)).copied().unwrap_or(0) != cnt {
+            continue;
+        }
+        if cnt < 2 {
+            break;
+        }
+        let nid = next_id;
         merges.push((a, b));
-        seqs = seqs.iter().map(|s| apply_merge(s, a, b, next_id)).collect();
         next_id += 1;
+
+        let mut affected = pair_occ.remove(&(a, b)).unwrap_or_default();
+        affected.sort_unstable();
+        affected.dedup();
+        stamp = stamp.wrapping_add(1);
+        if stamp == 0 {
+            seen_words.fill(0);
+            stamp = 1;
+        }
+        for wi in affected {
+            let i = wi as usize;
+            if i >= words.len() || seen_words[i] == stamp {
+                continue;
+            }
+            seen_words[i] = stamp;
+            let old = &words[i];
+            if !old.windows(2).any(|w| w[0] == a && w[1] == b) {
+                continue;
+            }
+            let freq = u64::from(freqs[i]);
+            for w in old.windows(2) {
+                let p = (w[0], w[1]);
+                if let Some(c) = pair_count.get_mut(&p) {
+                    *c = c.saturating_sub(freq);
+                }
+            }
+            let new_sym = apply_merge(old, a, b, nid);
+            for w in new_sym.windows(2) {
+                let p = (w[0], w[1]);
+                let c = pair_count.entry(p).or_insert(0);
+                *c = c.saturating_add(freq);
+                pair_occ.entry(p).or_default().push(wi);
+                if *c >= 2 {
+                    heap.push((*c, p.0, p.1));
+                }
+            }
+            words[i] = new_sym;
+        }
+        pair_count.remove(&(a, b));
+
+        let done = next_id - start_id;
+        if done == 1 || done % 2048 == 0 {
+            println!(
+                "  tokenizer merge {done} / {}  chunks={} heap={}",
+                vocab_size.saturating_sub(start_id),
+                words.len(),
+                heap.len()
+            );
+            let _ = std::io::stdout().flush();
+        }
     }
 
     BpeTokenizer::new_with_atoms(vocab_size, merges, atoms, None)

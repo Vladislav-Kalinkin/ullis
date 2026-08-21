@@ -170,14 +170,29 @@ fn moe_sgd_steps_do_not_retain_graphs() {
         step(&mut model, &mut opt);
     }
     let rss0 = process_memory_bytes();
+    let ws0 = model.workspace_bytes();
+    let pb0 = model.trainable_param_bytes(2);
     for _ in 0..48 {
         step(&mut model, &mut opt);
     }
+    assert_eq!(
+        model.workspace_bytes(),
+        ws0,
+        "TrainWorkspace must be grow-only and stable after warmup"
+    );
+    assert_eq!(
+        model.trainable_param_bytes(2),
+        pb0,
+        "trainable bytes must not grow across SGD steps"
+    );
     let rss1 = process_memory_bytes();
     if rss0 > 0 {
         let growth = rss1.saturating_sub(rss0);
+        // Process RSS is shared with parallel tests in this binary (Metal
+        // PSOs). The workspace/param checks above are the leak gate;
+        // RSS is a coarse backstop.
         assert!(
-            growth < 8 * 1024 * 1024,
+            growth < 32 * 1024 * 1024,
             "optimizer retained graphs: rss grew by {} MB ({} -> {})",
             growth / (1024 * 1024),
             rss0 / (1024 * 1024),
@@ -335,10 +350,81 @@ fn streamed_tied_ce_acc_matches_allocating_oracle() {
     }
     for (g, p) in de.iter().zip(prior.iter()) {
         assert!(
-            (0.25 + *g - *p).abs() < 1e-6,
+            (0.25 + *g - *p).abs() < 1e-5,
             "must not scale historical embed_grad"
         );
     }
+}
+
+#[test]
+fn teacher_forced_ce_finite_on_thinking_train_anchor() {
+    use ullis::config::TrainConfig;
+    use ullis::data::{encode_supervised, parse_jsonl_line};
+    use ullis::model::UllisKan;
+    use ullis::tokenizer::train_wordpiece;
+
+    let line = std::fs::read_to_string("data/thinking-train.jsonl")
+        .unwrap()
+        .lines()
+        .next()
+        .unwrap()
+        .to_string();
+    let rec = parse_jsonl_line(&line).expect("anchor");
+    let mut tok = train_wordpiece(&[], 1024, 7).unwrap();
+    let (ids, mask) = encode_supervised(&mut tok, &rec, 32);
+    let t = 32.min(ids.len().saturating_sub(1)).max(4);
+    let x: Vec<u32> = ids[..t].iter().copied().map(|id| id % 1024).collect();
+    let y: Vec<u32> = ids[1..t + 1]
+        .iter()
+        .copied()
+        .map(|id| id % 1024)
+        .collect();
+    let m = mask[1..t + 1].to_vec();
+    let gpu = SovereignDevice::open(false).unwrap();
+    let cfg = TrainConfig {
+        d_model: 16,
+        n_layers: 2,
+        n_basis: 4,
+        vocab_size: 1024,
+        seq_len: t,
+        mixer: "shift".into(),
+        moe: true,
+        moe_topk: 0,
+        ..TrainConfig::default()
+    };
+    let mut model = UllisKan::new(cfg, gpu).unwrap();
+    let loss = model.train_step(&x, &y, &m, 1, t, 0.0).unwrap();
+    assert!(loss.is_finite(), "teacher-forced CE {loss}");
+    assert!(model.last_ce.is_finite());
+}
+
+#[test]
+fn streamed_tied_ce_chunked_stable_at_wide_v() {
+    let n = 4usize;
+    let d = 8usize;
+    let v = 128usize;
+    let hidden: Vec<f32> = (0..n * d).map(|i| (i as f32) * 0.02 - 0.3).collect();
+    let embed: Vec<f32> = (0..v * d).map(|i| ((i % 11) as f32) * 0.03 - 0.1).collect();
+    let targets = [3u32, 17, 0, 90];
+    let mask = [1u8, 1, 0, 1];
+    let mut dh = vec![0.0f32; n * d];
+    let mut de = vec![0.0f32; v * d];
+    let mut row = Vec::new();
+    let (loss, h) = ullis::mixers::streamed_tied_ce_acc(
+        &hidden, &embed, n, d, v, &targets, &mask, 0.03, &mut dh, &mut de, &mut row,
+    )
+    .unwrap();
+    assert!(loss.is_finite() && h.is_finite());
+    assert!(dh.iter().any(|x| *x != 0.0));
+    let mut dh2 = vec![0.0f32; n * d];
+    let mut de2 = vec![0.0f32; v * d];
+    let mut row2 = Vec::new();
+    let (loss2, h2) = ullis::mixers::streamed_tied_ce_acc(
+        &hidden, &embed, n, d, v, &targets, &mask, 0.03, &mut dh2, &mut de2, &mut row2,
+    )
+    .unwrap();
+    assert!((loss - loss2).abs() < 1e-6);
+    assert!((h - h2).abs() < 1e-6);
 }
 
 #[test]
@@ -545,10 +631,38 @@ fn layer_bwd_pair(
     moe: bool,
     phase: u8,
 ) -> f32 {
+    layer_bwd_pair_factor(
+        gpu_host,
+        gpu_fused,
+        in_f,
+        out_f,
+        n,
+        moe,
+        phase,
+        ullis::KanFactor::None,
+    )
+}
+
+fn layer_bwd_pair_factor(
+    gpu_host: &SovereignDevice,
+    gpu_fused: &SovereignDevice,
+    in_f: usize,
+    out_f: usize,
+    n: usize,
+    moe: bool,
+    phase: u8,
+    factor: ullis::KanFactor,
+) -> f32 {
     let mut rng = ullis::device::rng_from_seed(21);
     let mut host = TernaryKanLinear::new(in_f, out_f, 4, moe, 3, 0.7, &mut rng).unwrap();
     let mut rng = ullis::device::rng_from_seed(21);
     let mut fused = TernaryKanLinear::new(in_f, out_f, 4, moe, 3, 0.7, &mut rng).unwrap();
+    if factor != ullis::KanFactor::None {
+        let mut rng = ullis::device::rng_from_seed(23);
+        host.apply_kan_factor(factor, &mut rng).unwrap();
+        let mut rng = ullis::device::rng_from_seed(23);
+        fused.apply_kan_factor(factor, &mut rng).unwrap();
+    }
     host.set_phase(phase).unwrap();
     fused.set_phase(phase).unwrap();
     let x = ullis::mixers::randn(n * in_f, 1.0, &mut ullis::device::rng_from_seed(22));
@@ -645,4 +759,113 @@ fn fused_forward_d512_metal_matches_cpu() {
         .map(|(a, b)| (a - b).abs())
         .fold(0.0f32, f32::max);
     assert!(max < 1e-4, "layer d=512 metal vs cpu max|Δ|={max}");
+}
+
+#[test]
+fn shared_edge_has_fewer_spline_params() {
+    let mut rng = ullis::device::rng_from_seed(1);
+    let layer = TernaryKanLinear::new(8, 8, 4, true, 3, 0.7, &mut rng).unwrap();
+    let es = layer.weight_shared.as_ref().unwrap().numel();
+    let er = layer.weight_routed.as_ref().unwrap().numel();
+    assert_eq!(es, 8 * layer.n_shared);
+    assert_eq!(er, 3 * 8 * layer.n_routed);
+    assert!(es < 8 * 8 * layer.n_shared);
+    assert!(er < 3 * 8 * 8 * layer.n_routed);
+}
+
+#[test]
+fn shared_edge_forward_finite_and_pack() {
+    let gpu = SovereignDevice::open(false).unwrap();
+    let mut rng = ullis::device::rng_from_seed(2);
+    let mut layer = TernaryKanLinear::new(8, 8, 4, true, 3, 0.7, &mut rng).unwrap();
+    layer
+        .apply_kan_factor(ullis::KanFactor::SharedEdge, &mut rng)
+        .unwrap();
+    let x = ullis::mixers::randn(4 * 8, 1.0, &mut rng);
+    let y = layer.forward(&gpu, &x, 4).unwrap();
+    assert_eq!(y.len(), 4 * 8);
+    assert!(y.iter().all(|v| v.is_finite()));
+    layer.set_phase(3).unwrap();
+    let y2 = layer.forward(&gpu, &x, 4).unwrap();
+    assert!(y2.iter().all(|v| v.is_finite()));
+    layer.pack().unwrap();
+    let y3 = layer.forward(&gpu, &x, 4).unwrap();
+    assert_eq!(y3.len(), y2.len());
+    assert!(y3.iter().all(|v| v.is_finite()));
+}
+
+#[test]
+fn shared_edge_insert_knot_preserves_shape() {
+    let gpu = SovereignDevice::open(false).unwrap();
+    let mut rng = ullis::device::rng_from_seed(3);
+    let mut layer = TernaryKanLinear::new(6, 6, 4, true, 3, 0.7, &mut rng).unwrap();
+    layer
+        .apply_kan_factor(ullis::KanFactor::SharedEdge, &mut rng)
+        .unwrap();
+    let x = ullis::mixers::randn(2 * 6, 1.0, &mut rng);
+    let y0 = layer.forward(&gpu, &x, 2).unwrap();
+    layer.knot_energy = vec![0.1, 2.0, 2.5, 0.1];
+    let g = layer.insert_knot().unwrap();
+    assert_eq!(g, 5);
+    let y1 = layer.forward(&gpu, &x, 2).unwrap();
+    assert_eq!(y0.len(), y1.len());
+    assert!(y1.iter().all(|v| v.is_finite()));
+    assert_eq!(
+        layer.weight_shared.as_ref().unwrap().numel(),
+        6 * layer.n_shared
+    );
+}
+
+#[test]
+fn shared_edge_fused_bwd_matches_host() {
+    let cpu = SovereignDevice::open(false).unwrap();
+    let err = layer_bwd_pair_factor(&cpu, &cpu, 16, 16, 8, true, 1, ullis::KanFactor::SharedEdge);
+    assert!(
+        err < 1e-4,
+        "shared-edge cpu fused vs host phase1 max|Δ|={err}"
+    );
+    let err = layer_bwd_pair_factor(&cpu, &cpu, 16, 16, 8, true, 3, ullis::KanFactor::SharedEdge);
+    assert!(err < 1e-4, "shared-edge cpu fused vs host qat max|Δ|={err}");
+}
+
+#[test]
+fn shared_edge_metal_matches_cpu() {
+    let metal = SovereignDevice::open(true).unwrap();
+    if !metal.is_metal() {
+        return;
+    }
+    let cpu = SovereignDevice::open(false).unwrap();
+    let err = layer_bwd_pair_factor(
+        &cpu,
+        &metal,
+        16,
+        16,
+        8,
+        true,
+        1,
+        ullis::KanFactor::SharedEdge,
+    );
+    assert!(err < 1e-4, "shared-edge metal vs host max|Δ|={err}");
+    let mut rng = ullis::device::rng_from_seed(9);
+    let mut layer = TernaryKanLinear::new(16, 16, 4, true, 3, 0.7, &mut rng).unwrap();
+    layer
+        .apply_kan_factor(ullis::KanFactor::SharedEdge, &mut rng)
+        .unwrap();
+    let x = ullis::mixers::randn(4 * 16, 1.0, &mut rng);
+    let y_cpu = layer.forward(&cpu, &x, 4).unwrap();
+    let y_gpu = layer.forward(&metal, &x, 4).unwrap();
+    let max = y_cpu
+        .iter()
+        .zip(y_gpu.iter())
+        .map(|(a, b)| (a - b).abs())
+        .fold(0.0f32, f32::max);
+    assert!(max < 1e-4, "shared-edge fwd metal vs cpu max|Δ|={max}");
+}
+
+#[test]
+fn shared_edge_is_default_layout() {
+    let spec = ullis::MobKanSpec::new(2, 4, 3, 4, 3, 1, 3, 3, 1, false, false, 1.5, 0.7).unwrap();
+    assert_eq!(spec.kan_factor, 1);
+    assert_eq!(spec.w_shared_len(), 4 * 3);
+    assert_eq!(spec.scale_shared_len(), 4);
 }

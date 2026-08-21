@@ -96,7 +96,14 @@ pub fn pack_record(
 
 /// Encode a packed record. Loss mask is 1 on thinking+output (the trajectory
 /// the KAN layer must predict) and 0 on the system+user prefix.
-pub fn encode_supervised(tokenizer: &mut BpeTokenizer, rec: &ChatRecord) -> (Vec<u32>, Vec<u8>) {
+///
+/// Long traces are clipped to `seq_len + 1` keeping the user→thinking boundary
+/// (head of thinking + output), so a `T=96` window still sees the user turn.
+pub fn encode_supervised(
+    tokenizer: &mut BpeTokenizer,
+    rec: &ChatRecord,
+    seq_len: usize,
+) -> (Vec<u32>, Vec<u8>) {
     let think_span = format!("{TAG_THINKING}\n{}\n{TAG_THINK_END}\n", rec.thinking.trim());
     let out_span = format!("{TAG_OUTPUT}\n{}\n", rec.output.trim());
 
@@ -109,8 +116,20 @@ pub fn encode_supervised(tokenizer: &mut BpeTokenizer, rec: &ChatRecord) -> (Vec
     ids.extend(tokenizer.encode(&think_span, false, false));
     ids.extend(tokenizer.encode(&out_span, false, false));
     ids.push(tokenizer.eos_id);
+    let keep = seq_len.saturating_add(1).max(prefix_len.saturating_add(8));
+    if ids.len() > keep {
+        let mut clipped = ids[..prefix_len.min(keep)].to_vec();
+        let budget = keep.saturating_sub(clipped.len());
+        let rest = &ids[prefix_len..];
+        if rest.len() > budget {
+            clipped.extend_from_slice(&rest[..budget]);
+        } else {
+            clipped.extend_from_slice(rest);
+        }
+        ids = clipped;
+    }
     let mut mask = vec![0u8; ids.len()];
-    for m in mask.iter_mut().skip(prefix_len) {
+    for m in mask.iter_mut().skip(prefix_len.min(ids.len())) {
         *m = 1;
     }
     if mask.iter().all(|&m| m == 0) {
@@ -323,12 +342,57 @@ pub fn jsonl_corpus_texts(path: impl AsRef<Path>, max_records: usize) -> Result<
         let Some(rec) = parse_jsonl_line(&line) else {
             continue;
         };
-        texts.push(rec.pack());
+        // Truncate thinking so BPE training does not hold a 19 MB dump.
+        let think = rec.thinking.chars().take(512).collect::<String>();
+        texts.push(format!("{}\n{think}\n{}", rec.user, rec.output));
         if texts.len() >= max_records {
             break;
         }
     }
     Ok(texts)
+}
+
+/// Peek a JSONL for collapsed user distribution / huge thinking traces.
+pub fn warn_corpus_homogeneity(path: impl AsRef<Path>) -> Result<()> {
+    use std::collections::HashSet;
+    let path = path.as_ref();
+    let file = File::open(path).with_context(|| format!("open {}", path.display()))?;
+    let reader = BufReader::new(file);
+    let mut users = HashSet::new();
+    let mut n = 0u64;
+    let mut think_chars = 0u64;
+    for line in reader.lines() {
+        let line = line?;
+        let Some(rec) = parse_jsonl_line(&line) else {
+            continue;
+        };
+        n += 1;
+        users.insert(rec.user.chars().take(80).collect::<String>());
+        think_chars += rec.thinking.len() as u64;
+        if n >= 4096 {
+            break;
+        }
+    }
+    if n == 0 {
+        return Ok(());
+    }
+    let uniq = users.len() as f64 / n as f64;
+    let mean_think = think_chars as f64 / n as f64;
+    if uniq < 0.10 {
+        eprintln!(
+            "warn: {} unique-user ratio {:.2} (<0.10) — most windows will ignore the user turn",
+            path.display(),
+            uniq
+        );
+    }
+    if mean_think > 1500.0 {
+        eprintln!(
+            "warn: {} mean thinking {:.0} chars — records are clipped to seq_len so the user prefix stays in-window",
+            path.display(),
+            mean_think
+        );
+    }
+    Ok(())
 }
 
 pub fn parse_jsonl_line(line: &str) -> Option<ChatRecord> {
@@ -424,7 +488,7 @@ impl JsonlStream {
         let Some(rec) = parse_jsonl_line(trimmed) else {
             return Ok(true);
         };
-        let (ids, mask) = encode_supervised(&mut self.tokenizer, &rec);
+        let (ids, mask) = encode_supervised(&mut self.tokenizer, &rec, self.seq_len);
         self.push_ids(ids, mask);
         self.lines_seen += 1;
         Ok(true)
@@ -439,10 +503,7 @@ impl JsonlStream {
                 loops += 1;
                 if loops > 2 {
                     if self.flash.is_empty() {
-                        anyhow::bail!(
-                            "JSONL corpus produced no tokens: {}",
-                            self.path.display()
-                        );
+                        anyhow::bail!("JSONL corpus produced no tokens: {}", self.path.display());
                     }
                     break;
                 }
@@ -462,10 +523,12 @@ impl JsonlStream {
             self.flash.push(self.tokenizer.eos_id, 0);
         }
         let max_start = self.flash.len() - self.seq_len - 1;
-        // Bias toward the tail so thinking+output stay in-window on long records.
+        // Prefer the left of the buffer (user→thinking boundary after clip).
         let start = if max_start == 0 {
             0
-        } else if self.rng.random::<f32>() < 0.65 {
+        } else if self.rng.random::<f32>() < 0.55 {
+            0
+        } else if self.rng.random::<f32>() < 0.5 {
             max_start
         } else {
             self.rng.random_range(0..=max_start)
@@ -599,6 +662,32 @@ mod tests {
             n += 1;
         }
         assert!(n >= 8, "expected a dense sample set, got {n}");
+    }
+
+    #[test]
+    fn encode_supervised_clips_long_think_keeps_user() {
+        let mut tok = crate::tokenizer::train_wordpiece(&[], 1024, 1).unwrap();
+        let rec = ChatRecord {
+            system: "sys".into(),
+            user: "Write fn add that sums two i32".into(),
+            thinking: "step ".repeat(800),
+            output: "fn add(a: i32, b: i32) -> i32 { a + b }".into(),
+        };
+        let seq = 48usize;
+        let (ids, mask) = encode_supervised(&mut tok, &rec, seq);
+        assert!(ids.len() <= seq + 1, "clipped len {}", ids.len());
+        let prefix = tok.encode(
+            &pack_record(&rec.system, &rec.user, None, None),
+            false,
+            false,
+        );
+        assert!(ids.len() >= prefix.len().min(seq));
+        let n_pref = prefix.len().min(ids.len());
+        assert!(
+            mask.iter().take(n_pref).all(|&m| m == 0),
+            "user prefix must be masked off so the window still conditions on it"
+        );
+        assert!(mask.contains(&1));
     }
 
     #[test]

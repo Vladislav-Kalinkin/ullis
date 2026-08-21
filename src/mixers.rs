@@ -2,7 +2,7 @@
 
 use anyhow::Result;
 
-use crate::accelerate::{sgemm, sgemm_nt, softmax_rows};
+use crate::accelerate::{sgemm, sgemm_nt, sgemm_tn, softmax_rows};
 
 /// Parameter-free token mix: delay half the channels by one step.
 /// `x` is `[b, t, c]` row-major.
@@ -370,67 +370,153 @@ pub fn streamed_tied_ce_acc(
         anyhow::bail!("embed_grad len {} != v*d {}", embed_grad.len(), v * d);
     }
     dhidden.fill(0.0);
-    if logits_row.len() < v {
-        logits_row.resize(v, 0.0);
+    let live: Vec<usize> = (0..n).filter(|&i| mask[i] != 0).collect();
+    if live.is_empty() {
+        return Ok((0.0, 0.0));
     }
-    let row = &mut logits_row[..v];
-    let mut den = 0.0f32;
-    for &m in mask {
-        if m != 0 {
-            den += 1.0;
-        }
-    }
-    let inv_den = if den > 0.0 { 1.0 / den } else { 0.0 };
+    let n_live = live.len();
+    let inv_den = 1.0 / n_live as f32;
     let lam = entropy_coef.max(0.0);
+    let mut h_live = vec![0.0f32; n_live.saturating_mul(d)];
+    for (r, &i) in live.iter().enumerate() {
+        h_live[r * d..(r + 1) * d].copy_from_slice(&hidden[i * d..(i + 1) * d]);
+    }
+    // Keep the logits tile ≲ 2 MB. Never materialize `[n, V]`.
+    let max_floats = (2 * 1024 * 1024) / 4;
+    let chunk = (max_floats / n_live.max(1)).clamp(128, 8192).min(v.max(1));
+    let need = n_live.saturating_mul(chunk);
+    if logits_row.len() < need {
+        logits_row.resize(need, 0.0);
+    }
+    let mut m = vec![f32::NEG_INFINITY; n_live];
+    let mut z = vec![0.0f32; n_live];
+    let mut entropy_row = vec![0.0f32; n_live];
+    let mut dh_live = vec![0.0f32; n_live.saturating_mul(d)];
+    let mut g = vec![0.0f32; need];
+
+    let gemm_chunk = |v0: usize, loc: &mut [f32]| -> Result<usize> {
+        let vc = chunk.min(v - v0);
+        sgemm_nt(
+            n_live,
+            vc,
+            d,
+            1.0,
+            &h_live,
+            &embed[v0 * d..(v0 + vc) * d],
+            0.0,
+            &mut loc[..n_live * vc],
+        )?;
+        Ok(vc)
+    };
+
+    let mut v0 = 0usize;
+    while v0 < v {
+        let loc = &mut logits_row[..need];
+        let vc = gemm_chunk(v0, loc)?;
+        for r in 0..n_live {
+            let row = &loc[r * vc..(r + 1) * vc];
+            let mx = row.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+            if mx > m[r] {
+                m[r] = mx;
+            }
+        }
+        v0 += vc;
+    }
+
+    v0 = 0;
+    while v0 < v {
+        let loc = &mut logits_row[..need];
+        let vc = gemm_chunk(v0, loc)?;
+        for r in 0..n_live {
+            let row = &loc[r * vc..(r + 1) * vc];
+            let mr = m[r];
+            let mut s = 0.0f32;
+            for &x in row {
+                s += (x - mr).exp();
+            }
+            z[r] += s;
+        }
+        v0 += vc;
+    }
+
+    if lam > 0.0 {
+        v0 = 0;
+        while v0 < v {
+            let loc = &mut logits_row[..need];
+            let vc = gemm_chunk(v0, loc)?;
+            for r in 0..n_live {
+                let row = &loc[r * vc..(r + 1) * vc];
+                let inv_z = 1.0 / z[r].max(1e-20);
+                let mr = m[r];
+                let mut h = 0.0f32;
+                for &x in row {
+                    let p = ((x - mr).exp() * inv_z).max(1e-12);
+                    h -= p * p.ln();
+                }
+                entropy_row[r] += h;
+            }
+            v0 += vc;
+        }
+    }
+
     let mut loss = 0.0f32;
+    v0 = 0;
+    while v0 < v {
+        let loc = &mut logits_row[..need];
+        let vc = gemm_chunk(v0, loc)?;
+        for r in 0..n_live {
+            let i = live[r];
+            let y = (targets[i] as usize).min(v.saturating_sub(1));
+            let inv_z = 1.0 / z[r].max(1e-20);
+            let mr = m[r];
+            let ent = entropy_row[r];
+            let grow = &mut g[r * vc..(r + 1) * vc];
+            let row = &loc[r * vc..(r + 1) * vc];
+            for t in 0..vc {
+                let tok = v0 + t;
+                let p = (row[t] - mr).exp() * inv_z;
+                if tok == y {
+                    loss += -p.max(1e-12).ln();
+                }
+                let mut gk = p;
+                if tok == y {
+                    gk -= 1.0;
+                }
+                if lam > 0.0 {
+                    gk += lam * (-p.max(1e-12) * (p.max(1e-12).ln() + ent));
+                }
+                grow[t] = gk * inv_den;
+            }
+        }
+        sgemm(
+            n_live,
+            d,
+            vc,
+            1.0,
+            &g[..n_live * vc],
+            &embed[v0 * d..(v0 + vc) * d],
+            1.0,
+            &mut dh_live,
+        )?;
+        sgemm_tn(
+            vc,
+            d,
+            n_live,
+            1.0,
+            &g[..n_live * vc],
+            &h_live,
+            1.0,
+            &mut embed_grad[v0 * d..(v0 + vc) * d],
+        )?;
+        v0 += vc;
+    }
+
+    for (r, &i) in live.iter().enumerate() {
+        dhidden[i * d..(i + 1) * d].copy_from_slice(&dh_live[r * d..(r + 1) * d]);
+    }
     let mut h_sum = 0.0f32;
-    for i in 0..n {
-        if mask[i] == 0 {
-            continue;
-        }
-        let h = &hidden[i * d..(i + 1) * d];
-        for tok in 0..v {
-            let er = &embed[tok * d..(tok + 1) * d];
-            let mut acc = 0.0f32;
-            for j in 0..d {
-                acc += h[j] * er[j];
-            }
-            row[tok] = acc;
-        }
-        let m = row.iter().copied().fold(f32::NEG_INFINITY, f32::max);
-        let mut z = 0.0f32;
-        for tok in 0..v {
-            row[tok] = (row[tok] - m).exp();
-            z += row[tok];
-        }
-        let inv = 1.0 / z.max(1e-20);
-        let mut entropy = 0.0f32;
-        for tok in 0..v {
-            row[tok] *= inv;
-            let p = row[tok].max(1e-12);
-            entropy -= p * p.ln();
-        }
-        let y = (targets[i] as usize).min(v.saturating_sub(1));
-        loss += -row[y].max(1e-12).ln();
-        h_sum += entropy;
-        for tok in 0..v {
-            let p = row[tok];
-            let mut g = p;
-            if tok == y {
-                g -= 1.0;
-            }
-            if lam > 0.0 {
-                g += lam * (-p * (p.max(1e-12).ln() + entropy));
-            }
-            g *= inv_den;
-            let er = &embed[tok * d..(tok + 1) * d];
-            let dh = &mut dhidden[i * d..(i + 1) * d];
-            let de = &mut embed_grad[tok * d..(tok + 1) * d];
-            for j in 0..d {
-                dh[j] += g * er[j];
-                de[j] += g * h[j];
-            }
-        }
+    for e in &entropy_row {
+        h_sum += *e;
     }
     loss *= inv_den;
     h_sum *= inv_den;

@@ -33,12 +33,7 @@ fn code_atoms_compress() {
     let mut tok = train_bpe(&texts, 1024, 2).unwrap();
     for atom in ["def ", "fn ", "return", "impl", "match"] {
         let ids = tok.encode(atom, false, false);
-        assert_eq!(
-            ids.len(),
-            1,
-            "{atom:?} used {} tokens: {ids:?}",
-            ids.len()
-        );
+        assert_eq!(ids.len(), 1, "{atom:?} used {} tokens: {ids:?}", ids.len());
     }
 }
 

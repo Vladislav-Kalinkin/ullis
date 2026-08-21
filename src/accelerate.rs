@@ -35,8 +35,10 @@ pub struct MobKanSpec {
     pub n_tile: u32,
     /// 0 = dense (all K). 1|2 = per-token top-k after full softmax.
     pub topk: u32,
+    /// 0 = unfactored `[out, in·G]`. 1 = shared-edge `[in, G]` (PR8).
+    pub kan_factor: u32,
     /// Layout pad so `MobKanSpec` stays 16-byte-sized (80 bytes).
-    pub pad: [u32; 3],
+    pub pad: [u32; 2],
     pub inv_width: f32,
     pub delta_ratio: f32,
 }
@@ -90,7 +92,8 @@ impl MobKanSpec {
             out_tile: out_f_u.clamp(1, Self::OUT_TILE),
             n_tile: n_u.clamp(1, Self::N_TILE),
             topk: 0,
-            pad: [0; 3],
+            kan_factor: 1,
+            pad: [0; 2],
             inv_width,
             delta_ratio,
         };
@@ -157,6 +160,12 @@ impl MobKanSpec {
         if self.topk > self.k && self.k > 0 {
             bail!("topk {} exceeds k {}", self.topk, self.k);
         }
+        if self.kan_factor != 1 {
+            bail!(
+                "kan_factor {} invalid: shared-edge (1) is required",
+                self.kan_factor
+            );
+        }
         let _ = self.pad;
         if self.scratch_floats() > Self::TG_SCRATCH_FLOATS as usize {
             bail!(
@@ -210,8 +219,21 @@ impl MobKanSpec {
         self.topk == 0 || self.k == 0 || self.topk >= self.k
     }
 
+    pub fn shared_edge(&self) -> bool {
+        self.kan_factor == 1
+    }
+
     pub fn with_topk(mut self, topk: u32) -> Result<Self> {
         self.topk = topk;
+        self.validate()?;
+        Ok(self)
+    }
+
+    pub fn with_kan_factor(mut self, kan_factor: u32) -> Result<Self> {
+        if kan_factor != 1 {
+            bail!("unfactored KAN was removed");
+        }
+        self.kan_factor = 1;
         self.validate()?;
         Ok(self)
     }
@@ -226,10 +248,18 @@ impl MobKanSpec {
         self.out_us() * self.in_us()
     }
     pub fn w_shared_len(&self) -> usize {
-        self.out_us() * self.in_us() * self.gs_us()
+        if self.shared_edge() {
+            self.in_us() * self.gs_us()
+        } else {
+            self.out_us() * self.in_us() * self.gs_us()
+        }
     }
     pub fn w_routed_len(&self) -> usize {
-        self.k_us() * self.out_us() * self.in_us() * self.gr_us()
+        if self.shared_edge() {
+            self.k_us() * self.in_us() * self.gr_us()
+        } else {
+            self.k_us() * self.out_us() * self.in_us() * self.gr_us()
+        }
     }
     pub fn router_len(&self) -> usize {
         self.k_us() * self.in_us()
@@ -240,9 +270,20 @@ impl MobKanSpec {
     pub fn scale_vec_len(&self) -> usize {
         self.out_us()
     }
+    pub fn scale_shared_len(&self) -> usize {
+        if self.shared_edge() {
+            self.in_us()
+        } else {
+            self.out_us()
+        }
+    }
     pub fn scale_routed_len(&self) -> usize {
         let k = self.k_us().max(1);
-        k * self.out_us()
+        if self.shared_edge() {
+            k * self.in_us()
+        } else {
+            k * self.out_us()
+        }
     }
 
     pub fn quantize(&self) -> bool {
@@ -257,7 +298,9 @@ impl MobKanSpec {
 
     pub fn scratch_floats(&self) -> usize {
         let tin = self.tile_in_us();
-        tin + tin * self.g_us() + self.k_us().max(1)
+        let k = self.k_us().max(1);
+        // x[TIN] + ψ[TIN·G] + gates[K] + φ[TIN] + ρ[K·TIN] + d_base[OUT_TILE]
+        tin + tin * self.g_us() + k + tin + k * tin + self.out_tile_us()
     }
 
     pub fn n_tiles(&self) -> usize {
@@ -324,11 +367,12 @@ impl BwdPartialLayout {
         let off_dsb = off;
         off += tg.saturating_mul(ot);
         let off_dss = off;
-        off += tg.saturating_mul(ot);
+        off += tg.saturating_mul(ot).saturating_mul(tin);
         let off_dsr = off;
-        off += tg.saturating_mul(k).saturating_mul(ot);
+        off += tg.saturating_mul(k).saturating_mul(ot).saturating_mul(tin);
         let off_dc = off;
-        off += tg.saturating_mul(g);
+        // Per in-tile lane so TG threads do not serialize `dCenters`.
+        off += tg.saturating_mul(tin).saturating_mul(g);
         let off_dg = off;
         // Unique slot per output in the tile so TG threads do not race on dg.
         off += tg.saturating_mul(nt).saturating_mul(ot).saturating_mul(k);
@@ -529,6 +573,33 @@ pub fn sgemm_nt(
     sgemm_nt_inner(m, n, k, alpha, a, b, beta, c)
 }
 
+/// Row-major `C[m, n] = alpha * A[k, m]^T @ B[k, n] + beta * C`.
+/// `A` is stored `[k, m]` (e.g. `g[n_live, Vc]` with `k=n_live`, `m=Vc`).
+pub fn sgemm_tn(
+    m: usize,
+    n: usize,
+    k: usize,
+    alpha: f32,
+    a: &[f32],
+    b: &[f32],
+    beta: f32,
+    c: &mut [f32],
+) -> Result<()> {
+    if a.len() < k.saturating_mul(m) {
+        bail!("sgemm_tn A len {} < k*m {}", a.len(), k * m);
+    }
+    if b.len() < k.saturating_mul(n) {
+        bail!("sgemm_tn B len {} < k*n {}", b.len(), k * n);
+    }
+    if c.len() < m.saturating_mul(n) {
+        bail!("sgemm_tn C len {} < m*n {}", c.len(), m * n);
+    }
+    if m == 0 || n == 0 || k == 0 {
+        return Ok(());
+    }
+    sgemm_tn_inner(m, n, k, alpha, a, b, beta, c)
+}
+
 #[cfg(target_os = "macos")]
 fn sgemm_inner(
     m: usize,
@@ -599,6 +670,41 @@ fn sgemm_nt_inner(
     Ok(())
 }
 
+#[cfg(target_os = "macos")]
+fn sgemm_tn_inner(
+    m: usize,
+    n: usize,
+    k: usize,
+    alpha: f32,
+    a: &[f32],
+    b: &[f32],
+    beta: f32,
+    c: &mut [f32],
+) -> Result<()> {
+    let m_i = i32_dim(m, "m")?;
+    let n_i = i32_dim(n, "n")?;
+    let k_i = i32_dim(k, "k")?;
+    unsafe {
+        cblas_sgemm(
+            CBLAS_ROW_MAJOR,
+            CBLAS_TRANS,
+            CBLAS_NO_TRANS,
+            m_i,
+            n_i,
+            k_i,
+            alpha,
+            a.as_ptr(),
+            m_i,
+            b.as_ptr(),
+            n_i,
+            beta,
+            c.as_mut_ptr(),
+            n_i,
+        );
+    }
+    Ok(())
+}
+
 #[cfg(not(target_os = "macos"))]
 fn sgemm_inner(
     m: usize,
@@ -641,6 +747,31 @@ fn sgemm_nt_inner(
             let arow = i * k;
             for p in 0..k {
                 acc += a[arow + p] * b[brow + p];
+            }
+            let idx = i * n + j;
+            c[idx] = alpha * acc + beta * c[idx];
+        }
+    }
+    Ok(())
+}
+
+#[cfg(not(target_os = "macos"))]
+fn sgemm_tn_inner(
+    m: usize,
+    n: usize,
+    k: usize,
+    alpha: f32,
+    a: &[f32],
+    b: &[f32],
+    beta: f32,
+    c: &mut [f32],
+) -> Result<()> {
+    // A is [k, m], B is [k, n], C is [m, n]; C += A^T @ B
+    for i in 0..m {
+        for j in 0..n {
+            let mut acc = 0.0f32;
+            for p in 0..k {
+                acc += a[p * m + i] * b[p * n + j];
             }
             let idx = i * n + j;
             c[idx] = alpha * acc + beta * c[idx];
@@ -1250,10 +1381,45 @@ pub fn mob_kan_fused_cpu(
             spec.centers_len()
         );
     }
-    if scale_base.len() != spec.scale_vec_len() || scale_shared.len() != spec.scale_vec_len() {
+    if scale_base.len() != spec.scale_vec_len() || scale_shared.len() != spec.scale_shared_len() {
         bail!("scale len");
     }
 
+    mob_kan_fused_cpu_shared_edge(
+        spec,
+        x,
+        w_base,
+        w_shared,
+        w_routed,
+        router,
+        centers,
+        inv_widths,
+        scale_base,
+        scale_shared,
+        scale_routed,
+        y,
+    )
+}
+
+/// Shared-edge forward: one univariate spline per incoming edge, then `W_base`.
+///
+/// `φ_i = Σ_g Q(W_shared[i,g]) ψ_g(x_i)`
+/// `ρ_{k,i} = Σ_g Q(W_routed[k,i,g]) ψ_{gs+g}(x_i)`
+/// `y = Q(W_base) (x + φ + Σ_k g_k ρ_k)`
+fn mob_kan_fused_cpu_shared_edge(
+    spec: &MobKanSpec,
+    x: &[f32],
+    w_base: &[f32],
+    w_shared: &[f32],
+    w_routed: &[f32],
+    router: &[f32],
+    centers: &[f32],
+    inv_widths: &[f32],
+    scale_base: &[f32],
+    scale_shared: &[f32],
+    scale_routed: &[f32],
+    y: &mut [f32],
+) -> Result<()> {
     let n = spec.n_us();
     let in_f = spec.in_us();
     let out_f = spec.out_us();
@@ -1265,16 +1431,11 @@ pub fn mob_kan_fused_cpu(
     let tin_max = spec.tile_in_us();
     let ot_max = spec.out_tile_us();
     let nt_max = spec.n_tile_us();
-    debug_assert!(
-        tin_max * g * nt_max < n.saturating_mul(in_f).saturating_mul(g)
-            || tin_max == in_f && nt_max == n,
-        "bump tile must not be the full [n,in,G] plane unless the problem fits one tile"
-    );
 
     let mut wb = Vec::new();
     let mut ws = Vec::new();
     prepare_weights(spec, w_base, out_f, in_f, scale_base, &mut wb)?;
-    prepare_weights(spec, w_shared, out_f, in_f * gs, scale_shared, &mut ws)?;
+    prepare_weights(spec, w_shared, in_f, gs.max(1), scale_shared, &mut ws)?;
 
     fill(y, 0.0);
 
@@ -1295,7 +1456,14 @@ pub fn mob_kan_fused_cpu(
         sgemm_nt(n, k, in_f, 1.0, x, router, 0.0, &mut logits)?;
         softmax_rows(&mut logits, n, k)?;
         apply_topk_gates(&mut logits, n, k, spec.topk);
-        prepare_weights(spec, w_routed, k * out_f, in_f * gr, scale_routed, &mut wr)?;
+        prepare_weights(
+            spec,
+            w_routed,
+            k.max(1) * in_f,
+            gr.max(1),
+            scale_routed,
+            &mut wr,
+        )?;
     }
 
     let iw_fallback = [spec.inv_width];
@@ -1307,25 +1475,9 @@ pub fn mob_kan_fused_cpu(
 
     let mut x_tile = vec![0.0f32; nt_max * tin_max];
     let mut bumps = vec![0.0f32; nt_max * tin_max * g];
-    let mut shared_b = vec![0.0f32; nt_max * tin_max * g_use];
-    let mut routed_b = if routed && gr > 0 {
-        vec![0.0f32; nt_max * tin_max * gr]
-    } else {
-        Vec::new()
-    };
+    let mut u_tile = vec![0.0f32; nt_max * tin_max];
     let mut wb_tile = vec![0.0f32; ot_max * tin_max];
-    let mut ws_tile = vec![0.0f32; ot_max * tin_max * g_use];
-    let mut wr_tile = if routed && gr > 0 {
-        vec![0.0f32; k.max(1) * ot_max * tin_max * gr]
-    } else {
-        Vec::new()
-    };
     let mut y_tile = vec![0.0f32; nt_max * ot_max];
-    let mut stacked = if routed {
-        vec![0.0f32; nt_max * k.max(1) * ot_max]
-    } else {
-        Vec::new()
-    };
 
     let mut t0 = 0usize;
     while t0 < n {
@@ -1345,17 +1497,27 @@ pub fn mob_kan_fused_cpu(
             for t in 0..tn {
                 for i in 0..tin {
                     let src = (t * tin + i) * g;
-                    let dst = (t * tin + i) * g_use;
-                    shared_b[dst..dst + g_use].copy_from_slice(&bumps[src..src + g_use]);
-                }
-            }
-            if routed && gr > 0 {
-                for t in 0..tn {
-                    for i in 0..tin {
-                        let src = (t * tin + i) * g + gs;
-                        let dst = (t * tin + i) * gr;
-                        routed_b[dst..dst + gr].copy_from_slice(&bumps[src..src + gr]);
+                    let mut phi = 0.0f32;
+                    let gi_in = in0 + i;
+                    for gi in 0..g_use {
+                        phi += bumps[src + gi] * ws[gi_in * gs + gi];
                     }
+                    let mut rho = 0.0f32;
+                    if routed && gr > 0 {
+                        for e in 0..k {
+                            let gate = logits[(t0 + t) * k + e];
+                            if gate == 0.0 {
+                                continue;
+                            }
+                            let mut mix = 0.0f32;
+                            let row = (e * in_f + gi_in) * gr;
+                            for gi in 0..gr {
+                                mix += bumps[src + gs + gi] * wr[row + gi];
+                            }
+                            rho += gate * mix;
+                        }
+                    }
+                    u_tile[t * tin + i] = x_tile[t * tin + i] + phi + rho;
                 }
             }
 
@@ -1364,57 +1526,7 @@ pub fn mob_kan_fused_cpu(
                 let ot = ot_max.min(out_f - o0);
                 pack_base_tile(&wb, in_f, o0, ot, in0, tin, &mut wb_tile);
                 y_tile[..tn * ot].fill(0.0);
-                sgemm_nt(tn, ot, tin, 1.0, &x_tile, &wb_tile, 0.0, &mut y_tile)?;
-
-                for o in 0..ot {
-                    for i in 0..tin {
-                        let src = (o0 + o) * (in_f * gs) + (in0 + i) * gs;
-                        let dst = o * (tin * g_use) + i * g_use;
-                        ws_tile[dst..dst + g_use].copy_from_slice(&ws[src..src + g_use]);
-                    }
-                }
-                sgemm_nt(
-                    tn,
-                    ot,
-                    tin * g_use,
-                    1.0,
-                    &shared_b,
-                    &ws_tile,
-                    1.0,
-                    &mut y_tile,
-                )?;
-
-                if routed && gr > 0 {
-                    for e in 0..k {
-                        for o in 0..ot {
-                            let src = (e * out_f + o0 + o) * (in_f * gr) + in0 * gr;
-                            let dst = (e * ot + o) * (tin * gr);
-                            wr_tile[dst..dst + tin * gr].copy_from_slice(&wr[src..src + tin * gr]);
-                        }
-                    }
-                    stacked[..tn * k * ot].fill(0.0);
-                    sgemm_nt(
-                        tn,
-                        k * ot,
-                        tin * gr,
-                        1.0,
-                        &routed_b,
-                        &wr_tile,
-                        0.0,
-                        &mut stacked,
-                    )?;
-                    for t in 0..tn {
-                        for e in 0..k {
-                            let gate = logits[(t0 + t) * k + e];
-                            let src = (t * k + e) * ot;
-                            let dst = t * ot;
-                            for o in 0..ot {
-                                y_tile[dst + o] += gate * stacked[src + o];
-                            }
-                        }
-                    }
-                }
-
+                sgemm_nt(tn, ot, tin, 1.0, &u_tile, &wb_tile, 0.0, &mut y_tile)?;
                 add_y_tile(y, out_f, t0, tn, o0, ot, &y_tile);
                 o0 += ot;
             }
@@ -1494,6 +1606,49 @@ pub fn mob_kan_fused_bwd_cpu(
         grads.dx[..spec.x_len()].fill(0.0);
         return Ok((0.0, 0.0));
     }
+    if x.len() != spec.x_len() || dy.len() != spec.y_len() {
+        bail!("fused bwd x/dy rank");
+    }
+    if grads.dx.len() < spec.x_len() {
+        bail!("fused bwd dx short");
+    }
+    grads.dx[..spec.x_len()].fill(0.0);
+    mob_kan_fused_bwd_cpu_shared_edge(
+        spec,
+        x,
+        w_base,
+        w_shared,
+        w_routed,
+        router,
+        centers,
+        inv_widths,
+        scale_base,
+        scale_shared,
+        scale_routed,
+        dy,
+        lambda_r,
+        aux_coef,
+        grads,
+    )
+}
+
+fn mob_kan_fused_bwd_cpu_shared_edge(
+    spec: &MobKanSpec,
+    x: &[f32],
+    w_base: &[f32],
+    w_shared: &[f32],
+    w_routed: &[f32],
+    router: &[f32],
+    centers: &[f32],
+    inv_widths: &[f32],
+    scale_base: &[f32],
+    scale_shared: &[f32],
+    scale_routed: &[f32],
+    dy: &[f32],
+    lambda_r: f32,
+    aux_coef: f32,
+    grads: FusedBwdGrads<'_>,
+) -> Result<(f32, f32)> {
     let n = spec.n_us();
     let in_f = spec.in_us();
     let out_f = spec.out_us();
@@ -1507,19 +1662,7 @@ pub fn mob_kan_fused_bwd_cpu(
     let scale_on = qat || packed;
     let ratio = spec.delta_ratio;
     let routed = !spec.mask_routed();
-
-    if x.len() != spec.x_len() || dy.len() != spec.y_len() {
-        bail!("fused bwd x/dy rank");
-    }
-    if grads.dx.len() < spec.x_len() {
-        bail!("fused bwd dx short");
-    }
     let dx = &mut grads.dx[..spec.x_len()];
-    dx.fill(0.0);
-
-    let cols_b = in_f;
-    let cols_s = in_f * gs.max(1);
-    let cols_r = in_f * gr.max(1);
 
     let mut gates = vec![0.0f32; n * k.max(1)];
     if routed {
@@ -1533,27 +1676,32 @@ pub fn mob_kan_fused_bwd_cpu(
     apply_topk_gates(&mut mix_gates, n, k, spec.topk);
 
     let mut d_base = vec![0.0f32; out_f];
-    let mut d_sh = vec![0.0f32; out_f];
-    let mut d_rt = vec![0.0f32; k.max(1) * out_f];
+    let mut d_sh = vec![0.0f32; in_f];
+    let mut d_rt = vec![0.0f32; k.max(1) * in_f];
     if qat {
         for o in 0..out_f {
-            d_base[o] = row_delta(&w_base[o * cols_b..(o + 1) * cols_b], ratio);
-            d_sh[o] = row_delta(&w_shared[o * cols_s..(o + 1) * cols_s], ratio);
+            d_base[o] = row_delta(&w_base[o * in_f..(o + 1) * in_f], ratio);
+        }
+        for i in 0..in_f {
+            d_sh[i] = row_delta(&w_shared[i * gs..(i + 1) * gs], ratio);
             if routed && gr > 0 {
                 for e in 0..k {
-                    let row = (e * out_f + o) * cols_r;
-                    d_rt[e * out_f + o] = row_delta(&w_routed[row..row + cols_r], ratio);
+                    let row = (e * in_f + i) * gr;
+                    d_rt[e * in_f + i] = row_delta(&w_routed[row..row + gr], ratio);
                 }
             }
         }
     }
 
     let tin_max = spec.tile_in_us();
-    let ot_max = spec.out_tile_us();
     let nt_max = spec.n_tile_us();
-    let span = tin_max.saturating_mul(g).max(1);
-    let mut bumps = vec![0.0f32; nt_max * span];
+    let mut bumps = vec![0.0f32; nt_max * tin_max * g];
     let mut x_tile = vec![0.0f32; nt_max * tin_max];
+    let mut u_tile = vec![0.0f32; nt_max * tin_max];
+    let mut q_s = vec![0.0f32; tin_max * gs.max(1)];
+    let mut q_r = vec![0.0f32; k.max(1) * tin_max * gr.max(1)];
+    let mut rho = vec![0.0f32; k.max(1) * tin_max];
+    let mut d_u = vec![0.0f32; tin_max];
     let mut dg = vec![0.0f32; n * k.max(1)];
 
     let mut t0 = 0usize;
@@ -1571,96 +1719,130 @@ pub fn mob_kan_fused_bwd_cpu(
                 inv_widths,
                 &mut bumps[..tn * tin * g],
             )?;
-            let mut o0 = 0usize;
-            while o0 < out_f {
-                let ot = ot_max.min(out_f - o0);
-                for lo in 0..ot {
-                    let o = o0 + lo;
-                    let sbo = if scale_on { scale_base[o] } else { 1.0 };
-                    let sso = if scale_on { scale_shared[o] } else { 1.0 };
-                    let db = d_base[o];
-                    let ds = d_sh[o];
-                    for lt in 0..tn {
-                        let t = t0 + lt;
-                        let go = dy[t * out_f + o];
-                        for i in 0..tin {
-                            let gi_in = in0 + i;
-                            let xv = x_tile[lt * tin + i];
-                            let w = w_base[o * cols_b + gi_in];
-                            let (qw, ste) = qat_and_ste(w, db, sbo, qat, packed);
-                            dx[t * in_f + gi_in] += go * qw;
-                            grads.grad_base[o * cols_b + gi_in] += go * xv * sbo * ste;
-                            if scale_on {
-                                let code = if sbo.abs() > 0.0 { qw / sbo } else { 0.0 };
-                                grads.grad_scale_base[o] += go * xv * code;
-                            }
-                            for gi in 0..g_use {
-                                let b = bumps[(lt * tin + i) * g + gi];
-                                let idx = o * cols_s + gi_in * gs + gi;
-                                let ws = w_shared[idx];
-                                let (qs, ste_s) = qat_and_ste(ws, ds, sso, qat, packed);
-                                grads.grad_shared[idx] += go * b * sso * ste_s;
-                                if scale_on {
-                                    let code = if sso.abs() > 0.0 { qs / sso } else { 0.0 };
-                                    grads.grad_scale_shared[o] += go * b * code;
-                                }
-                                let inv = inv_at(inv_widths, gi, spec.inv_width);
-                                bump_grads(
-                                    xv,
-                                    centers[gi],
-                                    inv,
-                                    go * qs,
-                                    &mut dx[t * in_f + gi_in],
-                                    &mut grads.grad_centers[gi],
-                                );
-                            }
-                        }
-                        if !routed {
-                            continue;
-                        }
+            for lt in 0..tn {
+                let t = t0 + lt;
+                for i in 0..tin {
+                    let gi_in = in0 + i;
+                    let src = (lt * tin + i) * g;
+                    let ssi = if scale_on { scale_shared[gi_in] } else { 1.0 };
+                    let mut phi = 0.0f32;
+                    for gi in 0..g_use {
+                        let (qs, _) =
+                            qat_and_ste(w_shared[gi_in * gs + gi], d_sh[gi_in], ssi, qat, packed);
+                        q_s[i * gs + gi] = qs;
+                        phi += bumps[src + gi] * qs;
+                    }
+                    let mut rsum = 0.0f32;
+                    if routed && gr > 0 {
                         for e in 0..k {
                             let gate = mix_gates[t * k + e];
-                            if gate == 0.0 {
-                                continue;
-                            }
-                            let sre = if scale_on {
-                                scale_routed[e * out_f + o]
+                            let sri = if scale_on {
+                                scale_routed[e * in_f + gi_in]
                             } else {
                                 1.0
                             };
-                            let dr = d_rt[e * out_f + o];
                             let mut mix = 0.0f32;
-                            for i in 0..tin {
-                                let gi_in = in0 + i;
-                                let xv = x_tile[lt * tin + i];
-                                for gi in 0..gr {
-                                    let b = bumps[(lt * tin + i) * g + gs + gi];
-                                    let idx = (e * out_f + o) * cols_r + gi_in * gr + gi;
-                                    let wr = w_routed[idx];
-                                    let (qr, ste_r) = qat_and_ste(wr, dr, sre, qat, packed);
-                                    grads.grad_routed[idx] += go * gate * b * sre * ste_r;
-                                    if scale_on {
-                                        let code = if sre.abs() > 0.0 { qr / sre } else { 0.0 };
-                                        grads.grad_scale_routed[e * out_f + o] +=
-                                            go * gate * b * code;
-                                    }
-                                    mix += b * qr;
-                                    let inv = inv_at(inv_widths, gs + gi, spec.inv_width);
-                                    bump_grads(
-                                        xv,
-                                        centers[gs + gi],
-                                        inv,
-                                        go * gate * qr,
-                                        &mut dx[t * in_f + gi_in],
-                                        &mut grads.grad_centers[gs + gi],
-                                    );
-                                }
+                            let row = (e * in_f + gi_in) * gr;
+                            for gi in 0..gr {
+                                let (qr, _) = qat_and_ste(
+                                    w_routed[row + gi],
+                                    d_rt[e * in_f + gi_in],
+                                    sri,
+                                    qat,
+                                    packed,
+                                );
+                                q_r[(e * tin + i) * gr + gi] = qr;
+                                mix += bumps[src + gs + gi] * qr;
                             }
-                            dg[t * k + e] += go * mix;
+                            rho[e * tin + i] = mix;
+                            rsum += gate * mix;
+                        }
+                    }
+                    u_tile[lt * tin + i] = x_tile[lt * tin + i] + phi + rsum;
+                }
+
+                d_u[..tin].fill(0.0);
+                for o in 0..out_f {
+                    let go = dy[t * out_f + o];
+                    let sbo = if scale_on { scale_base[o] } else { 1.0 };
+                    let db = d_base[o];
+                    for i in 0..tin {
+                        let gi_in = in0 + i;
+                        let w = w_base[o * in_f + gi_in];
+                        let (qw, ste) = qat_and_ste(w, db, sbo, qat, packed);
+                        dx[t * in_f + gi_in] += go * qw;
+                        grads.grad_base[o * in_f + gi_in] += go * u_tile[lt * tin + i] * sbo * ste;
+                        if scale_on {
+                            let code = if sbo.abs() > 0.0 { qw / sbo } else { 0.0 };
+                            grads.grad_scale_base[o] += go * u_tile[lt * tin + i] * code;
+                        }
+                        d_u[i] += go * qw;
+                    }
+                }
+
+                for i in 0..tin {
+                    let gi_in = in0 + i;
+                    let xv = x_tile[lt * tin + i];
+                    let src = (lt * tin + i) * g;
+                    let ssi = if scale_on { scale_shared[gi_in] } else { 1.0 };
+                    let du = d_u[i];
+                    for gi in 0..g_use {
+                        let idx = gi_in * gs + gi;
+                        let b = bumps[src + gi];
+                        let (_, ste_s) = qat_and_ste(w_shared[idx], d_sh[gi_in], ssi, qat, packed);
+                        grads.grad_shared[idx] += du * b * ssi * ste_s;
+                        if scale_on {
+                            let qs = q_s[i * gs + gi];
+                            let code = if ssi.abs() > 0.0 { qs / ssi } else { 0.0 };
+                            grads.grad_scale_shared[gi_in] += du * b * code;
+                        }
+                        let inv = inv_at(inv_widths, gi, spec.inv_width);
+                        bump_grads(
+                            xv,
+                            centers[gi],
+                            inv,
+                            du * q_s[i * gs + gi],
+                            &mut dx[t * in_f + gi_in],
+                            &mut grads.grad_centers[gi],
+                        );
+                    }
+                    if !routed || gr == 0 {
+                        continue;
+                    }
+                    for e in 0..k {
+                        let gate = mix_gates[t * k + e];
+                        dg[t * k + e] += du * rho[e * tin + i];
+                        if gate == 0.0 {
+                            continue;
+                        }
+                        let sri = if scale_on {
+                            scale_routed[e * in_f + gi_in]
+                        } else {
+                            1.0
+                        };
+                        let dr = d_rt[e * in_f + gi_in];
+                        for gi in 0..gr {
+                            let idx = (e * in_f + gi_in) * gr + gi;
+                            let b = bumps[src + gs + gi];
+                            let qr = q_r[(e * tin + i) * gr + gi];
+                            let (_, ste_r) = qat_and_ste(w_routed[idx], dr, sri, qat, packed);
+                            grads.grad_routed[idx] += du * gate * b * sri * ste_r;
+                            if scale_on {
+                                let code = if sri.abs() > 0.0 { qr / sri } else { 0.0 };
+                                grads.grad_scale_routed[e * in_f + gi_in] += du * gate * b * code;
+                            }
+                            let inv = inv_at(inv_widths, gs + gi, spec.inv_width);
+                            bump_grads(
+                                xv,
+                                centers[gs + gi],
+                                inv,
+                                du * gate * qr,
+                                &mut dx[t * in_f + gi_in],
+                                &mut grads.grad_centers[gs + gi],
+                            );
                         }
                     }
                 }
-                o0 += ot;
             }
             in0 += tin;
         }
@@ -1759,7 +1941,7 @@ pub fn reduce_bwd_partials(
                 for i in 0..tin {
                     grads.grad_base[o * in_f + in0 + i] += part[base_row + i];
                     if gs > 0 {
-                        let dst = o * (in_f * gs) + (in0 + i) * gs;
+                        let dst = (in0 + i) * gs;
                         let src = sh_row + i * layout.gs;
                         for gi in 0..gs {
                             grads.grad_shared[dst + gi] += part[src + gi];
@@ -1767,20 +1949,25 @@ pub fn reduce_bwd_partials(
                     }
                 }
                 grads.grad_scale_base[o] += part[layout.off_dsb + tg * ot_max + lo];
-                grads.grad_scale_shared[o] += part[layout.off_dss + tg * ot_max + lo];
+                let dss = layout.off_dss + (tg * ot_max + lo) * tin_cap;
+                for i in 0..tin {
+                    grads.grad_scale_shared[in0 + i] += part[dss + i];
+                }
                 if routed {
                     for e in 0..k {
                         let rr = layout.off_routed
                             + (((tg * layout.k + e) * ot_max + lo) * tin_cap) * layout.gr;
                         for i in 0..tin {
-                            let dst = (e * out_f + o) * (in_f * gr.max(1)) + (in0 + i) * gr.max(1);
+                            let dst = (e * in_f + in0 + i) * gr.max(1);
                             let src = rr + i * layout.gr;
                             for gi in 0..gr {
                                 grads.grad_routed[dst + gi] += part[src + gi];
                             }
                         }
-                        grads.grad_scale_routed[e * out_f + o] +=
-                            part[layout.off_dsr + (tg * layout.k + e) * ot_max + lo];
+                        let dsr = layout.off_dsr + ((tg * layout.k + e) * ot_max + lo) * tin_cap;
+                        for i in 0..tin {
+                            grads.grad_scale_routed[e * in_f + in0 + i] += part[dsr + i];
+                        }
                     }
                 }
             }
@@ -1791,8 +1978,11 @@ pub fn reduce_bwd_partials(
                     grads.dx[t * in_f + in0 + i] += part[dx_row + i];
                 }
             }
-            for gi in 0..g {
-                grads.grad_centers[gi] += part[layout.off_dc + tg * g + gi];
+            for i in 0..tin {
+                let dc_row = layout.off_dc + (tg * tin_cap + i) * g;
+                for gi in 0..g {
+                    grads.grad_centers[gi] += part[dc_row + gi];
+                }
             }
         }
     }
@@ -1963,7 +2153,7 @@ mod tests {
             .collect();
         let inv_widths = bump_inv_widths(&centers);
         let scale_base = vec![1.0f32; spec.scale_vec_len()];
-        let scale_shared = vec![1.0f32; spec.scale_vec_len()];
+        let scale_shared = vec![1.0f32; spec.scale_shared_len()];
         let scale_routed = vec![1.0f32; spec.scale_routed_len()];
         let mut y = vec![0.0f32; spec.y_len()];
         mob_kan_fused_cpu(
@@ -2000,7 +2190,8 @@ mod tests {
         let router = vec![1.0f32; spec_full.router_len()];
         let centers = vec![-2.0f32, -0.66, 0.66, 2.0];
         let inv_widths = bump_inv_widths(&centers);
-        let ones_o = vec![1.0f32; 2];
+        let ones_o = vec![1.0f32; spec_full.scale_vec_len()];
+        let ones_s = vec![1.0f32; spec_full.scale_shared_len()];
         let ones_r = vec![1.0f32; spec_full.scale_routed_len()];
         let mut y_full = vec![0.0f32; 2];
         let mut y_coarse = vec![0.0f32; 2];
@@ -2014,7 +2205,7 @@ mod tests {
             &centers,
             &inv_widths,
             &ones_o,
-            &ones_o,
+            &ones_s,
             &ones_r,
             &mut y_full,
         )
@@ -2029,7 +2220,7 @@ mod tests {
             &centers,
             &inv_widths,
             &ones_o,
-            &ones_o,
+            &ones_s,
             &ones_r,
             &mut y_coarse,
         )
@@ -2052,7 +2243,10 @@ mod tests {
         assert!(spec.in_f > MobKanSpec::MAX_IN);
         assert_eq!(spec.out_tile, MobKanSpec::OUT_TILE);
         assert!(spec.out_f > spec.out_tile);
-        assert_eq!(spec.scratch_floats(), 256 + 256 * 4 + 3);
+        assert_eq!(
+            spec.scratch_floats(),
+            256 + 256 * 4 + 3 + 256 + 3 * 256 + spec.out_tile_us()
+        );
     }
 
     fn run_fused(spec: &MobKanSpec, x: &[f32], w: &FusedW) -> Vec<f32> {
@@ -2100,7 +2294,7 @@ mod tests {
             inv: bump_inv_widths(&centers),
             centers,
             sb: vec![1.0f32; spec.scale_vec_len()],
-            ss: vec![1.0f32; spec.scale_vec_len()],
+            ss: vec![1.0f32; spec.scale_shared_len()],
             sr: vec![1.0f32; spec.scale_routed_len()],
         };
         (x, w)

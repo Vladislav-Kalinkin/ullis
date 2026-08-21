@@ -149,7 +149,16 @@ pub fn project_spline_coeffs(
 
     // target = psi_old [m, old_g] @ b_old^T [old_g, E] → [m, E]
     let mut target = vec![0.0f32; m * e];
-    sgemm(m, e, old_g, 1.0, &psi_old, &transpose(&b_old, e, old_g), 0.0, &mut target)?;
+    sgemm(
+        m,
+        e,
+        old_g,
+        1.0,
+        &psi_old,
+        &transpose(&b_old, e, old_g),
+        0.0,
+        &mut target,
+    )?;
 
     // gram = psi_new^T @ psi_new → [new_g, new_g]
     let psi_new_t = transpose(&psi_new, m, new_g);

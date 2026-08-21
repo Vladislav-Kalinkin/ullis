@@ -19,9 +19,9 @@ pub mod tokenizer;
 pub mod train;
 
 pub use accelerate::{FusedBwdGrads, MobKanSpec};
-pub use device::prefer_host_bwd;
-pub use config::{MasterDtype, MomDtype, TrainConfig};
+pub use config::{KanFactor, MasterDtype, MomDtype, TrainConfig};
 pub use data::SovereignFlashBuffer;
+pub use device::prefer_host_bwd;
 pub use device::SovereignDevice;
 pub use kan::TernaryKanLinear;
 pub use model::UllisKan;

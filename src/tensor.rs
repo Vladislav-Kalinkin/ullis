@@ -346,6 +346,9 @@ fn fused_bwd_metal(
     let dummy = gpu.dummy_buffer();
     let tin_max = spec.tile_in_us();
     let mut in0 = 0usize;
+    // One wait per in-tile: host `reduce_bwd_partials` reads `part` immediately.
+    // Coalescing waits needs a part slab per tile (or a device reduce). At
+    // default d=32, TIN covers `in`, so this loop is a single dispatch.
     while in0 < spec.in_us() {
         let tin = tin_max.min(spec.in_us() - in0);
         part.as_mut_slice().fill(0.0);
@@ -434,7 +437,11 @@ pub fn fused_mob_kan_step(
     check_len(tensors.centers, spec.centers_len(), "centers")?;
     check_len(tensors.inv_widths, spec.centers_len(), "inv_widths")?;
     check_len(tensors.scale_base, spec.scale_vec_len(), "scale_base")?;
-    check_len(tensors.scale_shared, spec.scale_vec_len(), "scale_shared")?;
+    check_len(
+        tensors.scale_shared,
+        spec.scale_shared_len(),
+        "scale_shared",
+    )?;
     if !spec.mask_routed() {
         let wr = tensors
             .w_routed
@@ -600,15 +607,15 @@ mod tests {
         let x = SovereignTensor::fill(vec![2, 4], 0.2).unwrap();
         let mut y = SovereignTensor::zeros(vec![2, 3]).unwrap();
         let w_base = SovereignTensor::fill(vec![3, 4], 0.05).unwrap();
-        let w_shared = SovereignTensor::fill(vec![3, 12], 0.02).unwrap();
-        let w_routed = SovereignTensor::fill(vec![3, 3, 4], 0.01).unwrap();
+        let w_shared = SovereignTensor::fill(vec![4, 3], 0.02).unwrap();
+        let w_routed = SovereignTensor::fill(vec![3, 4, 1], 0.01).unwrap();
         let router = SovereignTensor::zeros(vec![3, 4]).unwrap();
         let centers = SovereignTensor::from_vec(vec![4], vec![-2.0, -0.66, 0.66, 2.0]).unwrap();
         let iw = crate::accelerate::bump_inv_widths(centers.as_slice());
         let inv_widths = SovereignTensor::from_vec(vec![4], iw).unwrap();
         let scale_base = SovereignTensor::fill(vec![3], 1.0).unwrap();
-        let scale_shared = SovereignTensor::fill(vec![3], 1.0).unwrap();
-        let scale_routed = SovereignTensor::fill(vec![3, 3], 1.0).unwrap();
+        let scale_shared = SovereignTensor::fill(vec![4], 1.0).unwrap();
+        let scale_routed = SovereignTensor::fill(vec![3, 4], 1.0).unwrap();
         fused_mob_kan_step(
             &gpu,
             &spec,
@@ -662,15 +669,15 @@ mod tests {
         let mut x = SovereignTensor::fill(vec![2, 4], 0.2).unwrap();
         let mut y_gpu = SovereignTensor::zeros(vec![2, 3]).unwrap();
         let mut w_base = SovereignTensor::fill(vec![3, 4], 0.05).unwrap();
-        let mut w_shared = SovereignTensor::fill(vec![3, 12], 0.02).unwrap();
-        let mut w_routed = SovereignTensor::fill(vec![3, 3, 4], 0.01).unwrap();
+        let mut w_shared = SovereignTensor::fill(vec![4, 3], 0.02).unwrap();
+        let mut w_routed = SovereignTensor::fill(vec![3, 4, 1], 0.01).unwrap();
         let mut router = SovereignTensor::zeros(vec![3, 4]).unwrap();
         let mut centers = SovereignTensor::from_vec(vec![4], vec![-2.0, -0.66, 0.66, 2.0]).unwrap();
         let iw = crate::accelerate::bump_inv_widths(centers.as_slice());
         let mut inv_widths = SovereignTensor::from_vec(vec![4], iw).unwrap();
         let mut scale_base = SovereignTensor::fill(vec![3], 1.0).unwrap();
-        let mut scale_shared = SovereignTensor::fill(vec![3], 1.0).unwrap();
-        let mut scale_routed = SovereignTensor::fill(vec![3, 3], 1.0).unwrap();
+        let mut scale_shared = SovereignTensor::fill(vec![4], 1.0).unwrap();
+        let mut scale_routed = SovereignTensor::fill(vec![3, 4], 1.0).unwrap();
         for t in [
             &mut x,
             &mut y_gpu,

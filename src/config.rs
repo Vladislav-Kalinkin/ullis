@@ -70,6 +70,38 @@ pub struct TrainConfig {
     /// Switch load-balance `α · K · Σ f_i P_i`. Used only when `moe_topk > 0`.
     #[serde(default = "default_moe_aux")]
     pub moe_aux: f64,
+    /// KAN factorization. Shared-edge is the production layout; `None` is rejected.
+    #[serde(default)]
+    pub kan_factor: KanFactor,
+}
+
+/// Spline coefficient layout. Shared-edge is the only production path.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum KanFactor {
+    None,
+    #[default]
+    SharedEdge,
+}
+
+impl KanFactor {
+    pub fn parse_name(s: &str) -> Result<Self> {
+        match s.to_ascii_lowercase().as_str() {
+            "none" | "off" | "unfactored" => Ok(Self::None),
+            "shared-edge" | "shared_edge" | "edge" => Ok(Self::SharedEdge),
+            other => bail!("--kan-factor {other}: expected none|shared-edge"),
+        }
+    }
+
+    pub fn as_u32(self) -> u32 {
+        match self {
+            Self::None => 0,
+            Self::SharedEdge => 1,
+        }
+    }
+
+    pub fn shared_edge(self) -> bool {
+        matches!(self, Self::SharedEdge)
+    }
 }
 
 /// KAN weight storage dtype. Centers / Gauss / knots stay FP32.
@@ -173,6 +205,7 @@ impl Default for TrainConfig {
             mom: MomDtype::Fp32,
             moe_topk: 0,
             moe_aux: default_moe_aux(),
+            kan_factor: KanFactor::SharedEdge,
         }
     }
 }

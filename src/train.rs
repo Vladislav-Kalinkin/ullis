@@ -6,14 +6,14 @@ use clap::Args;
 
 use crate::checkpoint;
 use crate::config::{next_grid_size, TrainConfig};
-use crate::data::{jsonl_corpus_texts, JsonlStream};
+use crate::data::{jsonl_corpus_texts, warn_corpus_homogeneity, JsonlStream};
 use crate::device::{
     device_name, setup_device, setup_device_with, synchronize, Backend, DeviceFlags,
 };
 use crate::model::UllisKan;
 use crate::optim::SgdMomentum;
 use crate::telemetry::{
-    cache_metal_hello_mb, metal_hello_mb, process_memory_mb, TrainFootprint, Throughput,
+    cache_metal_hello_mb, metal_hello_mb, process_memory_mb, Throughput, TrainFootprint,
 };
 use crate::tokenizer::{load_or_train, BpeTokenizer};
 
@@ -48,8 +48,8 @@ pub struct TrainArgs {
     /// Continuous `SovereignFlashBuffer` token-ring cap.
     #[arg(long = "context-len", default_value_t = 32_768)]
     pub context_len: usize,
-    /// Recompute layer interiors on backward (identical grads, ~½ peak RAM).
-    #[arg(long = "fused-grad-ckpt", default_value_t = true, action = clap::ArgAction::Set)]
+    /// Kept for old scripts; fused checkpointing is always on.
+    #[arg(long = "fused-grad-ckpt", default_value_t = true, action = clap::ArgAction::Set, hide = true)]
     pub fused_grad_ckpt: bool,
     #[arg(long, default_value = "shift")]
     pub mixer: String,
@@ -89,7 +89,7 @@ pub struct TrainArgs {
     /// Momentum storage. `fp32` (default) or `q8`.
     #[arg(long, default_value = "fp32")]
     pub mom: String,
-    /// MoE top-k. `0` = dense (bit-identical). `1` or `2` = sparse routed experts.
+    /// MoE top-k. Default `0` = dense (bit-identical). `1|2` = per-token top-k.
     #[arg(long = "moe-topk", default_value_t = 0)]
     pub moe_topk: u32,
     /// Switch load-balance coefficient (only when `--moe-topk` > 0).
@@ -111,7 +111,7 @@ impl TrainArgs {
             batch_size: self.batch_size,
             mixer: self.mixer.clone(),
             vocab_size: self.vocab_size as usize,
-            fused_grad_ckpt: self.fused_grad_ckpt,
+            fused_grad_ckpt: true,
             steps_per_epoch: self.steps,
             epochs_warmup: self.epochs_warmup,
             epochs_sparsify: self.epochs_sparsify,
@@ -176,6 +176,8 @@ pub fn train(args: TrainArgs) -> Result<PathBuf> {
     }
     cfg.moe_topk = args.moe_topk;
     cfg.moe_aux = args.moe_aux;
+    cfg.kan_factor = crate::config::KanFactor::SharedEdge;
+    cfg.fused_grad_ckpt = true;
     cfg.n_basis = cfg.grid_start;
     crate::tokenizer::validate_vocab_size(cfg.vocab_size as u32)?;
     let device = setup_device_with(
@@ -185,10 +187,7 @@ pub fn train(args: TrainArgs) -> Result<PathBuf> {
         },
     )?;
     cache_metal_hello_mb(process_memory_mb());
-    println!(
-        "metal_hello={:.1}MB (rss gate: hello+12)",
-        metal_hello_mb()
-    );
+    println!("metal_hello={:.1}MB (rss gate: hello+12)", metal_hello_mb());
     let tok_path = if cfg.tokenizer_path.is_empty() {
         None
     } else {
@@ -201,11 +200,33 @@ pub fn train(args: TrainArgs) -> Result<PathBuf> {
             data_path.display()
         );
     }
+    println!("corpus: loading {}", data_path.display());
+    warn_corpus_homogeneity(&data_path)?;
+    if cfg.vocab_size > 8192 {
+        let embed_mb = (cfg.vocab_size * cfg.d_model * 4) as f64 / (1024.0 * 1024.0);
+        eprintln!(
+            "warn: V={} embed FP32 ≈ {:.1} MB (×3 with grad+vel). Default quality path is V=8192.",
+            cfg.vocab_size, embed_mb
+        );
+    }
     let texts = jsonl_corpus_texts(&data_path, 8_192)?;
     if texts.is_empty() {
         anyhow::bail!("JSONL corpus is empty: {}", data_path.display());
     }
+    let nchars: usize = texts.iter().map(String::len).sum();
+    println!(
+        "corpus: {} records, {:.1} MB packed text; tokenizer V={}",
+        texts.len(),
+        nchars as f64 / (1024.0 * 1024.0),
+        cfg.vocab_size
+    );
     let tokenizer = load_or_train(cfg.vocab_size as u32, &texts, tok_path, cfg.seed)?;
+    println!(
+        "tokenizer ready: V={} pieces={} merges={}",
+        tokenizer.vocab_size,
+        tokenizer.populated(),
+        tokenizer.merges.len()
+    );
     cfg.vocab_size = tokenizer.vocab_size as usize;
 
     let mut stream = JsonlStream::open_with_cap(
@@ -217,16 +238,22 @@ pub fn train(args: TrainArgs) -> Result<PathBuf> {
     )?;
 
     println!(
-        "device={} vocab={} moe={} topk={} aux={} master={:?} mom={:?} data={} jsonl=v4 {}",
+        "device={} vocab={} moe={} topk={} aux={} kan_factor={:?} master={:?} mom={:?} data={} jsonl=v4 {}",
         device_name(&device),
         tokenizer.vocab_size,
         cfg.moe,
         cfg.moe_topk,
         cfg.moe_aux,
+        cfg.kan_factor,
         cfg.master,
         cfg.mom,
         data_path.display(),
         format_cfg(&cfg)
+    );
+    let n = cfg.batch_size * cfg.seq_len;
+    println!(
+        "ce_gemm n·V·d = {}·{}·{} (chunked sgemm, no [n,V] logits)",
+        n, cfg.vocab_size, cfg.d_model
     );
 
     let mut model = UllisKan::new(cfg.clone(), device)?;
@@ -281,7 +308,7 @@ pub fn train(args: TrainArgs) -> Result<PathBuf> {
                     let avg = running / n_seen.max(1) as f32;
                     let fp = train_footprint(&model, &opt, phase);
                     println!(
-                        "  {name} e{epoch} s{step:04} loss={avg:.4} ce={:.4} H={:.3} Hr={:.3} rss={:.1}MB{} tok/s={:.0} G={} zero={:.2} +={:.2} -={:.2}",
+                        "  {name} e{epoch} s{step:04} loss={avg:.4} ce={:.4} H={:.3} Hr={:.3} rss={:.1}MB{} tok/s={:.0} G={} zero={:.2} +={:.2} -={:.2} fwd={:.1}ms ce={:.1}ms bwd={:.1}ms waits={}",
                         model.last_ce,
                         model.last_entropy,
                         model.last_router_entropy,
@@ -291,7 +318,11 @@ pub fn train(args: TrainArgs) -> Result<PathBuf> {
                         model.cfg.n_basis,
                         stats.frac_zero,
                         stats.frac_pos,
-                        stats.frac_neg
+                        stats.frac_neg,
+                        model.last_fwd_ms,
+                        model.last_ce_ms,
+                        model.last_bwd_ms,
+                        crate::telemetry::take_gpu_waits()
                     );
                     running = 0.0;
                     n_seen = 0;

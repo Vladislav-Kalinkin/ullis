@@ -29,7 +29,7 @@
 //! Grid lift G=4→8→12 samples `M=max(64,16G)` points and solves
 //! `Ψ_newᵀ Ψ_new b' = Ψ_newᵀ Ψ_old b` on-device. Elementwise / broadcast / `cat`
 //! only (no `linalg` CPU fallback on the happy path). Ridge `1e-6 · mean(diag)`,
-//! pivot floor `1e-8`. Host `gauss_jordan_f32` is the G≤16 fallback.
+//! pivot floor `1e-8`. Host `gauss_jordan_f32` is the G≤ fallback.
 //!
 //! Binary: `ullis train | chat | smoke`. License: AGPL-3.0.
 

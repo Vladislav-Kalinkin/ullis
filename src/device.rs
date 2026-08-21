@@ -15,6 +15,8 @@ use rand::rngs::StdRng;
 use rand::SeedableRng;
 
 use crate::accelerate::MobKanSpec;
+#[cfg(target_os = "macos")]
+use crate::telemetry::record_gpu_wait;
 
 pub fn rng_from_seed(seed: u64) -> StdRng {
     StdRng::seed_from_u64(seed)
@@ -323,6 +325,7 @@ impl SovereignDevice {
             enc.end_encoding();
             cmd.commit();
             cmd.wait_until_completed();
+            record_gpu_wait();
             let status = cmd.status();
             if status != metal::MTLCommandBufferStatus::Completed {
                 bail!("fused command buffer status {status:?}");
@@ -395,6 +398,7 @@ impl SovereignDevice {
             enc.end_encoding();
             cmd.commit();
             cmd.wait_until_completed();
+            record_gpu_wait();
             let status = cmd.status();
             if status != metal::MTLCommandBufferStatus::Completed {
                 bail!("fused bwd command buffer status {status:?}");
@@ -451,6 +455,7 @@ impl SovereignDevice {
             enc.end_encoding();
             cmd.commit();
             cmd.wait_until_completed();
+            record_gpu_wait();
             if cmd.status() != metal::MTLCommandBufferStatus::Completed {
                 bail!("i8 embed command status {:?}", cmd.status());
             }
@@ -507,6 +512,7 @@ impl SovereignDevice {
             enc.end_encoding();
             cmd.commit();
             cmd.wait_until_completed();
+            record_gpu_wait();
             if cmd.status() != metal::MTLCommandBufferStatus::Completed {
                 bail!("i8 logits command status {:?}", cmd.status());
             }
@@ -730,7 +736,7 @@ struct MobKanSpec {
     uint out_tile;
     uint n_tile;
     uint topk;
-    uint pad0;
+    uint kan_factor;
     uint pad1;
     uint pad2;
     float inv_width;
@@ -871,6 +877,8 @@ kernel void ullis_mob_kan_fused_step(
     threadgroup float* x_s = scratch;
     threadgroup float* bump_s = scratch + tin_cap;
     threadgroup float* gate_s = scratch + tin_cap + tin_cap * g;
+    threadgroup float* phi_s = gate_s + max(p.k, 1u);
+    threadgroup float* rho_s = phi_s + tin_cap;
 #if ULLIS_FUSED_GRAD_CKPT
     (void)0;
 #endif
@@ -914,6 +922,8 @@ kernel void ullis_mob_kan_fused_step(
     const uint packed = p.packed;
     const uint sh_len = in_f * gs;
     const uint rt_len = in_f * gr;
+    (void)sh_len;
+    (void)rt_len;
 
     for (uint in0 = 0u; in0 < in_f; in0 += tin_cap) {
         uint tin = min(tin_cap, in_f - in0);
@@ -935,49 +945,46 @@ kernel void ullis_mob_kan_fused_step(
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
+        for (uint i = tid; i < tin; i += tpg) {
+            float phi = 0.0f;
+            device const float* ws_i = w_shared + (in0 + i) * gs;
+            float d_sh = (qat != 0u) ? row_delta(ws_i, gs, p.delta_ratio) : 0.0f;
+            float ss = (qat != 0u || packed != 0u) ? scale_shared[in0 + i] : 1.0f;
+            for (uint gi = 0; gi < g_use; ++gi) {
+                phi += bump_s[i * g + gi] * apply_w(ws_i[gi], d_sh, ss, qat, packed);
+            }
+            phi_s[i] = phi;
+            if (routed) {
+                for (uint e = 0; e < k; ++e) {
+                    device const float* wr = w_routed + (e * in_f + in0 + i) * max(gr, 1u);
+                    float d_rt = (qat != 0u) ? row_delta(wr, gr, p.delta_ratio) : 0.0f;
+                    float sr = (qat != 0u || packed != 0u) ? scale_routed[e * in_f + in0 + i] : 1.0f;
+                    float mix = 0.0f;
+                    for (uint gi = 0; gi < gr; ++gi) {
+                        mix += bump_s[i * g + gs + gi] * apply_w(wr[gi], d_rt, sr, qat, packed);
+                    }
+                    rho_s[e * tin_cap + i] = mix;
+                }
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
         for (uint o0 = 0u; o0 < out_f; o0 += otile) {
             uint o_end = min(o0 + otile, out_f);
             for (uint o = o0 + tid; o < o_end; o += tpg) {
                 float acc = (in0 == 0u) ? 0.0f : y[gid * out_f + o];
-
                 device const float* wb = w_base + o * in_f;
                 float d_base = (qat != 0u) ? row_delta(wb, in_f, p.delta_ratio) : 0.0f;
                 float sb = (qat != 0u || packed != 0u) ? scale_base[o] : 1.0f;
                 for (uint i = 0; i < tin; ++i) {
-                    acc += x_s[i] * apply_w(wb[in0 + i], d_base, sb, qat, packed);
-                }
-
-                device const float* ws = w_shared + o * sh_len;
-                float d_sh = (qat != 0u) ? row_delta(ws, sh_len, p.delta_ratio) : 0.0f;
-                float ss = (qat != 0u || packed != 0u) ? scale_shared[o] : 1.0f;
-                for (uint i = 0; i < tin; ++i) {
-                    for (uint gi = 0; gi < g_use; ++gi) {
-                        float b = bump_s[i * g + gi];
-                        float w = ws[(in0 + i) * gs + gi];
-                        acc += b * apply_w(w, d_sh, ss, qat, packed);
-                    }
-                }
-
-                if (routed) {
-                    for (uint e = 0; e < k; ++e) {
-                        if (gate_s[e] <= 0.0f) {
-                            continue;
+                    float u = x_s[i] + phi_s[i];
+                    if (routed) {
+                        for (uint e = 0; e < k; ++e) {
+                            u += gate_s[e] * rho_s[e * tin_cap + i];
                         }
-                        device const float* wr = w_routed + (e * out_f + o) * rt_len;
-                        float d_rt = (qat != 0u) ? row_delta(wr, rt_len, p.delta_ratio) : 0.0f;
-                        float sr = (qat != 0u || packed != 0u) ? scale_routed[e * out_f + o] : 1.0f;
-                        float mix = 0.0f;
-                        for (uint i = 0; i < tin; ++i) {
-                            for (uint gi = 0; gi < gr; ++gi) {
-                                float b = bump_s[i * g + gs + gi];
-                                float w = wr[(in0 + i) * gr + gi];
-                                mix += b * apply_w(w, d_rt, sr, qat, packed);
-                            }
-                        }
-                        acc += gate_s[e] * mix;
                     }
+                    acc += u * apply_w(wb[in0 + i], d_base, sb, qat, packed);
                 }
-
                 y[gid * out_f + o] = acc;
             }
         }
@@ -1036,10 +1043,13 @@ kernel void ullis_mob_kan_fused_bwd(
     threadgroup float* x_s = scratch;
     threadgroup float* bump_s = scratch + tin_cap;
     threadgroup float* gate_s = scratch + tin_cap + tin_cap * g;
+    threadgroup float* phi_s = gate_s + max(p.k, 1u);
+    threadgroup float* rho_s = phi_s + tin_cap;
 
     const uint qat = (p.phase >= 3u && p.packed == 0u) ? 1u : 0u;
     const uint packed = p.packed;
     const uint scale_on = (qat != 0u || packed != 0u) ? 1u : 0u;
+    const uint edge = 1u;
     const bool routed = (p.coarse == 0u) && (gr > 0u) && (k > 0u);
     const uint sh_len = in_f * gs;
     const uint rt_len = in_f * max(gr, 1u);
@@ -1061,11 +1071,11 @@ kernel void ullis_mob_kan_fused_bwd(
     const uint off_dsb = off;
     off += ntg * ot_cap;
     const uint off_dss = off;
-    off += ntg * ot_cap;
+    off += ntg * ot_cap * tin_cap;
     const uint off_dsr = off;
-    off += ntg * k_a * ot_cap;
+    off += ntg * k_a * ot_cap * tin_cap;
     const uint off_dc = off;
-    off += ntg * g;
+    off += ntg * tin_cap * g;
     const uint off_dg = off;
 
     for (uint lt = 0u; lt < tn; ++lt) {
@@ -1115,73 +1125,168 @@ kernel void ullis_mob_kan_fused_bwd(
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
+        if (edge != 0u) {
+            for (uint i = tid0; i < tin; i += tpgx) {
+                float phi = 0.0f;
+                device const float* ws_i = w_shared + (in0 + i) * gs;
+                float d_sh_i = (qat != 0u) ? row_delta(ws_i, gs, p.delta_ratio) : 0.0f;
+                float ssi = (scale_on != 0u) ? scale_shared[in0 + i] : 1.0f;
+                for (uint gi = 0u; gi < g_use; ++gi) {
+                    phi += bump_s[i * g + gi] * qw_of(ws_i[gi], d_sh_i, ssi, qat, packed);
+                }
+                phi_s[i] = phi;
+                if (routed) {
+                    for (uint e = 0u; e < k; ++e) {
+                        device const float* wr = w_routed + (e * in_f + in0 + i) * gr_a;
+                        float d_rt_i = (qat != 0u) ? row_delta(wr, gr, p.delta_ratio) : 0.0f;
+                        float sri = (scale_on != 0u) ? scale_routed[e * in_f + in0 + i] : 1.0f;
+                        float mix = 0.0f;
+                        for (uint gi = 0u; gi < gr; ++gi) {
+                            mix += bump_s[i * g + gs + gi] * qw_of(wr[gi], d_rt_i, sri, qat, packed);
+                        }
+                        rho_s[e * tin_cap + i] = mix;
+                    }
+                }
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+        }
+
         for (uint lo = tid0; lo < otn; lo += tpgx) {
             uint o = o0 + lo;
             float go = dy[t * out_f + o];
             float sbo = (scale_on != 0u) ? scale_base[o] : 1.0f;
-            float sso = (scale_on != 0u) ? scale_shared[o] : 1.0f;
             device const float* wb = w_base + o * in_f;
-            device const float* ws = w_shared + o * sh_len;
             float d_base = (qat != 0u) ? row_delta(wb, in_f, p.delta_ratio) : 0.0f;
-            float d_sh = (qat != 0u) ? row_delta(ws, sh_len, p.delta_ratio) : 0.0f;
             float dsb_acc = 0.0f;
-            float dss_acc = 0.0f;
             device float* pb = part + off_base + (tg * ot_cap + lo) * tin_cap;
             device float* ps = part + off_shared + (tg * ot_cap + lo) * tin_cap * gs_a;
-            for (uint i = 0u; i < tin; ++i) {
-                float xv = x_s[i];
-                float w = wb[in0 + i];
-                float qw = qw_of(w, d_base, sbo, qat, packed);
-                float ste = (qat != 0u) ? ste_w(w) : 1.0f;
-                pb[i] += go * xv * sbo * ste;
-                if (scale_on != 0u) {
-                    float code = (sbo != 0.0f) ? (qw / sbo) : 0.0f;
-                    dsb_acc += go * xv * code;
-                }
-                for (uint gi = 0u; gi < g_use; ++gi) {
-                    float b = bump_s[i * g + gi];
-                    float ww = ws[(in0 + i) * gs + gi];
-                    float qs = qw_of(ww, d_sh, sso, qat, packed);
-                    float ste_s = (qat != 0u) ? ste_w(ww) : 1.0f;
-                    ps[i * gs_a + gi] += go * b * sso * ste_s;
-                    if (scale_on != 0u) {
-                        float code = (sso != 0.0f) ? (qs / sso) : 0.0f;
-                        dss_acc += go * b * code;
-                    }
-                }
-            }
-            part[off_dsb + tg * ot_cap + lo] += dsb_acc;
-            part[off_dss + tg * ot_cap + lo] += dss_acc;
-
-            if (routed) {
-                for (uint e = 0u; e < k; ++e) {
-                    float gate = gate_s[e];
-                    if (gate <= 0.0f) {
-                        continue;
-                    }
-                    float sre = (scale_on != 0u) ? scale_routed[e * out_f + o] : 1.0f;
-                    device const float* wr = w_routed + (e * out_f + o) * rt_len;
-                    float d_rt = (qat != 0u) ? row_delta(wr, rt_len, p.delta_ratio) : 0.0f;
-                    float mix = 0.0f;
-                    float dsr_acc = 0.0f;
-                    device float* pr = part + off_routed
-                        + (((tg * k_a + e) * ot_cap + lo) * tin_cap) * gr_a;
-                    for (uint i = 0u; i < tin; ++i) {
-                        for (uint gi = 0u; gi < gr; ++gi) {
-                            float b = bump_s[i * g + gs + gi];
-                            float ww = wr[(in0 + i) * gr + gi];
-                            float qr = qw_of(ww, d_rt, sre, qat, packed);
-                            float ste_r = (qat != 0u) ? ste_w(ww) : 1.0f;
-                            pr[i * gr_a + gi] += go * gate * b * sre * ste_r;
-                            if (scale_on != 0u) {
-                                float code = (sre != 0.0f) ? (qr / sre) : 0.0f;
-                                dsr_acc += go * gate * b * code;
-                            }
-                            mix += b * qr;
+            if (edge != 0u) {
+                device float* dss_row = part + off_dss + (tg * ot_cap + lo) * tin_cap;
+                for (uint i = 0u; i < tin; ++i) {
+                    float u = x_s[i] + phi_s[i];
+                    if (routed) {
+                        for (uint e = 0u; e < k; ++e) {
+                            u += gate_s[e] * rho_s[e * tin_cap + i];
                         }
                     }
-                    part[off_dsr + (tg * k_a + e) * ot_cap + lo] += dsr_acc;
-                    part[off_dg + (((tg * nt_cap + lt) * ot_cap + lo) * k_a) + e] += go * mix;
+                    float w = wb[in0 + i];
+                    float qw = qw_of(w, d_base, sbo, qat, packed);
+                    float ste = (qat != 0u) ? ste_w(w) : 1.0f;
+                    pb[i] += go * u * sbo * ste;
+                    if (scale_on != 0u) {
+                        float code = (sbo != 0.0f) ? (qw / sbo) : 0.0f;
+                        dsb_acc += go * u * code;
+                    }
+                    float du = go * qw;
+                    device const float* ws_i = w_shared + (in0 + i) * gs;
+                    float d_sh_i = (qat != 0u) ? row_delta(ws_i, gs, p.delta_ratio) : 0.0f;
+                    float ssi = (scale_on != 0u) ? scale_shared[in0 + i] : 1.0f;
+                    for (uint gi = 0u; gi < g_use; ++gi) {
+                        float b = bump_s[i * g + gi];
+                        float ww = ws_i[gi];
+                        float qs = qw_of(ww, d_sh_i, ssi, qat, packed);
+                        float ste_s = (qat != 0u) ? ste_w(ww) : 1.0f;
+                        ps[i * gs_a + gi] += du * b * ssi * ste_s;
+                        if (scale_on != 0u) {
+                            float code = (ssi != 0.0f) ? (qs / ssi) : 0.0f;
+                            dss_row[i] += du * b * code;
+                        }
+                    }
+                }
+                part[off_dsb + tg * ot_cap + lo] += dsb_acc;
+                if (routed) {
+                    for (uint e = 0u; e < k; ++e) {
+                        float gate = gate_s[e];
+                        device float* pr = part + off_routed
+                            + (((tg * k_a + e) * ot_cap + lo) * tin_cap) * gr_a;
+                        device float* dsr_row = part + off_dsr
+                            + ((tg * k_a + e) * ot_cap + lo) * tin_cap;
+                        float mix_dg = 0.0f;
+                        for (uint i = 0u; i < tin; ++i) {
+                            float qw = qw_of(wb[in0 + i], d_base, sbo, qat, packed);
+                            float du = go * qw;
+                            mix_dg += du * rho_s[e * tin_cap + i];
+                            if (gate <= 0.0f) {
+                                continue;
+                            }
+                            device const float* wr = w_routed + (e * in_f + in0 + i) * gr_a;
+                            float d_rt_i = (qat != 0u) ? row_delta(wr, gr, p.delta_ratio) : 0.0f;
+                            float sri = (scale_on != 0u) ? scale_routed[e * in_f + in0 + i] : 1.0f;
+                            for (uint gi = 0u; gi < gr; ++gi) {
+                                float b = bump_s[i * g + gs + gi];
+                                float ww = wr[gi];
+                                float qr = qw_of(ww, d_rt_i, sri, qat, packed);
+                                float ste_r = (qat != 0u) ? ste_w(ww) : 1.0f;
+                                pr[i * gr_a + gi] += du * gate * b * sri * ste_r;
+                                if (scale_on != 0u) {
+                                    float code = (sri != 0.0f) ? (qr / sri) : 0.0f;
+                                    dsr_row[i] += du * gate * b * code;
+                                }
+                            }
+                        }
+                        part[off_dg + (((tg * nt_cap + lt) * ot_cap + lo) * k_a) + e] += mix_dg;
+                    }
+                }
+            } else {
+                float sso = (scale_on != 0u) ? scale_shared[o] : 1.0f;
+                device const float* ws = w_shared + o * sh_len;
+                float d_sh = (qat != 0u) ? row_delta(ws, sh_len, p.delta_ratio) : 0.0f;
+                float dss_acc = 0.0f;
+                for (uint i = 0u; i < tin; ++i) {
+                    float xv = x_s[i];
+                    float w = wb[in0 + i];
+                    float qw = qw_of(w, d_base, sbo, qat, packed);
+                    float ste = (qat != 0u) ? ste_w(w) : 1.0f;
+                    pb[i] += go * xv * sbo * ste;
+                    if (scale_on != 0u) {
+                        float code = (sbo != 0.0f) ? (qw / sbo) : 0.0f;
+                        dsb_acc += go * xv * code;
+                    }
+                    for (uint gi = 0u; gi < g_use; ++gi) {
+                        float b = bump_s[i * g + gi];
+                        float ww = ws[(in0 + i) * gs + gi];
+                        float qs = qw_of(ww, d_sh, sso, qat, packed);
+                        float ste_s = (qat != 0u) ? ste_w(ww) : 1.0f;
+                        ps[i * gs_a + gi] += go * b * sso * ste_s;
+                        if (scale_on != 0u) {
+                            float code = (sso != 0.0f) ? (qs / sso) : 0.0f;
+                            dss_acc += go * b * code;
+                        }
+                    }
+                }
+                part[off_dsb + tg * ot_cap + lo] += dsb_acc;
+                part[off_dss + tg * ot_cap + lo] += dss_acc;
+
+                if (routed) {
+                    for (uint e = 0u; e < k; ++e) {
+                        float gate = gate_s[e];
+                        if (gate <= 0.0f) {
+                            continue;
+                        }
+                        float sre = (scale_on != 0u) ? scale_routed[e * out_f + o] : 1.0f;
+                        device const float* wr = w_routed + (e * out_f + o) * rt_len;
+                        float d_rt = (qat != 0u) ? row_delta(wr, rt_len, p.delta_ratio) : 0.0f;
+                        float mix = 0.0f;
+                        float dsr_acc = 0.0f;
+                        device float* pr = part + off_routed
+                            + (((tg * k_a + e) * ot_cap + lo) * tin_cap) * gr_a;
+                        for (uint i = 0u; i < tin; ++i) {
+                            for (uint gi = 0u; gi < gr; ++gi) {
+                                float b = bump_s[i * g + gs + gi];
+                                float ww = wr[(in0 + i) * gr + gi];
+                                float qr = qw_of(ww, d_rt, sre, qat, packed);
+                                float ste_r = (qat != 0u) ? ste_w(ww) : 1.0f;
+                                pr[i * gr_a + gi] += go * gate * b * sre * ste_r;
+                                if (scale_on != 0u) {
+                                    float code = (sre != 0.0f) ? (qr / sre) : 0.0f;
+                                    dsr_acc += go * gate * b * code;
+                                }
+                                mix += b * qr;
+                            }
+                        }
+                        part[off_dsr + (tg * k_a + e) * ot_cap + lo] += dsr_acc;
+                        part[off_dg + (((tg * nt_cap + lt) * ot_cap + lo) * k_a) + e] += go * mix;
+                    }
                 }
             }
         }
@@ -1194,27 +1299,26 @@ kernel void ullis_mob_kan_fused_bwd(
             for (uint gi = 0u; gi < g; ++gi) {
                 dc_add[gi] = 0.0f;
             }
-            for (uint lo = 0u; lo < otn; ++lo) {
-                uint o = o0 + lo;
-                float go = dy[t * out_f + o];
-                float sbo = (scale_on != 0u) ? scale_base[o] : 1.0f;
-                float sso = (scale_on != 0u) ? scale_shared[o] : 1.0f;
-                device const float* wb = w_base + o * in_f;
-                device const float* ws = w_shared + o * sh_len;
-                float d_base = (qat != 0u) ? row_delta(wb, in_f, p.delta_ratio) : 0.0f;
-                float d_sh = (qat != 0u) ? row_delta(ws, sh_len, p.delta_ratio) : 0.0f;
-                float qw = qw_of(wb[in0 + i], d_base, sbo, qat, packed);
-                acc += go * qw;
+            if (edge != 0u) {
+                for (uint lo = 0u; lo < otn; ++lo) {
+                    uint o = o0 + lo;
+                    float go = dy[t * out_f + o];
+                    float sbo = (scale_on != 0u) ? scale_base[o] : 1.0f;
+                    device const float* wb = w_base + o * in_f;
+                    float d_base = (qat != 0u) ? row_delta(wb, in_f, p.delta_ratio) : 0.0f;
+                    acc += go * qw_of(wb[in0 + i], d_base, sbo, qat, packed);
+                }
+                float du = acc;
+                device const float* ws_i = w_shared + (in0 + i) * gs;
+                float d_sh_i = (qat != 0u) ? row_delta(ws_i, gs, p.delta_ratio) : 0.0f;
+                float ssi = (scale_on != 0u) ? scale_shared[in0 + i] : 1.0f;
                 for (uint gi = 0u; gi < g_use; ++gi) {
-                    float b = bump_s[i * g + gi];
-                    (void)b;
-                    float ww = ws[(in0 + i) * gs + gi];
-                    float qs = qw_of(ww, d_sh, sso, qat, packed);
+                    float qs = qw_of(ws_i[gi], d_sh_i, ssi, qat, packed);
                     float inv = inv_widths[gi];
                     if (inv <= 0.0f || !isfinite(inv)) {
                         inv = p.inv_width;
                     }
-                    bump_pair(xv, centers[gi], inv, go * qs, &acc, &dc_add[gi]);
+                    bump_pair(xv, centers[gi], inv, du * qs, &acc, &dc_add[gi]);
                 }
                 if (routed) {
                     for (uint e = 0u; e < k; ++e) {
@@ -1222,12 +1326,11 @@ kernel void ullis_mob_kan_fused_bwd(
                         if (gate <= 0.0f) {
                             continue;
                         }
-                        float sre = (scale_on != 0u) ? scale_routed[e * out_f + o] : 1.0f;
-                        device const float* wr = w_routed + (e * out_f + o) * rt_len;
-                        float d_rt = (qat != 0u) ? row_delta(wr, rt_len, p.delta_ratio) : 0.0f;
+                        device const float* wr = w_routed + (e * in_f + in0 + i) * gr_a;
+                        float d_rt_i = (qat != 0u) ? row_delta(wr, gr, p.delta_ratio) : 0.0f;
+                        float sri = (scale_on != 0u) ? scale_routed[e * in_f + in0 + i] : 1.0f;
                         for (uint gi = 0u; gi < gr; ++gi) {
-                            float ww = wr[(in0 + i) * gr + gi];
-                            float qr = qw_of(ww, d_rt, sre, qat, packed);
+                            float qr = qw_of(wr[gi], d_rt_i, sri, qat, packed);
                             float inv = inv_widths[gs + gi];
                             if (inv <= 0.0f || !isfinite(inv)) {
                                 inv = p.inv_width;
@@ -1236,65 +1339,69 @@ kernel void ullis_mob_kan_fused_bwd(
                                 xv,
                                 centers[gs + gi],
                                 inv,
-                                go * gate * qr,
+                                du * gate * qr,
                                 &acc,
                                 &dc_add[gs + gi]
                             );
                         }
                     }
                 }
-            }
-            part[off_dx + (tg * nt_cap + lt) * tin_cap + i] += acc;
-            for (uint gi = 0u; gi < g; ++gi) {
-                // Unique (tg, i, gi) writers still race on dc[tg, gi] across i.
-                // Reduce into per-thread then tid-0 isn't available; use the
-                // dx-owner i loop and atomic-free slot (tg, gi) via serial i on tid0 after.
-                (void)dc_add[gi];
-            }
-        }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-
-        if (tid0 == 0u) {
-            for (uint gi = 0u; gi < g; ++gi) {
-                float dc = 0.0f;
-                float inv = inv_widths[gi];
-                if (inv <= 0.0f || !isfinite(inv)) {
-                    inv = p.inv_width;
-                }
-                for (uint i = 0u; i < tin; ++i) {
-                    float xv = x_s[i];
-                    for (uint lo = 0u; lo < otn; ++lo) {
-                        uint o = o0 + lo;
-                        float go = dy[t * out_f + o];
-                        if (gi < g_use) {
-                            float sso = (scale_on != 0u) ? scale_shared[o] : 1.0f;
-                            device const float* ws = w_shared + o * sh_len;
-                            float d_sh = (qat != 0u) ? row_delta(ws, sh_len, p.delta_ratio) : 0.0f;
-                            float ww = ws[(in0 + i) * gs + gi];
-                            float qs = qw_of(ww, d_sh, sso, qat, packed);
-                            float dummy = 0.0f;
-                            bump_pair(xv, centers[gi], inv, go * qs, &dummy, &dc);
-                        } else if (routed && gi >= gs) {
-                            uint rgi = gi - gs;
-                            if (rgi < gr) {
-                                for (uint e = 0u; e < k; ++e) {
-                                    float gate = gate_s[e];
-                                    if (gate <= 0.0f) {
-                                        continue;
-                                    }
-                                    float sre = (scale_on != 0u) ? scale_routed[e * out_f + o] : 1.0f;
-                                    device const float* wr = w_routed + (e * out_f + o) * rt_len;
-                                    float d_rt = (qat != 0u) ? row_delta(wr, rt_len, p.delta_ratio) : 0.0f;
-                                    float ww = wr[(in0 + i) * gr + rgi];
-                                    float qr = qw_of(ww, d_rt, sre, qat, packed);
-                                    float dummy = 0.0f;
-                                    bump_pair(xv, centers[gi], inv, go * gate * qr, &dummy, &dc);
+            } else {
+                for (uint lo = 0u; lo < otn; ++lo) {
+                    uint o = o0 + lo;
+                    float go = dy[t * out_f + o];
+                    float sbo = (scale_on != 0u) ? scale_base[o] : 1.0f;
+                    float sso = (scale_on != 0u) ? scale_shared[o] : 1.0f;
+                    device const float* wb = w_base + o * in_f;
+                    device const float* ws = w_shared + o * sh_len;
+                    float d_base = (qat != 0u) ? row_delta(wb, in_f, p.delta_ratio) : 0.0f;
+                    float d_sh = (qat != 0u) ? row_delta(ws, sh_len, p.delta_ratio) : 0.0f;
+                    float qw = qw_of(wb[in0 + i], d_base, sbo, qat, packed);
+                    acc += go * qw;
+                    for (uint gi = 0u; gi < g_use; ++gi) {
+                        float b = bump_s[i * g + gi];
+                        (void)b;
+                        float ww = ws[(in0 + i) * gs + gi];
+                        float qs = qw_of(ww, d_sh, sso, qat, packed);
+                        float inv = inv_widths[gi];
+                        if (inv <= 0.0f || !isfinite(inv)) {
+                            inv = p.inv_width;
+                        }
+                        bump_pair(xv, centers[gi], inv, go * qs, &acc, &dc_add[gi]);
+                    }
+                    if (routed) {
+                        for (uint e = 0u; e < k; ++e) {
+                            float gate = gate_s[e];
+                            if (gate <= 0.0f) {
+                                continue;
+                            }
+                            float sre = (scale_on != 0u) ? scale_routed[e * out_f + o] : 1.0f;
+                            device const float* wr = w_routed + (e * out_f + o) * rt_len;
+                            float d_rt = (qat != 0u) ? row_delta(wr, rt_len, p.delta_ratio) : 0.0f;
+                            for (uint gi = 0u; gi < gr; ++gi) {
+                                float ww = wr[(in0 + i) * gr + gi];
+                                float qr = qw_of(ww, d_rt, sre, qat, packed);
+                                float inv = inv_widths[gs + gi];
+                                if (inv <= 0.0f || !isfinite(inv)) {
+                                    inv = p.inv_width;
                                 }
+                                bump_pair(
+                                    xv,
+                                    centers[gs + gi],
+                                    inv,
+                                    go * gate * qr,
+                                    &acc,
+                                    &dc_add[gs + gi]
+                                );
                             }
                         }
                     }
                 }
-                part[off_dc + tg * g + gi] += dc;
+            }
+            part[off_dx + (tg * nt_cap + lt) * tin_cap + i] += acc;
+            device float* dc_row = part + off_dc + (tg * tin_cap + i) * g;
+            for (uint gi = 0u; gi < g; ++gi) {
+                dc_row[gi] += dc_add[gi];
             }
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -1431,7 +1538,7 @@ mod tests {
         let centers = vec![-2.0f32, -0.66, 0.66, 2.0];
         let inv_widths = crate::accelerate::bump_inv_widths(&centers);
         let scale_base = vec![1.0f32; spec.scale_vec_len()];
-        let scale_shared = vec![1.0f32; spec.scale_vec_len()];
+        let scale_shared = vec![1.0f32; spec.scale_shared_len()];
         let scale_routed = vec![1.0f32; spec.scale_routed_len()];
         let mut y_cpu = vec![0.0f32; spec.y_len()];
         mob_kan_fused_cpu(
@@ -1514,7 +1621,7 @@ mod tests {
         let centers = vec![-2.0f32, -0.66, 0.66, 2.0];
         let inv_widths = crate::accelerate::bump_inv_widths(&centers);
         let scale_base = vec![1.0f32; spec.scale_vec_len()];
-        let scale_shared = vec![1.0f32; spec.scale_vec_len()];
+        let scale_shared = vec![1.0f32; spec.scale_shared_len()];
         let scale_routed = vec![1.0f32; spec.scale_routed_len()];
         let mut y_cpu = vec![0.0f32; spec.y_len()];
         mob_kan_fused_cpu(

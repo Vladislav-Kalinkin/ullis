@@ -3,15 +3,15 @@ use std::mem::size_of_val;
 use anyhow::{bail, Result};
 
 use crate::accelerate::sgemm_nt;
-use crate::config::{MasterDtype, TrainConfig};
-use crate::kan::stored_f32;
-use crate::quant::{pack_f16, unpack_f16};
+use crate::config::{KanFactor, MasterDtype, TrainConfig};
 use crate::device::SovereignDevice;
+use crate::kan::stored_f32;
 use crate::kan::{KanEvalMode, NamedBlob, TernaryKanLinear};
 use crate::mixers::{
     causal_shift_backward_into, causal_shift_into, embed_lookup_into, embed_scatter_acc, randn,
     rmsnorm, rmsnorm_backward_into, rmsnorm_into, streamed_tied_ce_acc, CausalAttention,
 };
+use crate::quant::{pack_f16, unpack_f16};
 use crate::quant::{tied_logits_i8, PackedI8Matrix, TernaryHist, TrainStepGuard};
 use crate::tensor::SovereignTensor;
 use crate::tokenizer::{BpeTokenizer, StreamDecoder};
@@ -206,6 +206,9 @@ impl KanBlock {
         ff.knot_ema = cfg.knot_ema as f32;
         ff.moe_topk = cfg.moe_topk;
         ff.moe_aux = cfg.moe_aux as f32;
+        if cfg.kan_factor != KanFactor::SharedEdge {
+            bail!("unfactored KAN was removed; shared-edge is the only layout");
+        }
         Ok(Self {
             n1: RmsNorm::new(cfg.d_model)?,
             n2: RmsNorm::new(cfg.d_model)?,
@@ -459,6 +462,9 @@ pub struct UllisKan {
     pub last_entropy: f32,
     pub last_router_entropy: f32,
     pub last_aux: f32,
+    pub last_fwd_ms: f32,
+    pub last_ce_ms: f32,
+    pub last_bwd_ms: f32,
 }
 
 impl UllisKan {
@@ -495,6 +501,9 @@ impl UllisKan {
             last_entropy: 0.0,
             last_router_entropy: 0.0,
             last_aux: 0.0,
+            last_fwd_ms: 0.0,
+            last_ce_ms: 0.0,
+            last_bwd_ms: 0.0,
         })
     }
 
@@ -718,10 +727,15 @@ impl UllisKan {
     ) -> Result<f32> {
         let _guard = TrainStepGuard::enter();
         self.zero_grad();
+        for blk in &mut self.blocks {
+            blk.ff.set_hot_fp32(true)?;
+        }
         let v = self.cfg.vocab_size;
         let d = self.cfg.d_model;
         let n = b * t;
+        let t_fwd = std::time::Instant::now();
         let _hidden = self.forward_hidden(ids, b, t, KanEvalMode::Full, true)?;
+        self.last_fwd_ms = t_fwd.elapsed().as_secs_f32() * 1e3;
         let entropy_coef = self.cfg.entropy_coef as f32;
         let tape = self
             .tape
@@ -729,6 +743,7 @@ impl UllisKan {
             .ok_or_else(|| anyhow::anyhow!("missing tape"))?;
         ensure_nd(&mut self.ws.dh, n, d);
         ensure_nd(&mut self.ws.vocab_row, v, 1);
+        let t_ce = std::time::Instant::now();
         let (mut loss, mean_h) = streamed_tied_ce_acc(
             &tape.hidden,
             self.embed.as_slice(),
@@ -742,6 +757,7 @@ impl UllisKan {
             &mut self.embed_grad,
             &mut self.ws.vocab_row,
         )?;
+        self.last_ce_ms = t_ce.elapsed().as_secs_f32() * 1e3;
         self.last_ce = loss - entropy_coef.max(0.0) * mean_h;
         self.last_entropy = mean_h;
         if l1 > 0.0 {
@@ -765,6 +781,7 @@ impl UllisKan {
         )?;
         add_assign(&mut self.norm.grad, &dw);
         let gpu = &self.device;
+        let t_bwd = std::time::Instant::now();
         if tape.checkpointed {
             // Cheap rematerialize of RMS+mixer; fused bwd rematerializes ψ in TG
             // scratch. Resonance loops > 1 still re-run the full fused forward.
@@ -814,6 +831,10 @@ impl UllisKan {
         }
         self.last_aux = if an == 0 { 0.0 } else { aux / an as f32 };
         loss += self.last_aux;
+        self.last_bwd_ms = t_bwd.elapsed().as_secs_f32() * 1e3;
+        for blk in &mut self.blocks {
+            blk.ff.set_hot_fp32(false)?;
+        }
         Ok(loss)
     }
 
@@ -902,7 +923,10 @@ impl UllisKan {
         };
         let t = ctx.len().max(1);
         let hidden = self.forward_hidden(ctx, 1, t, mode, false)?;
-        let last = self.project_logits_last(&hidden, t)?;
+        let mut last = self.project_logits_last(&hidden, t)?;
+        if self.cfg.d_model <= 64 {
+            ban_unigram_run(&mut last, ctx, 8);
+        }
         Ok(sample_logits(&last, temperature, rng))
     }
 
@@ -956,8 +980,12 @@ impl UllisKan {
             total += b.ff.inv_widths.numel();
         }
         format!(
-            "params={total} packed={packed} d={} L={} G={g} V={} moe={}",
-            self.cfg.d_model, self.cfg.n_layers, self.cfg.vocab_size, self.cfg.moe
+            "params={total} packed={packed} d={} L={} G={g} V={} moe={} kan_factor={:?}",
+            self.cfg.d_model,
+            self.cfg.n_layers,
+            self.cfg.vocab_size,
+            self.cfg.moe,
+            self.cfg.kan_factor
         )
     }
 
@@ -1110,7 +1138,13 @@ impl UllisKan {
             f(&n2, b.n2.weight.as_slice(), &b.n2.grad);
             if kan_train_weights(b.ff.packed, phase) {
                 let nm = format!("blocks.{i}.ff.weight_base");
-                visit_stored(&nm, &b.ff.weight_base, &b.ff.f16_base, &b.ff.grad_base, &mut f);
+                visit_stored(
+                    &nm,
+                    &b.ff.weight_base,
+                    &b.ff.f16_base,
+                    &b.ff.grad_base,
+                    &mut f,
+                );
                 let nm = format!("blocks.{i}.ff.weight_shared");
                 visit_stored(
                     &nm,
@@ -1128,7 +1162,13 @@ impl UllisKan {
                     &mut f,
                 );
                 let nm = format!("blocks.{i}.ff.router");
-                visit_stored(&nm, &b.ff.router, &b.ff.f16_router, &b.ff.grad_router, &mut f);
+                visit_stored(
+                    &nm,
+                    &b.ff.router,
+                    &b.ff.f16_router,
+                    &b.ff.grad_router,
+                    &mut f,
+                );
                 if kan_train_centers(b.ff.packed, phase) {
                     let nm = format!("blocks.{i}.ff.centers");
                     f(&nm, b.ff.centers.as_slice(), &b.ff.grad_centers);
@@ -1317,6 +1357,20 @@ fn push_named(out: &mut Vec<(String, NamedBlob)>, name: &str, t: &SovereignTenso
     ));
 }
 
+fn ban_unigram_run(logits: &mut [f32], ctx: &[u32], run: usize) {
+    if run == 0 || ctx.len() < run {
+        return;
+    }
+    let last = ctx[ctx.len() - 1];
+    if !ctx[ctx.len() - run..].iter().all(|&t| t == last) {
+        return;
+    }
+    let i = last as usize;
+    if i < logits.len() {
+        logits[i] = f32::NEG_INFINITY;
+    }
+}
+
 fn sample_logits(logits: &[f32], temperature: f32, rng: &mut impl rand::Rng) -> u32 {
     if temperature <= 0.0 {
         let (i, _) = logits
@@ -1345,6 +1399,18 @@ fn sample_logits(logits: &[f32], temperature: f32, rng: &mut impl rand::Rng) -> 
 mod tests {
     use super::*;
     use crate::device::SovereignDevice;
+
+    #[test]
+    fn unigram_run_ban_blocks_repeated_id() {
+        let mut logits = vec![0.0f32; 6];
+        logits[4] = 12.0;
+        ban_unigram_run(&mut logits, &[4, 4, 4, 4, 4, 4, 4, 4], 8);
+        assert!(logits[4].is_infinite() && logits[4] < 0.0);
+        let mut logits = vec![0.0f32; 6];
+        logits[4] = 12.0;
+        ban_unigram_run(&mut logits, &[4, 4, 1, 4, 4, 4, 4, 4], 8);
+        assert_eq!(logits[4], 12.0);
+    }
 
     #[test]
     fn forward_shapes() {

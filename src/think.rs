@@ -48,10 +48,8 @@ impl ThinkingMode {
     pub fn kan_mode(self) -> KanEvalMode {
         match self {
             Self::Low => KanEvalMode::Coarse,
-            Self::Medium | Self::High => KanEvalMode::Full,
-            Self::Xhigh => KanEvalMode::Resonant {
-                loops: XHIGH_RESONANCE_LOOPS,
-            },
+            // xhigh is a longer token budget, not extra untrained KAN loops.
+            Self::Medium | Self::High | Self::Xhigh => KanEvalMode::Full,
         }
     }
 }
@@ -71,9 +69,6 @@ impl FromStr for ThinkingMode {
         }
     }
 }
-
-/// Extra residual KAN passes per block at `xhigh` (mixer runs once).
-pub const XHIGH_RESONANCE_LOOPS: u8 = 3;
 
 /// Hard cap on persisted dialogue characters — independent of thinking depth.
 pub const DIALOGUE_CHAR_CAP: usize = 3_072;
@@ -349,5 +344,10 @@ mod tests {
             }
             assert_eq!(ThinkingMode::Low.think_budget(seq), 0);
         }
+        assert_eq!(
+            ThinkingMode::Xhigh.kan_mode(),
+            KanEvalMode::Full,
+            "xhigh must match train (Full), not untrained Resonant loops"
+        );
     }
 }

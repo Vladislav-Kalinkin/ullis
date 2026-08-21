@@ -5,6 +5,7 @@
 //! streams in bold green. `ReasoningScratch::clear` runs the instant the
 //! visible stream ends — thinking never enters `DialogueCache`.
 
+use std::collections::HashSet;
 use std::fs::File;
 use std::io::{self, IsTerminal, Read, Write};
 use std::path::{Path, PathBuf};
@@ -17,7 +18,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::checkpoint;
 use crate::data::{
-    pack_record, SovereignFlashBuffer, TAG_OUTPUT, TAG_SYSTEM, TAG_THINKING, TAG_THINK_END, TAG_USER,
+    pack_record, SovereignFlashBuffer, TAG_OUTPUT, TAG_SYSTEM, TAG_THINKING, TAG_THINK_END,
+    TAG_USER,
 };
 use crate::device::{device_name, setup_device, synchronize};
 use crate::kan::KanEvalMode;
@@ -350,11 +352,13 @@ fn stream_turn(
     trim_ctx(&mut ctx, model.cfg.seq_len);
 
     let mut emitted = 0usize;
+    let mut gen_ids: Vec<u32> = Vec::new();
     if think_budget > 0 {
         let mut dec = StreamDecoder::new(tokenizer);
         for _ in 0..think_budget {
             let nxt = model.next_token(&ctx, temperature, kan_mode, &mut rng)?;
             ctx.push(nxt);
+            gen_ids.push(nxt);
             scratch.push_token(nxt);
             emitted += 1;
             let piece = dec.push(nxt);
@@ -362,7 +366,11 @@ fn stream_turn(
                 scratch.push_text(&piece);
                 emit_ops(&mut stdout, color, &paint.feed(&piece))?;
             }
-            if nxt == eos || thinking_closed(scratch.text()) {
+            if nxt == eos
+                || thinking_closed(scratch.text())
+                || piece.contains(TAG_THINK_END)
+                || piece.contains(TAG_OUTPUT)
+            {
                 break;
             }
         }
@@ -398,12 +406,15 @@ fn stream_turn(
         color,
         &mut rng,
         &mut stdout,
+        &mut gen_ids,
     )?;
     emitted += n_out;
     emit_ops(&mut stdout, color, &[PaintOp::Reset])?;
     stdout.flush()?;
     println!();
 
+    let think_closed =
+        think_budget == 0 || thinking_closed(scratch.text()) || paint.lane == Lane::Output;
     // Persist the continuous token ring, then GC think scratch.
     session.absorb_ctx(&ctx);
     session.flash.bind_metal(&model.device).ok();
@@ -418,8 +429,9 @@ fn stream_turn(
 
     let dt = t0.elapsed().as_secs_f64().max(1e-9);
     let stats = model.ternary_stats().unwrap_or_default();
+    let (max_run, uniq) = decode_token_stats(&gen_ids);
     println!(
-        "  └ {emitted} tok  {:.1} tok/s  rss={:.1}MB  think={}  zero={:.2} +={:.2} -={:.2}",
+        "  └ {emitted} tok  {:.1} tok/s  rss={:.1}MB  think={}  zero={:.2} +={:.2} -={:.2} uniq={uniq:.2} run={max_run} closed={think_closed}",
         emitted as f64 / dt,
         process_memory_mb(),
         thinking.as_str(),
@@ -437,6 +449,24 @@ fn trim_ctx(ctx: &mut Vec<u32>, seq_len: usize) {
     }
 }
 
+fn decode_token_stats(ids: &[u32]) -> (usize, f32) {
+    if ids.is_empty() {
+        return (0, 0.0);
+    }
+    let mut max_run = 1usize;
+    let mut run = 1usize;
+    for w in ids.windows(2) {
+        if w[0] == w[1] {
+            run += 1;
+            max_run = max_run.max(run);
+        } else {
+            run = 1;
+        }
+    }
+    let uniq = ids.iter().copied().collect::<HashSet<_>>().len();
+    (max_run, uniq as f32 / ids.len() as f32)
+}
+
 fn color_stream(
     model: &mut UllisKan,
     tokenizer: &BpeTokenizer,
@@ -449,12 +479,14 @@ fn color_stream(
     color: bool,
     rng: &mut impl rand::Rng,
     stdout: &mut impl Write,
+    gen_ids: &mut Vec<u32>,
 ) -> Result<(String, usize)> {
     let mut dec = StreamDecoder::new(tokenizer);
     let mut emitted = 0usize;
     for _ in 0..max_new {
         let nxt = model.next_token(ctx, temperature, mode, rng)?;
         ctx.push(nxt);
+        gen_ids.push(nxt);
         emitted += 1;
         let piece = dec.push(nxt);
         if !piece.is_empty() {
