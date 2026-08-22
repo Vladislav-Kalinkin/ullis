@@ -135,6 +135,8 @@ pub struct UllisMemory {
     pub last_bwd_ms: f32,
     pub device: SovereignDevice,
     tapes: Vec<BlockTape>,
+    /// Reused slot tables; reset each forward. Shape follows `(B, S, D)`.
+    slot_state: Vec<SlotState>,
 }
 
 impl UllisMemory {
@@ -156,6 +158,9 @@ impl UllisMemory {
         let n_layers = cfg.n_layers.max(1);
         let blocks = (0..n_layers)
             .map(|i| MemoryBlock::new(&cfg, i, rng))
+            .collect::<Vec<_>>();
+        let slot_state = (0..n_layers)
+            .map(|_| SlotState::new(cfg.batch_size.max(1), cfg.n_slots.max(1), d))
             .collect();
         Ok(Self {
             cfg,
@@ -172,6 +177,7 @@ impl UllisMemory {
             last_bwd_ms: 0.0,
             device,
             tapes: Vec::new(),
+            slot_state,
         })
     }
 
@@ -223,41 +229,45 @@ impl UllisMemory {
     ) -> Result<Vec<f32>> {
         let d = self.cfg.d_model;
         let n = b * t;
-        let blk = &self.blocks[li];
-        let mut n1 = vec![0.0f32; n * d];
-        rmsnorm_into(x, n, d, &blk.n1.weight, blk.n1.eps, &mut n1)?;
-        let mut had = vec![0.0f32; n * d];
-        fwht_rows(&n1, n, d, &mut had)?;
-        let (h_scan, scan_tape, _) = scan_forward(&blk.scan, &had, b, t, None)?;
-        let mut after = vec![0.0f32; n * d];
-        for i in 0..n * d {
-            after[i] = x[i] + h_scan[i];
-        }
-        let mut n2 = vec![0.0f32; n * d];
-        rmsnorm_into(&after, n, d, &blk.n2.weight, blk.n2.eps, &mut n2)?;
         let k = self.cfg.moe_topk.max(1) as usize;
         let gpu = if self.device.is_metal() {
             Some(&self.device)
         } else {
             None
         };
-        let (ff, moe) = moe_forward(&blk.experts, &blk.router, &n2, n, d, k, gpu)?;
-        let mut after_ff = vec![0.0f32; n * d];
-        for i in 0..n * d {
-            after_ff[i] = after[i] + ff[i];
-        }
-        let (y, slot_tape, after_ff_tape) = if let Some(sp) = blk.slots.as_ref() {
+        let (after, scan_tape, moe, after_ff) = {
+            let blk = &self.blocks[li];
+            let mut n1 = vec![0.0f32; n * d];
+            rmsnorm_into(x, n, d, &blk.n1.weight, blk.n1.eps, &mut n1)?;
+            let mut had = vec![0.0f32; n * d];
+            fwht_rows(&n1, n, d, &mut had)?;
+            let (h_scan, scan_tape, _) = scan_forward(&blk.scan, &had, b, t, None)?;
+            let mut after = vec![0.0f32; n * d];
+            for i in 0..n * d {
+                after[i] = x[i] + h_scan[i];
+            }
+            let mut n2 = vec![0.0f32; n * d];
+            rmsnorm_into(&after, n, d, &blk.n2.weight, blk.n2.eps, &mut n2)?;
+            let (ff, moe) = moe_forward(&blk.experts, &blk.router, &n2, n, d, k, gpu)?;
+            let mut after_ff = vec![0.0f32; n * d];
+            for i in 0..n * d {
+                after_ff[i] = after[i] + ff[i];
+            }
+            (after, scan_tape, moe, after_ff)
+        };
+        let (y, slot_tape, after_ff_tape) = if self.blocks[li].slots.is_some() {
             let mut slot_n = vec![0.0f32; n * d];
-            rmsnorm_into(
-                &after_ff,
-                n,
-                d,
-                &blk.n_slot.weight,
-                blk.n_slot.eps,
-                &mut slot_n,
+            {
+                let ns = &self.blocks[li].n_slot;
+                rmsnorm_into(&after_ff, n, d, &ns.weight, ns.eps, &mut slot_n)?;
+            }
+            let (sv, tp) = slots_forward(
+                self.blocks[li].slots.as_ref().expect("slot params"),
+                &slot_n,
+                b,
+                t,
+                &mut self.slot_state[li],
             )?;
-            let mut st = SlotState::new(b, self.cfg.n_slots, d);
-            let (sv, tp) = slots_forward(sp, &slot_n, b, t, &mut st)?;
             let mut out = after_ff.clone();
             for i in 0..n * d {
                 out[i] += sv[i];
