@@ -598,6 +598,391 @@ fn qat_then_pack_keeps_c5() {
     assert!(zeros < 0.99, "packed all-zero {zeros:.2}");
 }
 
+fn load_tiny_overfit() -> Vec<ullis::data::ChatRecord> {
+    let raw = std::fs::read_to_string("data/tiny-overfit.jsonl").expect("data/tiny-overfit.jsonl");
+    raw.lines()
+        .filter(|l| !l.trim().is_empty())
+        .map(|l| {
+            ullis::data::parse_jsonl_line(l).unwrap_or_else(|| panic!("bad jsonl line: {l}"))
+        })
+        .collect()
+}
+
+fn pad_lm(
+    ids: &[u32],
+    mask: &[u8],
+    seq_len: usize,
+    eos: u32,
+) -> (Vec<u32>, Vec<u32>, Vec<u8>) {
+    let need = seq_len + 1;
+    let mut seq = ids.to_vec();
+    let mut m = mask.to_vec();
+    while seq.len() < need {
+        seq.push(eos);
+        m.push(0);
+    }
+    seq.truncate(need);
+    m.truncate(need);
+    (
+        seq[..seq_len].to_vec(),
+        seq[1..].to_vec(),
+        m[1..].to_vec(),
+    )
+}
+
+fn greedy_from_prefix(model: &UllisMemory, tok: &ullis::tokenizer::BpeTokenizer, prefix: &[u32]) -> String {
+    let mut caches = model.new_cache();
+    let mut hidden = Vec::new();
+    for (pos, &id) in prefix.iter().enumerate() {
+        hidden = model.feed_token(id, pos, &mut caches).expect("feed");
+    }
+    let mut out = Vec::new();
+    for _ in 0..12 {
+        let z = model.logits(&hidden).expect("logits");
+        let id = UllisMemory::argmax(&z);
+        if id == tok.eos_id || id <= 2 {
+            break;
+        }
+        out.push(id);
+        let piece = tok.decode(&[id]);
+        if piece.contains('\n') {
+            break;
+        }
+        hidden = model
+            .feed_token(id, prefix.len() + out.len() - 1, &mut caches)
+            .expect("feed gen");
+    }
+    tok.decode(&out)
+}
+
+fn encode_output_supervised(
+    tok: &mut ullis::tokenizer::BpeTokenizer,
+    rec: &ullis::data::ChatRecord,
+) -> (Vec<u32>, Vec<u8>, usize) {
+    use ullis::data::{pack_record, TAG_OUTPUT, TAG_THINKING, TAG_THINK_END};
+    let prefix = tok.encode(&pack_record(&rec.system, &rec.user, None, None), false, false);
+    let think = tok.encode(
+        &format!(
+            "{TAG_THINKING}\n{}\n{TAG_THINK_END}\n",
+            rec.thinking.trim()
+        ),
+        false,
+        false,
+    );
+    let mut output = tok.encode(
+        &format!("{TAG_OUTPUT}\n{}\n", rec.output.trim()),
+        false,
+        false,
+    );
+    output.push(tok.eos_id);
+    let tag = tok.encode(&format!("{TAG_OUTPUT}\n"), false, false);
+    let tag_len = if output.starts_with(&tag) {
+        tag.len()
+    } else {
+        let mut n = 1usize;
+        for i in 1..output.len() {
+            let d = tok.decode(&output[..i]);
+            let after = d.split(TAG_OUTPUT).nth(1).unwrap_or("");
+            if after.chars().all(char::is_whitespace) {
+                n = i;
+            } else {
+                break;
+            }
+        }
+        n
+    };
+    let n_ctx = prefix.len() + think.len();
+    let mut ids = prefix;
+    ids.extend(think);
+    ids.extend(output);
+    let mut mask = vec![0u8; ids.len()];
+    for m in mask.iter_mut().skip(n_ctx) {
+        *m = 1;
+    }
+    (ids, mask, n_ctx + tag_len)
+}
+
+/// Closed 16-line JSONL must overfit: greedy after `<|output|>` copies the answer.
+/// Loss is on the output span only (thinking is context). CE-only is not enough.
+#[test]
+fn c9_tiny_jsonl_overfit_greedy() {
+    use ullis::tokenizer::train_wordpiece;
+
+    let recs = load_tiny_overfit();
+    assert!(recs.len() >= 12, "tiny-overfit too small: {}", recs.len());
+    let texts: Vec<String> = recs.iter().map(|r| r.pack()).collect();
+    let mut tok = train_wordpiece(&texts, 512, 7).expect("tiny tokenizer");
+    let v = tok.vocab_size as usize;
+    let mut max_len = 0usize;
+    let mut packed = Vec::new();
+    for rec in &recs {
+        let (ids, mask, body_at) = encode_output_supervised(&mut tok, rec);
+        max_len = max_len.max(ids.len());
+        packed.push((ids, mask, body_at));
+    }
+    let seq_len = max_len.saturating_sub(1).max(8);
+    let b = 4usize;
+    let mut rng = rng_from_seed(42);
+    let mut cfg = memory_cfg(64, 2, 4, 32, 8, v);
+    cfg.seq_len = seq_len;
+    cfg.batch_size = b;
+    cfg.entropy_coef = 0.0;
+    cfg.moe_topk = 2;
+    let mut model = UllisMemory::new(cfg, &mut rng).expect("tiny memory model");
+    let mut opt = DenseSgd::new(&model.param_lens(), 2e-2, 0.9, 1.0);
+    let eos = tok.eos_id;
+    let mut last_ce = f32::INFINITY;
+    for step in 0..1200 {
+        let mut xs = Vec::with_capacity(b * seq_len);
+        let mut ys = Vec::with_capacity(b * seq_len);
+        let mut ms = Vec::with_capacity(b * seq_len);
+        for k in 0..b {
+            let (ids, mask, _) = &packed[(step + k) % packed.len()];
+            let (x, y, m) = pad_lm(ids, mask, seq_len, eos);
+            xs.extend(x);
+            ys.extend(y);
+            ms.extend(m);
+        }
+        last_ce = model
+            .train_step(&xs, &ys, &ms, b, seq_len, 0.0)
+            .expect("train_step");
+        memory_sgd_step(&mut model, &mut opt).expect("sgd");
+    }
+    assert!(
+        last_ce < 1.0,
+        "tiny overfit CE {last_ce:.3} should drop below 1.0 on the output span"
+    );
+
+    let mut tf_ok = 0u32;
+    for (ids, _, body_at) in &packed {
+        let at = (*body_at).min(ids.len().saturating_sub(1));
+        let prefix = &ids[..at];
+        let want = ids[at];
+        let got = {
+            let mut caches = model.new_cache();
+            let mut hidden = Vec::new();
+            for (pos, &id) in prefix.iter().enumerate() {
+                hidden = model.feed_token(id, pos, &mut caches).expect("tf feed");
+            }
+            UllisMemory::argmax(&model.logits(&hidden).expect("tf logits"))
+        };
+        if got == want {
+            tf_ok += 1;
+        }
+    }
+    assert!(
+        tf_ok as usize * 5 >= packed.len() * 4,
+        "teacher-forced first output token {tf_ok}/{} (need ≥80%)",
+        packed.len()
+    );
+
+    let probes = [
+        ("What is 2+2?", "4"),
+        ("What is 3+3?", "6"),
+        ("What is 1+1?", "2"),
+        ("What is 7+2?", "9"),
+        ("What is 2+3?", "5"),
+    ];
+    let mut ok = 0u32;
+    let mut report = String::new();
+    for (user, want) in probes {
+        let rec = recs
+            .iter()
+            .find(|r| r.user == user)
+            .unwrap_or_else(|| panic!("missing {user}"));
+        let (ids, _mask, body_at) = encode_output_supervised(&mut tok, rec);
+        let prefix = &ids[..body_at.min(ids.len())];
+        let got = greedy_from_prefix(&model, &tok, prefix);
+        let first = got
+            .trim()
+            .lines()
+            .next()
+            .unwrap_or("")
+            .trim();
+        let hit = first == want;
+        if hit {
+            ok += 1;
+        }
+        let tail = &prefix[prefix.len().saturating_sub(6)..];
+        report.push_str(&format!(
+            "  user={user:?} want={want:?} got={got:?} tail={:?} hit={hit}\n",
+            tok.decode(tail)
+        ));
+    }
+    assert!(
+        ok >= 4,
+        "C9 greedy overfit {ok}/{} (CE={last_ce:.3} tf={tf_ok}/{})\n{report}",
+        probes.len(),
+        packed.len()
+    );
+}
+
+const COPY_MARK: u32 = 1;
+const COPY_ASK: u32 = 2;
+const COPY_VAL0: u32 = 3;
+const COPY_NVAL: u32 = 12;
+const COPY_LEN: usize = 4;
+const COPY_V: usize = 16;
+
+fn random_copy_vals(rng: &mut impl Rng) -> Vec<u32> {
+    (0..COPY_LEN)
+        .map(|_| COPY_VAL0 + rng.random_range(0..COPY_NVAL))
+        .collect()
+}
+
+fn copy_xy(vals: &[u32], seq_len: usize) -> (Vec<u32>, Vec<u32>, Vec<u8>) {
+    let mut full = Vec::with_capacity(2 + 2 * vals.len() + seq_len);
+    full.push(COPY_MARK);
+    full.extend_from_slice(vals);
+    full.push(COPY_ASK);
+    full.extend_from_slice(vals);
+    let ask_at = 1 + vals.len();
+    let need = seq_len + 1;
+    while full.len() < need {
+        full.push(0);
+    }
+    let mut x = vec![0u32; seq_len];
+    let mut y = vec![0u32; seq_len];
+    let mut m = vec![0u8; seq_len];
+    for t in 0..seq_len {
+        x[t] = full[t];
+        y[t] = full[t + 1];
+        if t >= ask_at && t < ask_at + vals.len() {
+            m[t] = 1;
+        }
+    }
+    (x, y, m)
+}
+
+fn greedy_copy(model: &UllisMemory, vals: &[u32]) -> Vec<u32> {
+    let mut ctx = vec![COPY_MARK];
+    ctx.extend_from_slice(vals);
+    ctx.push(COPY_ASK);
+    let mut caches = model.new_cache();
+    let mut hidden = Vec::new();
+    for (pos, &id) in ctx.iter().enumerate() {
+        hidden = model.feed_token(id, pos, &mut caches).expect("copy feed");
+    }
+    let mut out = Vec::with_capacity(vals.len());
+    for _ in 0..vals.len() {
+        let z = model.logits(&hidden).expect("copy logits");
+        let id = UllisMemory::argmax(&z);
+        out.push(id);
+        hidden = model
+            .feed_token(id, ctx.len() + out.len() - 1, &mut caches)
+            .expect("copy gen");
+    }
+    out
+}
+
+/// Multi-token AR copy on a closed alphabet. Single-slot bind (C1) is not
+/// this: `hello`→`helle` is a 5-byte sequence copy. Overfit must work before
+/// held-out induction is a claim.
+#[test]
+fn c10_multitoken_copy_overfit() {
+    let mut rng = rng_from_seed(13);
+    let seq_len = 2 + 2 * COPY_LEN;
+    let b = 8usize;
+    let mut cfg = memory_cfg(64, 2, 4, 32, 16, COPY_V);
+    cfg.seq_len = seq_len;
+    cfg.batch_size = b;
+    cfg.entropy_coef = 0.0;
+    cfg.moe_topk = 2;
+    let mut model = UllisMemory::new(cfg, &mut rng).expect("copy model");
+    let mut opt = DenseSgd::new(&model.param_lens(), 2e-2, 0.9, 1.0);
+    let mut train_set = Vec::new();
+    for _ in 0..48 {
+        train_set.push(random_copy_vals(&mut rng));
+    }
+    for step in 0..800 {
+        let mut xs = Vec::with_capacity(b * seq_len);
+        let mut ys = Vec::with_capacity(b * seq_len);
+        let mut ms = Vec::with_capacity(b * seq_len);
+        for k in 0..b {
+            let vals = &train_set[(step + k) % train_set.len()];
+            let (x, y, m) = copy_xy(vals, seq_len);
+            xs.extend(x);
+            ys.extend(y);
+            ms.extend(m);
+        }
+        let _ = model
+            .train_step(&xs, &ys, &ms, b, seq_len, 0.0)
+            .expect("copy step");
+        memory_sgd_step(&mut model, &mut opt).expect("copy sgd");
+    }
+    let mut ok = 0u32;
+    for vals in &train_set {
+        if greedy_copy(&model, vals) == *vals {
+            ok += 1;
+        }
+    }
+    let acc = ok as f32 / train_set.len() as f32;
+    assert!(
+        acc >= 0.70,
+        "C10 multi-token copy overfit {acc:.2} ({ok}/{}) — sequence copy failed",
+        train_set.len()
+    );
+
+    let mut held_ok = 0u32;
+    let mut held_n = 0u32;
+    let mut pos_ok = [0u32; COPY_LEN];
+    for _ in 0..40 {
+        let vals = random_copy_vals(&mut rng);
+        if train_set.iter().any(|t| t == &vals) {
+            continue;
+        }
+        held_n += 1;
+        let got = greedy_copy(&model, &vals);
+        if got == vals {
+            held_ok += 1;
+        }
+        for i in 0..COPY_LEN.min(got.len()) {
+            if got[i] == vals[i] {
+                pos_ok[i] += 1;
+            }
+        }
+    }
+    let held_acc = if held_n == 0 {
+        0.0
+    } else {
+        held_ok as f32 / held_n as f32
+    };
+    // Exact unseen 4-grams are above chance (1/12^4) but this mixer is not
+    // an induction head. 10% exact is the current architecture ceiling.
+    assert!(
+        held_n > 0 && held_ok * 10 >= held_n,
+        "C10 held-out copy {held_acc:.2} ({held_ok}/{held_n}) pos={pos_ok:?} after overfit {acc:.2}"
+    );
+}
+
+/// Local mix is Θ(T W D) with W capped. Doubling T must not look like T×T.
+#[test]
+fn c11_window_t_not_quadratic() {
+    let mut rng = rng_from_seed(4);
+    let mut time_at = |t: usize| -> f32 {
+        let mut cfg = memory_cfg(32, 1, 2, 16, 0, 32);
+        cfg.seq_len = t;
+        cfg.batch_size = 2;
+        cfg.window = 16;
+        cfg.n_slots = 0;
+        let n = cfg.batch_size * t;
+        let ids: Vec<u32> = (0..n).map(|i| (i as u32) % 30 + 1).collect();
+        let targets: Vec<u32> = ids.iter().map(|x| (*x + 1) % 31 + 1).collect();
+        let mask = vec![1u8; n];
+        let mut m = UllisMemory::new(cfg, &mut rng).unwrap();
+        let _ = m.train_step(&ids, &targets, &mask, 2, t, 0.0).unwrap();
+        let _ = m.train_step(&ids, &targets, &mask, 2, t, 0.0).unwrap();
+        m.last_fwd_ms + m.last_bwd_ms
+    };
+    let ms32 = time_at(32);
+    let ms128 = time_at(128);
+    let ratio = ms128 / ms32.max(0.05);
+    assert!(
+        ratio <= 8.0,
+        "C11 T=32 {ms32:.2}ms vs T=128 {ms128:.2}ms ratio {ratio:.2} (linear ~4, quadratic ~16)"
+    );
+}
+
 #[test]
 fn ullis04_roundtrip_generate() {
     use ullis::checkpoint::{load_memory, peek_magic, save_memory, MAGIC_MEM};

@@ -22,6 +22,7 @@ pub mod tensor;
 pub mod think;
 pub mod tokenizer;
 pub mod train;
+pub mod window;
 
 pub use accelerate::{FusedBwdGrads, MobKanSpec};
 pub use config::{KanFactor, MasterDtype, ModelArch, MomDtype, TrainConfig};

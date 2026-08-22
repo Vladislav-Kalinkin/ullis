@@ -94,6 +94,40 @@ pub fn pack_record(
     s
 }
 
+/// Ids through `<|output|>` plus its trailing newline piece — the cut C9
+/// uses so greedy starts at the answer, not at `<|thinking|>`.
+pub fn prefix_to_output_body(tokenizer: &mut BpeTokenizer, rec: &ChatRecord) -> Vec<u32> {
+    prefix_to_output_body_ex(tokenizer, rec, false)
+}
+
+pub fn prefix_to_output_body_ex(
+    tokenizer: &mut BpeTokenizer,
+    rec: &ChatRecord,
+    _output_only: bool,
+) -> Vec<u32> {
+    let (prefix, think, output) = encode_record_parts(tokenizer, rec);
+    let tag = tokenizer.encode(&format!("{TAG_OUTPUT}\n"), false, false);
+    let tag_len = if output.starts_with(&tag) {
+        tag.len()
+    } else {
+        let mut n = 1usize;
+        for i in 1..output.len() {
+            let d = tokenizer.decode(&output[..i]);
+            let after = d.split(TAG_OUTPUT).nth(1).unwrap_or("");
+            if after.chars().all(char::is_whitespace) {
+                n = i;
+            } else {
+                break;
+            }
+        }
+        n.min(output.len())
+    };
+    let mut ids = prefix;
+    ids.extend(think);
+    ids.extend_from_slice(&output[..tag_len.min(output.len())]);
+    ids
+}
+
 fn encode_record_parts(
     tokenizer: &mut BpeTokenizer,
     rec: &ChatRecord,
@@ -247,6 +281,15 @@ pub fn encode_supervised_windows(
     rec: &ChatRecord,
     seq_len: usize,
 ) -> Vec<(Vec<u32>, Vec<u8>)> {
+    encode_supervised_windows_ex(tokenizer, rec, seq_len, false)
+}
+
+fn encode_supervised_windows_ex(
+    tokenizer: &mut BpeTokenizer,
+    rec: &ChatRecord,
+    seq_len: usize,
+    output_only: bool,
+) -> Vec<(Vec<u32>, Vec<u8>)> {
     let keep = seq_len.saturating_add(1).max(1);
     let (prefix, think, output) = encode_record_parts(tokenizer, rec);
     let full_len = prefix.len() + think.len() + output.len();
@@ -255,16 +298,28 @@ pub fn encode_supervised_windows(
         ids.extend_from_slice(&prefix);
         ids.extend_from_slice(&think);
         ids.extend_from_slice(&output);
-        return vec![(ids, mask_pref_sup(prefix.len(), full_len))];
+        let n_ctx = if output_only {
+            prefix.len() + think.len()
+        } else {
+            prefix.len()
+        };
+        return vec![(ids, mask_pref_sup(n_ctx, full_len))];
     }
 
     let mut windows = Vec::with_capacity(4);
-    let start_body = if think.is_empty() {
+    let start_body = if output_only || think.is_empty() {
         output.as_slice()
     } else {
         think.as_slice()
     };
-    let (ids, mask) = pack_ctx_body(&prefix, start_body, keep, true);
+    let start_ctx: Vec<u32> = if output_only {
+        let mut c = prefix.clone();
+        c.extend_from_slice(&think);
+        c
+    } else {
+        prefix.clone()
+    };
+    let (ids, mask) = pack_ctx_body(&start_ctx, start_body, keep, true);
     push_unique_window(&mut windows, ids, mask);
 
     if !output.is_empty() {
@@ -279,7 +334,7 @@ pub fn encode_supervised_windows(
         }
     }
 
-    if think.len() > keep {
+    if !output_only && think.len() > keep {
         let stride = (keep / 2).max(1);
         let mut start = stride;
         let mut extra = 0u32;
@@ -531,8 +586,9 @@ pub fn jsonl_corpus_texts(path: impl AsRef<Path>, max_records: usize) -> Result<
         };
         // Truncate thinking so BPE training does not hold a 19 MB dump.
         // Head-only clips hide the bulk of 10k+ char traces, so take head/mid/tail.
-        let think = sample_thinking_chars(&rec.thinking, 768);
-        texts.push(format!("{}\n{think}\n{}", rec.user, rec.output));
+        let mut rec = rec;
+        rec.thinking = sample_thinking_chars(&rec.thinking, 768);
+        texts.push(rec.pack());
         if texts.len() >= max_records {
             break;
         }
@@ -549,6 +605,7 @@ pub fn warn_corpus_homogeneity(path: impl AsRef<Path>) -> Result<()> {
     let mut users = HashSet::new();
     let mut n = 0u64;
     let mut think_chars = 0u64;
+    let mut think_hist: std::collections::HashMap<String, u64> = std::collections::HashMap::new();
     for line in reader.lines() {
         let line = line?;
         let Some(rec) = parse_jsonl_line(&line) else {
@@ -557,6 +614,8 @@ pub fn warn_corpus_homogeneity(path: impl AsRef<Path>) -> Result<()> {
         n += 1;
         users.insert(rec.user.chars().take(80).collect::<String>());
         think_chars += rec.thinking.len() as u64;
+        let key: String = rec.thinking.chars().take(40).collect();
+        *think_hist.entry(key).or_insert(0) += 1;
         if n >= 4096 {
             break;
         }
@@ -580,7 +639,28 @@ pub fn warn_corpus_homogeneity(path: impl AsRef<Path>) -> Result<()> {
             mean_think
         );
     }
+    if let Some((dummy, c)) = think_hist.iter().max_by_key(|(_, c)| *c) {
+        let frac = *c as f64 / n as f64;
+        if n >= 32 && frac >= 0.50 {
+            eprintln!(
+                "warn: {} {frac:.0}% of thinking traces are {dummy:?} — the model will memorize that stub, not reason. Filter or write real traces.",
+                path.display()
+            );
+        }
+    }
     Ok(())
+}
+
+/// First valid 4-key record, for a cheap greedy probe during train.
+pub fn first_jsonl_record(path: impl AsRef<Path>) -> Option<ChatRecord> {
+    let file = File::open(path.as_ref()).ok()?;
+    let reader = BufReader::new(file);
+    for line in reader.lines().map_while(Result::ok) {
+        if let Some(rec) = parse_jsonl_line(&line) {
+            return Some(rec);
+        }
+    }
+    None
 }
 
 pub fn parse_jsonl_line(line: &str) -> Option<ChatRecord> {
@@ -603,6 +683,8 @@ pub struct JsonlStream {
     flash: SovereignFlashBuffer,
     rng: StdRng,
     lines_seen: u64,
+    /// Loss only on `<|output|>` body (thinking is context).
+    pub mask_output: bool,
 }
 
 impl JsonlStream {
@@ -633,6 +715,7 @@ impl JsonlStream {
             flash: SovereignFlashBuffer::new(cap)?,
             rng: crate::device::rng_from_seed(seed),
             lines_seen: 0,
+            mask_output: false,
         })
     }
 
@@ -678,7 +761,12 @@ impl JsonlStream {
         };
         let keep = self.seq_len.saturating_add(1);
         let eos = self.tokenizer.eos_id;
-        let mut windows = encode_supervised_windows(&mut self.tokenizer, &rec, self.seq_len);
+        let mut windows = encode_supervised_windows_ex(
+            &mut self.tokenizer,
+            &rec,
+            self.seq_len,
+            self.mask_output,
+        );
         if windows.len() > 1 {
             windows.shuffle(&mut self.rng);
         }
@@ -886,6 +974,39 @@ mod tests {
             "user prefix must be masked off so the window still conditions on it"
         );
         assert!(mask.contains(&1));
+    }
+
+    #[test]
+    fn encode_output_only_masks_thinking() {
+        let mut tok = crate::tokenizer::train_wordpiece(&[], 1024, 1).unwrap();
+        let rec = ChatRecord {
+            system: "sys".into(),
+            user: "add".into(),
+            thinking: "long chain of thought about adding".into(),
+            output: "fn add() {}".into(),
+        };
+        let windows = encode_supervised_windows_ex(&mut tok, &rec, 128, true);
+        let (ids, mask) = &windows[0];
+        let n_think = tok
+            .encode(
+                &format!("{TAG_THINKING}\n{}\n{TAG_THINK_END}\n", rec.thinking.trim()),
+                false,
+                false,
+            )
+            .len();
+        let n_pref = tok
+            .encode(
+                &pack_record(&rec.system, &rec.user, None, None),
+                false,
+                false,
+            )
+            .len();
+        assert!(
+            mask.iter().take(n_pref + n_think).all(|&m| m == 0),
+            "thinking must be mask-0 in output-only mode"
+        );
+        assert!(mask.contains(&1), "output must be supervised");
+        assert_eq!(ids.len(), mask.len());
     }
 
     #[test]

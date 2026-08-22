@@ -85,6 +85,12 @@ pub struct TrainConfig {
     /// Memory-arch expert count `E`. Independent of MoB `n_experts`.
     #[serde(default = "default_mem_experts")]
     pub mem_experts: usize,
+    /// Causal local mix width. 0 disables. Clamped to 64 — never `T`.
+    #[serde(default = "default_window")]
+    pub window: usize,
+    /// If true, CE is only on the output span (thinking is context).
+    #[serde(default)]
+    pub mask_output: bool,
 }
 
 /// Trainable model class.
@@ -171,7 +177,7 @@ impl MomDtype {
 }
 
 fn default_entropy_coef() -> f64 {
-    0.03
+    0.0
 }
 fn default_router_entropy_coef() -> f64 {
     0.05
@@ -199,6 +205,9 @@ fn default_n_slots() -> usize {
 }
 fn default_mem_experts() -> usize {
     4
+}
+fn default_window() -> usize {
+    16
 }
 
 impl Default for TrainConfig {
@@ -249,6 +258,8 @@ impl Default for TrainConfig {
             expert_width: default_expert_width(),
             n_slots: default_n_slots(),
             mem_experts: default_mem_experts(),
+            window: default_window(),
+            mask_output: false,
         }
     }
 }

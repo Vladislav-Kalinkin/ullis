@@ -15,6 +15,9 @@ use crate::mixers::{
 use crate::optim::DenseSgd;
 use crate::scan::{scan_backward, scan_forward, scan_step, ScanParams, ScanTape};
 use crate::slots::{slots_backward, slots_forward, slots_step, SlotParams, SlotState, SlotTape};
+use crate::window::{
+    clamp_width, window_backward, window_forward, window_step, WindowParams, WindowRing, WindowTape,
+};
 
 #[derive(Clone, Debug)]
 pub struct HostNorm {
@@ -47,6 +50,7 @@ pub struct MemoryBlock {
     pub router: Vec<f32>,
     pub grad_router: Vec<f32>,
     pub slots: Option<SlotParams>,
+    pub window: Option<WindowParams>,
 }
 
 impl MemoryBlock {
@@ -69,6 +73,12 @@ impl MemoryBlock {
         } else {
             None
         };
+        let win = clamp_width(cfg.window);
+        let window = if win > 0 {
+            Some(WindowParams::new(d, win))
+        } else {
+            None
+        };
         Self {
             n1: HostNorm::new(d),
             n2: HostNorm::new(d),
@@ -78,6 +88,7 @@ impl MemoryBlock {
             router,
             grad_router: vec![0.0; e * d],
             slots,
+            window,
         }
     }
 
@@ -99,6 +110,9 @@ impl MemoryBlock {
         if let Some(s) = self.slots.as_mut() {
             s.zero_grad();
         }
+        if let Some(w) = self.window.as_mut() {
+            w.zero_grad();
+        }
     }
 }
 
@@ -107,6 +121,7 @@ struct BlockTape {
     n1_in: Vec<f32>,
     scan: ScanTape,
     after_scan: Vec<f32>,
+    window: Option<WindowTape>,
     moe: MoeCache,
     after_ff: Vec<f32>,
     slot: Option<SlotTape>,
@@ -117,6 +132,7 @@ pub struct LayerCache {
     pub h: Vec<f32>,
     pub prev_u: Vec<f32>,
     pub slots: Option<SlotState>,
+    pub window: Option<WindowRing>,
 }
 
 #[derive(Debug)]
@@ -124,6 +140,10 @@ pub struct UllisMemory {
     pub cfg: TrainConfig,
     pub embed: Vec<f32>,
     pub embed_grad: Vec<f32>,
+    /// GPT-2-style learned positions `[max_pos, D]`. Add is Θ(T D), not T×T.
+    pub pos: Vec<f32>,
+    pub pos_grad: Vec<f32>,
+    pub max_pos: usize,
     pub norm: HostNorm,
     pub blocks: Vec<MemoryBlock>,
     pub phase: u8,
@@ -145,16 +165,19 @@ impl UllisMemory {
     }
 
     pub fn with_device(
-        cfg: TrainConfig,
+        mut cfg: TrainConfig,
         rng: &mut impl rand::Rng,
         device: SovereignDevice,
     ) -> Result<Self> {
         if cfg.d_model == 0 {
             bail!("d_model == 0");
         }
+        cfg.window = clamp_width(cfg.window);
         let d = cfg.d_model;
         let v = cfg.vocab_size;
         let embed = randn(v * d, 0.02, rng);
+        let max_pos = cfg.seq_len.max(1);
+        let pos = randn(max_pos * d, 0.01, rng);
         let n_layers = cfg.n_layers.max(1);
         let blocks = (0..n_layers)
             .map(|i| MemoryBlock::new(&cfg, i, rng))
@@ -166,6 +189,9 @@ impl UllisMemory {
             cfg,
             embed,
             embed_grad: vec![0.0; v * d],
+            pos,
+            pos_grad: vec![0.0; max_pos * d],
+            max_pos,
             norm: HostNorm::new(d),
             blocks,
             phase: 1,
@@ -189,7 +215,7 @@ impl UllisMemory {
     }
 
     pub fn param_report(&self) -> String {
-        let mut n = self.embed.len() + self.norm.weight.len();
+        let mut n = self.embed.len() + self.pos.len() + self.norm.weight.len();
         for b in &self.blocks {
             n += b.n1.weight.len() + b.n2.weight.len() + b.n_slot.weight.len();
             n += b.scan.w_alpha.len() * 4 + b.router.len();
@@ -199,20 +225,25 @@ impl UllisMemory {
             if let Some(s) = &b.slots {
                 n += s.w_q.len() + s.w_w.len() + s.w_link.len() + 8;
             }
+            if let Some(w) = &b.window {
+                n += w.w_q.len() + w.w_k.len() + w.b_lag.len() + 1;
+            }
         }
         format!(
-            "memory D={} L={} E={} W={} S={} params={}",
+            "memory D={} L={} E={} W={} S={} win={} params={}",
             self.cfg.d_model,
             self.blocks.len(),
             self.cfg.mem_experts,
             self.cfg.expert_width,
             self.cfg.n_slots,
+            self.cfg.window,
             n
         )
     }
 
     fn zero_grad(&mut self) {
         self.embed_grad.fill(0.0);
+        self.pos_grad.fill(0.0);
         self.norm.zero_grad();
         for b in &mut self.blocks {
             b.zero_grad();
@@ -235,7 +266,7 @@ impl UllisMemory {
         } else {
             None
         };
-        let (after, scan_tape, moe, after_ff) = {
+        let (after, scan_tape, win_tape, moe, after_ff) = {
             let blk = &self.blocks[li];
             let mut n1 = vec![0.0f32; n * d];
             rmsnorm_into(x, n, d, &blk.n1.weight, blk.n1.eps, &mut n1)?;
@@ -246,6 +277,15 @@ impl UllisMemory {
             for i in 0..n * d {
                 after[i] = x[i] + h_scan[i];
             }
+            let win_tape = if let Some(wp) = blk.window.as_ref() {
+                let (wy, wt) = window_forward(wp, &after, b, t)?;
+                for i in 0..n * d {
+                    after[i] += wy[i];
+                }
+                Some(wt)
+            } else {
+                None
+            };
             let mut n2 = vec![0.0f32; n * d];
             rmsnorm_into(&after, n, d, &blk.n2.weight, blk.n2.eps, &mut n2)?;
             let (ff, moe) = moe_forward(&blk.experts, &blk.router, &n2, n, d, k, gpu)?;
@@ -253,7 +293,7 @@ impl UllisMemory {
             for i in 0..n * d {
                 after_ff[i] = after[i] + ff[i];
             }
-            (after, scan_tape, moe, after_ff)
+            (after, scan_tape, win_tape, moe, after_ff)
         };
         let (y, slot_tape, after_ff_tape) = if self.blocks[li].slots.is_some() {
             let mut slot_n = vec![0.0f32; n * d];
@@ -281,6 +321,7 @@ impl UllisMemory {
                 n1_in: x.to_vec(),
                 scan: scan_tape,
                 after_scan: after,
+                window: win_tape,
                 moe,
                 after_ff: after_ff_tape,
                 slot: slot_tape,
@@ -347,6 +388,12 @@ impl UllisMemory {
         for i in 0..n * d {
             d_after[i] = dy_ff[i] + dn2[i];
         }
+        if let (Some(wp), Some(wt)) = (blk.window.as_mut(), tape.window.as_ref()) {
+            let dwin = window_backward(wp, wt, &d_after)?;
+            for i in 0..n * d {
+                d_after[i] += dwin[i];
+            }
+        }
         let dhad = scan_backward(&mut blk.scan, &tape.scan, &d_after, b, t)?;
         let mut dn1 = vec![0.0f32; n * d];
         fwht_rows_bwd(&dhad, n, d, &mut dn1)?;
@@ -388,6 +435,7 @@ impl UllisMemory {
         let t0 = std::time::Instant::now();
         let mut x = vec![0.0f32; n * d];
         embed_lookup_into(&self.embed, v, d, ids, &mut x)?;
+        add_positions(&self.pos, self.max_pos, &mut x, b, t, d);
         for li in 0..self.blocks.len() {
             x = self.block_forward(li, &x, b, t, true)?;
         }
@@ -453,6 +501,7 @@ impl UllisMemory {
             dx = self.block_backward(li, &dx, b, t)?;
         }
         embed_scatter_acc(v, d, ids, &dx, &mut self.embed_grad)?;
+        acc_position_grads(&dx, b, t, d, self.max_pos, &mut self.pos_grad);
         self.last_bwd_ms = t2.elapsed().as_secs_f32() * 1e3;
         Ok(loss)
     }
@@ -465,6 +514,7 @@ impl UllisMemory {
             }
         };
         add(&mut sq, &self.embed_grad);
+        add(&mut sq, &self.pos_grad);
         add(&mut sq, &self.norm.grad);
         for blk in &self.blocks {
             add(&mut sq, &blk.n1.grad);
@@ -498,6 +548,12 @@ impl UllisMemory {
                 sq += s.grad_gamma * s.grad_gamma;
                 sq += s.grad_b_alloc * s.grad_b_alloc;
             }
+            if let Some(w) = &blk.window {
+                add(&mut sq, &w.grad_w_q);
+                add(&mut sq, &w.grad_w_k);
+                add(&mut sq, &w.grad_b_lag);
+                sq += w.grad_gamma * w.grad_gamma;
+            }
         }
         sq
     }
@@ -511,6 +567,7 @@ impl UllisMemory {
 
     fn walk_lens(&self, v: &mut Vec<usize>, _i: &mut usize) {
         v.push(self.embed.len());
+        v.push(self.pos.len());
         v.push(self.norm.weight.len());
         for blk in &self.blocks {
             v.push(blk.n1.weight.len());
@@ -548,6 +605,12 @@ impl UllisMemory {
                     1,
                 ]);
             }
+            if let Some(w) = &blk.window {
+                v.push(w.w_q.len());
+                v.push(w.w_k.len());
+                v.push(w.b_lag.len());
+                v.push(1);
+            }
         }
     }
 
@@ -571,15 +634,23 @@ impl UllisMemory {
                     .slots
                     .as_ref()
                     .map(|_| SlotState::new(1, self.cfg.n_slots, d)),
+                window: blk.window.as_ref().map(|w| WindowRing::new(d, w.width)),
             })
             .collect()
     }
 
-    pub fn feed_token(&self, id: u32, caches: &mut [LayerCache]) -> Result<Vec<f32>> {
+    pub fn feed_token(&self, id: u32, pos: usize, caches: &mut [LayerCache]) -> Result<Vec<f32>> {
         let d = self.cfg.d_model;
         let v = self.cfg.vocab_size;
         let mut x = vec![0.0f32; d];
         embed_lookup_into(&self.embed, v, d, &[id], &mut x)?;
+        let p = pos.min(self.max_pos.saturating_sub(1));
+        let pr = p * d;
+        if pr + d <= self.pos.len() {
+            for c in 0..d {
+                x[c] += self.pos[pr + c];
+            }
+        }
         for (li, blk) in self.blocks.iter().enumerate() {
             let mut n1 = vec![0.0f32; d];
             rmsnorm_into(&x, 1, d, &blk.n1.weight, blk.n1.eps, &mut n1)?;
@@ -590,6 +661,12 @@ impl UllisMemory {
             caches[li].prev_u.copy_from_slice(&new_prev);
             for i in 0..d {
                 x[i] += h[i];
+            }
+            if let (Some(wp), Some(ring)) = (blk.window.as_ref(), caches[li].window.as_mut()) {
+                let wy = window_step(wp, &x, ring)?;
+                for i in 0..d {
+                    x[i] += wy[i];
+                }
             }
             let mut n2 = vec![0.0f32; d];
             rmsnorm_into(&x, 1, d, &blk.n2.weight, blk.n2.eps, &mut n2)?;
@@ -625,6 +702,12 @@ impl UllisMemory {
         Ok(z)
     }
 
+    pub fn argmax_penalized(logits: &mut [f32], ctx: &[u32], n_prompt: usize) -> u32 {
+        penalize_decode(logits, ctx, n_prompt);
+        ban_recent(logits, ctx);
+        Self::argmax(logits)
+    }
+
     pub fn argmax(logits: &[f32]) -> u32 {
         let mut best = 0usize;
         let mut bv = f32::NEG_INFINITY;
@@ -658,8 +741,8 @@ impl UllisMemory {
     pub fn generate_last(&mut self, ids: &[u32]) -> Result<u32> {
         let mut caches = self.new_cache();
         let mut last_h = vec![0.0f32; self.cfg.d_model];
-        for &id in ids {
-            last_h = self.feed_token(id, &mut caches)?;
+        for (i, &id) in ids.iter().enumerate() {
+            last_h = self.feed_token(id, i, &mut caches)?;
         }
         let z = self.logits(&last_h)?;
         Ok(Self::argmax(&z))
@@ -672,16 +755,18 @@ impl UllisMemory {
         rng: &mut impl rand::Rng,
         caches: &mut Vec<LayerCache>,
         fed: &mut usize,
+        n_prompt: usize,
     ) -> Result<u32> {
         if *fed > ctx.len() {
             *caches = self.new_cache();
             *fed = 0;
         }
         while *fed < ctx.len() {
-            let h = self.feed_token(ctx[*fed], caches)?;
+            let h = self.feed_token(ctx[*fed], *fed, caches)?;
             *fed += 1;
             if *fed == ctx.len() {
                 let mut z = self.logits(&h)?;
+                penalize_decode(&mut z, ctx, n_prompt);
                 ban_recent(&mut z, ctx);
                 return Ok(Self::sample_token(&z, temperature, rng));
             }
@@ -706,6 +791,12 @@ impl UllisMemory {
         let d = self.cfg.d_model;
         let v = self.cfg.vocab_size;
         push_f32(&mut out, "embed".into(), &self.embed, vec![v, d]);
+        push_f32(
+            &mut out,
+            "pos".into(),
+            &self.pos,
+            vec![self.max_pos, d],
+        );
         push_f32(&mut out, "norm.weight".into(), &self.norm.weight, vec![d]);
         for (i, blk) in self.blocks.iter().enumerate() {
             let p = format!("blocks.{i}");
@@ -781,6 +872,17 @@ impl UllisMemory {
                     vec![e.d],
                 );
             }
+            if let Some(w) = &blk.window {
+                push_f32(&mut out, format!("{p}.window.w_q"), &w.w_q, vec![d]);
+                push_f32(&mut out, format!("{p}.window.w_k"), &w.w_k, vec![d]);
+                push_f32(
+                    &mut out,
+                    format!("{p}.window.b_lag"),
+                    &w.b_lag,
+                    vec![w.width],
+                );
+                push_f32(&mut out, format!("{p}.window.gamma"), &[w.gamma], vec![1]);
+            }
             if let Some(s) = &blk.slots {
                 push_f32(&mut out, format!("{p}.slots.w_q"), &s.w_q, vec![d]);
                 push_f32(&mut out, format!("{p}.slots.w_w"), &s.w_w, vec![d]);
@@ -813,6 +915,9 @@ impl UllisMemory {
         if name == "embed" {
             return copy(&mut self.embed, data, name);
         }
+        if name == "pos" {
+            return copy(&mut self.pos, data, name);
+        }
         if name == "norm.weight" {
             return copy(&mut self.norm.weight, data, name);
         }
@@ -838,6 +943,21 @@ impl UllisMemory {
             }
             if name == format!("{p}.scan.b_i") {
                 return copy(&mut blk.scan.b_i, data, name);
+            }
+            if let Some(w) = blk.window.as_mut() {
+                if name == format!("{p}.window.w_q") {
+                    return copy(&mut w.w_q, data, name);
+                }
+                if name == format!("{p}.window.w_k") {
+                    return copy(&mut w.w_k, data, name);
+                }
+                if name == format!("{p}.window.b_lag") {
+                    return copy(&mut w.b_lag, data, name);
+                }
+                if name == format!("{p}.window.gamma") && !data.is_empty() {
+                    w.gamma = data[0];
+                    return Ok(());
+                }
             }
             if name == format!("{p}.router") {
                 return copy(&mut blk.router, data, name);
@@ -935,20 +1055,87 @@ impl UllisMemory {
     }
 }
 
-fn ban_recent(logits: &mut [f32], ctx: &[u32]) {
-    if ctx.len() >= 4 {
-        let last = ctx[ctx.len() - 1];
-        if ctx[ctx.len() - 4..].iter().all(|&t| t == last) {
-            let i = last as usize;
-            if i < logits.len() {
-                logits[i] = f32::NEG_INFINITY;
+fn add_positions(pos: &[f32], max_pos: usize, x: &mut [f32], b: usize, t: usize, d: usize) {
+    if max_pos == 0 || pos.is_empty() {
+        return;
+    }
+    for bi in 0..b {
+        for ti in 0..t {
+            let p = ti.min(max_pos - 1);
+            let xr = (bi * t + ti) * d;
+            let pr = p * d;
+            for c in 0..d {
+                x[xr + c] += pos[pr + c];
             }
         }
     }
-    for &id in ctx.iter().rev().take(16) {
+}
+
+fn acc_position_grads(dx: &[f32], b: usize, t: usize, d: usize, max_pos: usize, pos_grad: &mut [f32]) {
+    if max_pos == 0 || pos_grad.is_empty() {
+        return;
+    }
+    for bi in 0..b {
+        for ti in 0..t {
+            let p = ti.min(max_pos - 1);
+            let xr = (bi * t + ti) * d;
+            let pr = p * d;
+            for c in 0..d {
+                pos_grad[pr + c] += dx[xr + c];
+            }
+        }
+    }
+}
+
+/// HF-style repetition penalty on the last 64 tokens, plus OpenAI-style
+/// frequency penalty on the generated suffix only. Decode-only; no train RAM.
+fn penalize_decode(logits: &mut [f32], ctx: &[u32], n_prompt: usize) {
+    const REPEAT: f32 = 1.15;
+    const FREQ: f32 = 0.4;
+    let v = logits.len();
+    if v == 0 {
+        return;
+    }
+    let w0 = ctx.len().saturating_sub(64);
+    let mut seen = vec![false; v];
+    for &id in &ctx[w0..] {
         let i = id as usize;
-        if i < logits.len() && logits[i].is_finite() {
-            logits[i] -= 1.25;
+        if i < v && !seen[i] {
+            seen[i] = true;
+            if logits[i] > 0.0 {
+                logits[i] /= REPEAT;
+            } else {
+                logits[i] *= REPEAT;
+            }
+        }
+    }
+    let start = n_prompt.min(ctx.len());
+    let mut counts = vec![0u32; v];
+    for &id in &ctx[start..] {
+        let i = id as usize;
+        if i < v {
+            counts[i] = counts[i].saturating_add(1);
+        }
+    }
+    for (i, &c) in counts.iter().enumerate() {
+        if c > 0 {
+            logits[i] -= FREQ * c as f32;
+        }
+    }
+}
+
+fn ban_recent(logits: &mut [f32], ctx: &[u32]) {
+    // Break exact loops only. Penalizing the last 16 context ids by 1.25 made
+    // greedy hop across function-word unigrams (`the of and`) even when the
+    // head had a real mode.
+    if ctx.len() < 4 {
+        return;
+    }
+    let last = ctx[ctx.len() - 1];
+    if ctx[ctx.len() - 4..].iter().all(|&t| t == last) {
+        let i = last as usize;
+        if i < logits.len() {
+            logits[i] = f32::NEG_INFINITY;
         }
     }
 }
@@ -958,10 +1145,15 @@ fn upd(opt: &mut DenseSgd, i: &mut usize, w: &mut [f32], g: &[f32], scale: f32) 
     *i += 1;
 }
 
-fn upd_s(opt: &mut DenseSgd, i: &mut usize, w: &mut f32, g: f32, scale: f32) {
+fn upd_fp32(opt: &mut DenseSgd, i: &mut usize, w: &mut [f32], g: &[f32], scale: f32) {
+    opt.update_slice_fp32(*i, w, g, scale);
+    *i += 1;
+}
+
+fn upd_s_fp32(opt: &mut DenseSgd, i: &mut usize, w: &mut f32, g: f32, scale: f32) {
     let mut wv = [*w];
     let gv = [g];
-    opt.update_slice(*i, &mut wv, &gv, scale);
+    opt.update_slice_fp32(*i, &mut wv, &gv, scale);
     *w = wv[0];
     *i += 1;
 }
@@ -971,30 +1163,31 @@ pub fn memory_sgd_step(model: &mut UllisMemory, opt: &mut DenseSgd) -> Result<()
     let scale = opt.clip_scale(model.grad_sq());
     let mut i = 0usize;
     let phase = model.phase;
-    upd(opt, &mut i, &mut model.embed, &model.embed_grad, scale);
-    upd(opt, &mut i, &mut model.norm.weight, &model.norm.grad, scale);
+    upd_fp32(opt, &mut i, &mut model.embed, &model.embed_grad, scale);
+    upd_fp32(opt, &mut i, &mut model.pos, &model.pos_grad, scale);
+    upd_fp32(opt, &mut i, &mut model.norm.weight, &model.norm.grad, scale);
     for blk in &mut model.blocks {
-        upd(opt, &mut i, &mut blk.n1.weight, &blk.n1.grad, scale);
-        upd(opt, &mut i, &mut blk.n2.weight, &blk.n2.grad, scale);
-        upd(opt, &mut i, &mut blk.n_slot.weight, &blk.n_slot.grad, scale);
-        upd(
+        upd_fp32(opt, &mut i, &mut blk.n1.weight, &blk.n1.grad, scale);
+        upd_fp32(opt, &mut i, &mut blk.n2.weight, &blk.n2.grad, scale);
+        upd_fp32(opt, &mut i, &mut blk.n_slot.weight, &blk.n_slot.grad, scale);
+        upd_fp32(
             opt,
             &mut i,
             &mut blk.scan.w_alpha,
             &blk.scan.grad_w_alpha,
             scale,
         );
-        upd(
+        upd_fp32(
             opt,
             &mut i,
             &mut blk.scan.b_alpha,
             &blk.scan.grad_b_alpha,
             scale,
         );
-        upd(opt, &mut i, &mut blk.scan.w_i, &blk.scan.grad_w_i, scale);
-        upd(opt, &mut i, &mut blk.scan.b_i, &blk.scan.grad_b_i, scale);
+        upd_fp32(opt, &mut i, &mut blk.scan.w_i, &blk.scan.grad_w_i, scale);
+        upd_fp32(opt, &mut i, &mut blk.scan.b_i, &blk.scan.grad_b_i, scale);
         if !blk.router.is_empty() {
-            upd(opt, &mut i, &mut blk.router, &blk.grad_router, scale);
+            upd_fp32(opt, &mut i, &mut blk.router, &blk.grad_router, scale);
         }
         for e in &mut blk.experts {
             if phase < 4 {
@@ -1003,21 +1196,27 @@ pub fn memory_sgd_step(model: &mut UllisMemory, opt: &mut DenseSgd) -> Result<()
                 upd(opt, &mut i, &mut e.w_down, &e.grad_down, scale);
                 upd(opt, &mut i, &mut e.bumps, &e.grad_bumps, scale);
             }
-            upd(opt, &mut i, &mut e.scale_up, &e.grad_scale_up, scale);
-            upd(opt, &mut i, &mut e.scale_gate, &e.grad_scale_gate, scale);
-            upd(opt, &mut i, &mut e.scale_down, &e.grad_scale_down, scale);
+            upd_fp32(opt, &mut i, &mut e.scale_up, &e.grad_scale_up, scale);
+            upd_fp32(opt, &mut i, &mut e.scale_gate, &e.grad_scale_gate, scale);
+            upd_fp32(opt, &mut i, &mut e.scale_down, &e.grad_scale_down, scale);
         }
         if let Some(s) = blk.slots.as_mut() {
-            upd(opt, &mut i, &mut s.w_q, &s.grad_w_q, scale);
-            upd(opt, &mut i, &mut s.w_w, &s.grad_w_w, scale);
-            upd(opt, &mut i, &mut s.w_link, &s.grad_w_link, scale);
-            upd_s(opt, &mut i, &mut s.b_link, s.grad_b_link, scale);
-            upd_s(opt, &mut i, &mut s.w_bk, s.grad_w_bk, scale);
-            upd_s(opt, &mut i, &mut s.b_bk, s.grad_b_bk, scale);
-            upd_s(opt, &mut i, &mut s.w_bv, s.grad_w_bv, scale);
-            upd_s(opt, &mut i, &mut s.b_bv, s.grad_b_bv, scale);
-            upd_s(opt, &mut i, &mut s.gamma, s.grad_gamma, scale);
-            upd_s(opt, &mut i, &mut s.b_alloc, s.grad_b_alloc, scale);
+            upd_fp32(opt, &mut i, &mut s.w_q, &s.grad_w_q, scale);
+            upd_fp32(opt, &mut i, &mut s.w_w, &s.grad_w_w, scale);
+            upd_fp32(opt, &mut i, &mut s.w_link, &s.grad_w_link, scale);
+            upd_s_fp32(opt, &mut i, &mut s.b_link, s.grad_b_link, scale);
+            upd_s_fp32(opt, &mut i, &mut s.w_bk, s.grad_w_bk, scale);
+            upd_s_fp32(opt, &mut i, &mut s.b_bk, s.grad_b_bk, scale);
+            upd_s_fp32(opt, &mut i, &mut s.w_bv, s.grad_w_bv, scale);
+            upd_s_fp32(opt, &mut i, &mut s.b_bv, s.grad_b_bv, scale);
+            upd_s_fp32(opt, &mut i, &mut s.gamma, s.grad_gamma, scale);
+            upd_s_fp32(opt, &mut i, &mut s.b_alloc, s.grad_b_alloc, scale);
+        }
+        if let Some(w) = blk.window.as_mut() {
+            upd_fp32(opt, &mut i, &mut w.w_q, &w.grad_w_q, scale);
+            upd_fp32(opt, &mut i, &mut w.w_k, &w.grad_w_k, scale);
+            upd_fp32(opt, &mut i, &mut w.b_lag, &w.grad_b_lag, scale);
+            upd_s_fp32(opt, &mut i, &mut w.gamma, w.grad_gamma, scale);
         }
     }
     Ok(())

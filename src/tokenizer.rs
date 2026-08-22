@@ -30,6 +30,9 @@ pub const N_SPECIAL: u32 = 4;
 pub const BYTE_OFFSET: u32 = N_SPECIAL;
 /// Hard minimum production vocabulary.
 pub const MIN_VOCAB: u32 = 8192;
+/// Memory-arch overfit / tiny corpora. `V=8192` on 15 JSONL rows cannot
+/// copy C9 (that test uses V=512). Production chat still requires [`MIN_VOCAB`].
+pub const MIN_VOCAB_MEMORY: u32 = 512;
 /// Default production scale (equals [`MIN_VOCAB`]).
 pub const DEFAULT_VOCAB: u32 = MIN_VOCAB;
 /// Absolute ceiling for `--vocab-size` (131 072+; Metal buffer / i8-block cap).
@@ -40,6 +43,17 @@ pub const MAX_VOCAB: u32 = 1_048_576;
 pub fn validate_vocab_size(vocab_size: u32) -> Result<u32> {
     if vocab_size < MIN_VOCAB {
         bail!("vocab-size {vocab_size} is below the hard minimum {MIN_VOCAB}");
+    }
+    if vocab_size > MAX_VOCAB {
+        bail!("vocab-size {vocab_size} exceeds the absolute ceiling {MAX_VOCAB}");
+    }
+    Ok(vocab_size)
+}
+
+pub fn validate_vocab_size_arch(vocab_size: u32, memory: bool) -> Result<u32> {
+    let min = if memory { MIN_VOCAB_MEMORY } else { MIN_VOCAB };
+    if vocab_size < min {
+        bail!("vocab-size {vocab_size} is below the minimum {min}");
     }
     if vocab_size > MAX_VOCAB {
         bail!("vocab-size {vocab_size} exceeds the absolute ceiling {MAX_VOCAB}");
@@ -897,10 +911,15 @@ impl<'a> StreamDecoder<'a> {
 }
 
 fn collect_atoms(vocab_size: u32) -> Vec<String> {
+    let floor = (BYTE_OFFSET + 256) as usize;
+    let room = (vocab_size as usize).saturating_sub(floor);
+    // Longest-first seeds used to consume the whole table at V≤512, so a
+    // tiny corpus got zero pair-merges and "hello" stayed five byte ids.
+    // Production V=8192 still fits every seed (≈480) after a 20% reserve.
+    let budget = room.saturating_sub(room / 5);
     let mut atoms = Vec::new();
     let mut seen = std::collections::HashSet::new();
-    let budget = vocab_size.saturating_sub(BYTE_OFFSET + 256) as usize;
-    for s in ATOMS_SORTED.iter() {
+    for s in CODE_SEEDS.iter().chain(LANG_SEEDS.iter()) {
         if atoms.len() >= budget {
             break;
         }
@@ -1060,7 +1079,17 @@ pub fn load_or_train(
     path: Option<&Path>,
     seed: u64,
 ) -> Result<BpeTokenizer> {
-    let vocab_size = validate_vocab_size(vocab_size)?;
+    // Caller already applied production vs memory floor. Do not re-impose
+    // MIN_VOCAB=8192 here — that blocked `--arch memory --vocab-size 512`.
+    if vocab_size < BYTE_OFFSET + 256 {
+        bail!(
+            "vocab-size {vocab_size} is below the byte-fallback floor {}",
+            BYTE_OFFSET + 256
+        );
+    }
+    if vocab_size > MAX_VOCAB {
+        bail!("vocab-size {vocab_size} exceeds the absolute ceiling {MAX_VOCAB}");
+    }
     let mut candidates: Vec<std::path::PathBuf> = Vec::new();
     if let Some(p) = path {
         if !p.as_os_str().is_empty() {
@@ -1115,6 +1144,33 @@ mod tests {
     }
 
     #[test]
+    fn seed_fill_vs_corpus_hello() {
+        let n_atoms = collect_atoms(MAX_VOCAB).len();
+        assert!(n_atoms > 400, "seed table unexpectedly small: {n_atoms}");
+        assert_eq!(
+            collect_atoms(8192).len(),
+            n_atoms,
+            "V=8192 must still fit every seed"
+        );
+        let mut tok512 =
+            train_wordpiece(&["hello hello hello hello hello".into()], 512, 1).unwrap();
+        assert!(
+            !tok512.merges.is_empty(),
+            "V=512 must reserve merge slots, got 0"
+        );
+        let hello = tok512.encode("hello", false, false);
+        assert!(
+            hello.len() <= 2,
+            "hello should merge at V=512, got {} pieces {:?}",
+            hello.len(),
+            hello
+                .iter()
+                .map(|&i| tok512.decode(&[i]))
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
     fn byte_fallback_never_panics() {
         let mut tok = train_wordpiece(&[], 320, 0).unwrap();
         let junk: Vec<u8> = (0u8..=255).chain([0xFF, 0xFE, 0x80, 0xC0, 0xC1]).collect();
@@ -1141,6 +1197,11 @@ mod tests {
         assert_eq!(validate_vocab_size(MIN_VOCAB).unwrap(), MIN_VOCAB);
         assert_eq!(validate_vocab_size(131_072).unwrap(), 131_072);
         assert!(validate_vocab_size(MAX_VOCAB + 1).is_err());
+        assert!(validate_vocab_size_arch(256, true).is_err());
+        assert_eq!(validate_vocab_size_arch(512, true).unwrap(), 512);
+        assert!(validate_vocab_size_arch(512, false).is_err());
+        let tok = load_or_train(512, &["fn add(a: i32, b: i32)".into()], None, 1).unwrap();
+        assert_eq!(tok.vocab_size, 512);
     }
 
     #[test]

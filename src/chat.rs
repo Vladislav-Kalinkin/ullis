@@ -373,7 +373,21 @@ fn memory_generate(
     temperature: f32,
 ) -> Result<()> {
     let seq_len = model.cfg.seq_len;
-    let think_budget = thinking.think_budget(seq_len);
+    let think_budget = match thinking {
+        ThinkingMode::Low => 0,
+        ThinkingMode::Medium => thinking.think_budget(seq_len).min(16),
+        ThinkingMode::High | ThinkingMode::Xhigh => thinking.think_budget(seq_len).min(32),
+    };
+    if thinking != ThinkingMode::Low {
+        eprintln!(
+            "memory chat: thinking capped at {think_budget} tokens (use --thinking low until CE < 2)"
+        );
+    }
+    if system == DEFAULT_SYSTEM {
+        eprintln!(
+            "memory chat: default --system is the KAN code prompt; pass the JSONL system string"
+        );
+    }
     // Default clap temp 0.7 is noise at CE~7; greedy unless the user picked another value.
     let temperature = if (temperature - 0.7).abs() < 1e-4 {
         0.0
@@ -381,7 +395,12 @@ fn memory_generate(
         temperature
     };
     let seed = if think_budget == 0 {
-        pack_record(system, prompt, None, Some(""))
+        // Training always has thinking tags. Skipping them is OOD and the
+        // head emits `<|thinking|>` after the user turn.
+        let mut s = pack_record(system, prompt, Some(""), None);
+        s.push_str(TAG_OUTPUT);
+        s.push('\n');
+        s
     } else {
         let mut s = pack_record(system, prompt, None, None);
         s.push_str(TAG_THINKING);
@@ -409,11 +428,12 @@ fn memory_generate(
                paint: &mut PaintScan,
                stdout: &mut io::Stdout,
                emitted_ids: &mut Vec<u32>,
+               n_prompt: usize,
                stop_on_think_end: bool|
      -> Result<bool> {
         let mut dec = StreamDecoder::new(tokenizer);
         for _ in 0..n {
-            let nxt = model.next_token(ctx, temperature, rng, caches, fed)?;
+            let nxt = model.next_token(ctx, temperature, rng, caches, fed, n_prompt)?;
             ctx.push(nxt);
             emitted_ids.push(nxt);
             let piece = dec.push(nxt);
@@ -446,6 +466,7 @@ fn memory_generate(
     };
 
     if think_budget > 0 {
+        let n_prompt = ctx.len();
         let done = run(
             think_budget,
             tokenizer,
@@ -457,6 +478,7 @@ fn memory_generate(
             &mut paint,
             &mut stdout,
             &mut emitted_ids,
+            n_prompt,
             true,
         )?;
         if !done && paint.lane == Lane::Think {
@@ -468,6 +490,7 @@ fn memory_generate(
             fed = 0;
         }
     }
+    let n_prompt = ctx.len();
     let _ = run(
         max_new,
         tokenizer,
@@ -479,6 +502,7 @@ fn memory_generate(
         &mut paint,
         &mut stdout,
         &mut emitted_ids,
+        n_prompt,
         false,
     )?;
     emit_ops(&mut stdout, color, &[PaintOp::Reset])?;

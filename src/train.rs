@@ -6,7 +6,10 @@ use clap::Args;
 
 use crate::checkpoint;
 use crate::config::{next_grid_size, TrainConfig};
-use crate::data::{jsonl_corpus_texts, warn_corpus_homogeneity, JsonlStream};
+use crate::data::{
+    first_jsonl_record, jsonl_corpus_texts, prefix_to_output_body_ex, warn_corpus_homogeneity,
+    ChatRecord, JsonlStream,
+};
 use crate::device::{
     device_name, setup_device, setup_device_with, synchronize, Backend, DeviceFlags,
 };
@@ -72,8 +75,8 @@ pub struct TrainArgs {
     /// Disable Mixture-of-Bumps (recover the v2 all-shared edge function).
     #[arg(long, default_value_t = false)]
     pub no_moe: bool,
-    /// Vocab-softmax Shannon entropy penalty (language-agnostic).
-    #[arg(long, default_value_t = 0.03)]
+    /// Vocab-softmax Shannon entropy penalty (language-agnostic). 0 until CE drops.
+    #[arg(long, default_value_t = 0.0)]
     pub entropy_coef: f64,
     /// MoB router Shannon entropy penalty.
     #[arg(long, default_value_t = 0.05)]
@@ -107,6 +110,12 @@ pub struct TrainArgs {
     /// Memory-arch slot count `S`.
     #[arg(long = "slots", default_value_t = 32)]
     pub slots: usize,
+    /// Causal local mix width (memory arch). 0 off. Hard-capped at 64.
+    #[arg(long = "window", default_value_t = 16)]
+    pub window: usize,
+    /// Supervise only the output span (thinking is context). Use on tiny code JSONL.
+    #[arg(long = "mask-output", default_value_t = false)]
+    pub mask_output: bool,
 }
 
 impl TrainArgs {
@@ -142,6 +151,8 @@ impl TrainArgs {
             expert_width: self.expert_width,
             n_slots: self.slots,
             mem_experts: self.experts,
+            window: self.window,
+            mask_output: self.mask_output,
             ..TrainConfig::default()
         }
     }
@@ -198,10 +209,14 @@ pub fn train(args: TrainArgs) -> Result<PathBuf> {
     cfg.expert_width = args.expert_width.max(1);
     cfg.n_slots = args.slots;
     cfg.mem_experts = args.experts;
+    cfg.window = crate::window::clamp_width(args.window);
     if cfg.arch == crate::config::ModelArch::Memory && cfg.moe_topk == 0 {
         cfg.moe_topk = 2;
     }
-    crate::tokenizer::validate_vocab_size(cfg.vocab_size as u32)?;
+    crate::tokenizer::validate_vocab_size_arch(
+        cfg.vocab_size as u32,
+        cfg.arch == crate::config::ModelArch::Memory,
+    )?;
     if cfg.arch == crate::config::ModelArch::Memory {
         return train_memory(args, cfg);
     }
@@ -234,7 +249,7 @@ pub fn train(args: TrainArgs) -> Result<PathBuf> {
             cfg.vocab_size, embed_mb
         );
     }
-    let texts = jsonl_corpus_texts(&data_path, 8_192)?;
+    let texts = jsonl_corpus_texts(&data_path, 16_384)?;
     if texts.is_empty() {
         anyhow::bail!("JSONL corpus is empty: {}", data_path.display());
     }
@@ -261,6 +276,7 @@ pub fn train(args: TrainArgs) -> Result<PathBuf> {
         cfg.context_len,
         cfg.seed,
     )?;
+    stream.mask_output = cfg.mask_output;
 
     println!(
         "device={} vocab={} moe={} topk={} aux={} kan_factor={:?} master={:?} mom={:?} data={} jsonl=v4 {}",
@@ -388,7 +404,7 @@ fn train_memory(args: TrainArgs, mut cfg: TrainConfig) -> Result<PathBuf> {
         );
     }
     warn_corpus_homogeneity(&data_path)?;
-    let texts = jsonl_corpus_texts(&data_path, 8_192)?;
+    let texts = jsonl_corpus_texts(&data_path, 16_384)?;
     if texts.is_empty() {
         anyhow::bail!("JSONL corpus is empty: {}", data_path.display());
     }
@@ -399,6 +415,13 @@ fn train_memory(args: TrainArgs, mut cfg: TrainConfig) -> Result<PathBuf> {
     };
     let tokenizer = load_or_train(cfg.vocab_size as u32, &texts, tok_path, cfg.seed)?;
     cfg.vocab_size = tokenizer.vocab_size as usize;
+    if texts.len() < 256 && cfg.vocab_size >= 8192 {
+        eprintln!(
+            "warn: {} JSONL records with V={} — 15-row overfit needs --vocab-size 512 (C9), not a 8192-way softmax",
+            texts.len(),
+            cfg.vocab_size
+        );
+    }
     let mut stream = JsonlStream::open_with_cap(
         &data_path,
         tokenizer.clone(),
@@ -406,6 +429,7 @@ fn train_memory(args: TrainArgs, mut cfg: TrainConfig) -> Result<PathBuf> {
         cfg.context_len,
         cfg.seed,
     )?;
+    stream.mask_output = cfg.mask_output;
     let mut rng = crate::device::rng_from_seed(cfg.seed);
     let device = setup_device(!args.cpu)?;
     let mut model = crate::memory::UllisMemory::with_device(cfg.clone(), &mut rng, device)?;
@@ -415,15 +439,17 @@ fn train_memory(args: TrainArgs, mut cfg: TrainConfig) -> Result<PathBuf> {
         model.param_report()
     );
     println!(
-        "corpus {} V={} E={} W={} S={} k={} T={} B={} slots=host-gemv mom={:?}",
+        "corpus {} V={} E={} W={} S={} win={} k={} T={} B={} mask_output={} slots=host-gemv mom={:?}",
         data_path.display(),
         cfg.vocab_size,
         cfg.mem_experts,
         cfg.expert_width,
         cfg.n_slots,
+        cfg.window,
         cfg.moe_topk,
         cfg.seq_len,
         cfg.batch_size,
+        cfg.mask_output,
         cfg.mom
     );
     if cfg.n_slots > 64 {
@@ -440,6 +466,19 @@ fn train_memory(args: TrainArgs, mut cfg: TrainConfig) -> Result<PathBuf> {
     let ckpt_dir = PathBuf::from(&cfg.ckpt_dir);
     std::fs::create_dir_all(&ckpt_dir)?;
     tokenizer.save(ckpt_dir.join("tokenizer.json"))?;
+    if cfg.entropy_coef > 0.0 {
+        eprintln!(
+            "warn: entropy_coef={} keeps the softmax wide; first runs should use --entropy-coef 0 until CE < 3.",
+            cfg.entropy_coef
+        );
+    }
+    if cfg.epochs_qat > 0 || cfg.epochs_harden > 0 {
+        eprintln!(
+            "warn: QAT/harden ternarizes experts. First corpus run: --epochs-qat 0 --epochs-harden 0 --epochs-sparsify 0"
+        );
+    }
+    let probe_rec = first_jsonl_record(&data_path);
+    let mut probe_tok = tokenizer.clone();
 
     for (phase, name, epochs_of, lr_of) in PHASES {
         let epochs = epochs_of(&cfg);
@@ -485,6 +524,15 @@ fn train_memory(args: TrainArgs, mut cfg: TrainConfig) -> Result<PathBuf> {
                     thru.reset();
                 }
             }
+            if let Some(rec) = probe_rec.as_ref() {
+                memory_greedy_probe(&model, &mut probe_tok, rec, cfg.mask_output);
+            }
+            if phase == 1 && epoch == 0 && model.last_ce > 5.0 {
+                eprintln!(
+                    "warn: warmup e0 CE={:.3} is still unigram-like (ln V≈9). Do not start QAT.",
+                    model.last_ce
+                );
+            }
         }
         checkpoint::save_memory(
             ckpt_dir.join(format!("phase{phase}.bin")),
@@ -511,9 +559,19 @@ fn train_memory(args: TrainArgs, mut cfg: TrainConfig) -> Result<PathBuf> {
         stream.tokenizer(),
         model.phase,
     )?;
-    model.pack();
+    let do_pack = cfg.epochs_qat > 0 || cfg.epochs_harden > 0;
+    if do_pack {
+        model.pack();
+    } else {
+        eprintln!("memory: no QAT/harden — packed.bin stays FP32 (do not expect ternary)");
+    }
     let packed_path = ckpt_dir.join("packed.bin");
-    checkpoint::save_memory(&packed_path, &model, stream.tokenizer(), 4)?;
+    checkpoint::save_memory(
+        &packed_path,
+        &model,
+        stream.tokenizer(),
+        if do_pack { 4 } else { model.phase },
+    )?;
     let card = serde_json::json!({
         "engine": "Ullis Memory",
         "arch": "memory",
@@ -568,6 +626,52 @@ fn train_footprint(model: &UllisKan, opt: &SgdMomentum, phase: u8) -> TrainFootp
         embed_i8_bytes: model.embed_i8_bytes(),
         scratch_bumps: 0,
     }
+}
+
+fn memory_greedy_probe(
+    model: &crate::memory::UllisMemory,
+    tok: &mut BpeTokenizer,
+    rec: &ChatRecord,
+    output_only: bool,
+) {
+    let prefix = prefix_to_output_body_ex(tok, rec, output_only);
+    let n_prompt = prefix.len();
+    let mut caches = model.new_cache();
+    let mut hidden = Vec::new();
+    let mut ctx = prefix;
+    for (pos, &id) in ctx.iter().enumerate() {
+        match model.feed_token(id, pos, &mut caches) {
+            Ok(h) => hidden = h,
+            Err(_) => return,
+        }
+    }
+    if hidden.is_empty() {
+        return;
+    }
+    let mut out = Vec::new();
+    for _ in 0..48 {
+        let Ok(mut z) = model.logits(&hidden) else {
+            break;
+        };
+        let id = crate::memory::UllisMemory::argmax_penalized(&mut z, &ctx, n_prompt);
+        if id == tok.eos_id || id <= 2 {
+            break;
+        }
+        out.push(id);
+        ctx.push(id);
+        let n = out.len();
+        if n >= 4 && out[n - 4..].iter().all(|&t| t == id) {
+            break;
+        }
+        match model.feed_token(id, ctx.len() - 1, &mut caches) {
+            Ok(h) => hidden = h,
+            Err(_) => break,
+        }
+    }
+    let text = tok.decode(&out);
+    let shown: String = text.chars().take(96).collect();
+    let user: String = rec.user.chars().take(40).collect();
+    println!("  greedy {user:?} -> {shown:?}");
 }
 
 fn format_cfg(cfg: &TrainConfig) -> String {

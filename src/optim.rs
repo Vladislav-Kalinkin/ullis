@@ -205,6 +205,23 @@ impl DenseSgd {
     }
 
     pub fn update_slice(&mut self, i: usize, w: &mut [f32], g: &[f32], scale: f32) {
+        self.update_slice_kind(i, w, g, scale, true);
+    }
+
+    /// Control-plane / embedding update. Never Q8-packs this slot's velocity
+    /// (per-tensor Q8 on the V×D table zeros rare-token momentum).
+    pub fn update_slice_fp32(&mut self, i: usize, w: &mut [f32], g: &[f32], scale: f32) {
+        self.update_slice_kind(i, w, g, scale, false);
+    }
+
+    fn update_slice_kind(
+        &mut self,
+        i: usize,
+        w: &mut [f32],
+        g: &[f32],
+        scale: f32,
+        allow_q8: bool,
+    ) {
         if i >= self.vel.len() {
             self.vel.resize(i + 1, Vec::new());
         }
@@ -218,7 +235,9 @@ impl DenseSgd {
         if vel.len() != w.len() {
             vel.resize(w.len(), 0.0);
         }
-        if let Some(q8) = self.vel_q8.as_mut() {
+        let q8_on = allow_q8 && self.vel_q8.is_some();
+        if q8_on {
+            let q8 = self.vel_q8.as_mut().expect("q8");
             if i >= q8.len() {
                 q8.resize(i + 1, (Vec::new(), 1e-12));
             }
@@ -231,8 +250,8 @@ impl DenseSgd {
             vel[j] = vel[j] * mu + g[j] * scale;
             w[j] -= lr * vel[j];
         }
-        if let Some(q8) = self.vel_q8.as_mut() {
-            q8[i] = quant_q8(vel);
+        if q8_on {
+            self.vel_q8.as_mut().expect("q8")[i] = quant_q8(vel);
             vel.clear();
         }
     }
