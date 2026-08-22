@@ -415,7 +415,7 @@ fn train_memory(args: TrainArgs, mut cfg: TrainConfig) -> Result<PathBuf> {
         model.param_report()
     );
     println!(
-        "corpus {} V={} E={} W={} S={} k={} T={} B={}",
+        "corpus {} V={} E={} W={} S={} k={} T={} B={} slots=host-gemv mom={:?}",
         data_path.display(),
         cfg.vocab_size,
         cfg.mem_experts,
@@ -423,8 +423,20 @@ fn train_memory(args: TrainArgs, mut cfg: TrainConfig) -> Result<PathBuf> {
         cfg.n_slots,
         cfg.moe_topk,
         cfg.seq_len,
-        cfg.batch_size
+        cfg.batch_size,
+        cfg.mom
     );
+    if cfg.n_slots > 64 {
+        let b = cfg.batch_size.max(1);
+        let t = cfg.seq_len.max(1);
+        let s = cfg.n_slots;
+        let d = cfg.d_model.max(1);
+        let slot_layers = cfg.n_layers.div_ceil(2);
+        eprintln!(
+            "warn: slot BPTT is host GEMV Θ(B T S D) per slot layer ({} layers), not Metal. S={} T={} D={} B={} — design envelope is S∈{{16,32,64}}. S=512 at T=1024 is a CPU wall, not a GPU one.",
+            slot_layers, s, t, d, b
+        );
+    }
     let ckpt_dir = PathBuf::from(&cfg.ckpt_dir);
     std::fs::create_dir_all(&ckpt_dir)?;
     tokenizer.save(ckpt_dir.join("tokenizer.json"))?;
@@ -433,7 +445,13 @@ fn train_memory(args: TrainArgs, mut cfg: TrainConfig) -> Result<PathBuf> {
         let epochs = epochs_of(&cfg);
         let lr = lr_of(&cfg);
         model.set_phase(phase);
-        let mut opt = crate::optim::DenseSgd::new(&model.param_lens(), lr, cfg.momentum, cfg.max_norm);
+        let mut opt = crate::optim::DenseSgd::new_dtype(
+            &model.param_lens(),
+            lr,
+            cfg.momentum,
+            cfg.max_norm,
+            cfg.mom,
+        );
         println!("\n== phase {phase} {name} epochs={epochs} lr={lr} memory ==");
         let t0 = Instant::now();
         let mut thru = Throughput::new();

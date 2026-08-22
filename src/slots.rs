@@ -1,5 +1,10 @@
 //! Content-based key/value slot memory. Control plane, FP32, `[B, T, D]`.
 //!
+//! Sequence mix is causal in `T`, so tokens cannot be independent GPU
+//! threads. At the design envelope (`S≤64`, `D≤512`) each token is a
+//! handful of `S×D` GEMVs — Accelerate beats a Metal kernel that cannot
+//! fill the GPU. Slots stay on the host.
+//!
 //! Read: `s = softmax(M_key q / √D)`, `out = γ sᵀ M_val`.
 //! Write: content scores on `M_key` plus temporal link to the previous
 //! write, then a GRU-style update on the addressed slots. Keys and values
@@ -10,6 +15,11 @@ use anyhow::{bail, Result};
 use crate::scan::sigmoid;
 
 const ALLOC_TEMP: f32 = 8.0;
+/// Cosine temperature for content scores. `softmax(M q / √D)` is dead at
+/// language embed scale (`N(0, 0.02²)`, `||v||² ≈ 0.2`): matching-slot
+/// logits stay `≪ log S`. Cosine is scale-free; 8 nats peaks a match
+/// against hundreds of empty slots.
+const CONTENT_TEMP: f32 = 8.0;
 
 #[derive(Clone, Debug)]
 pub struct SlotParams {
@@ -132,38 +142,88 @@ impl SlotState {
     }
 }
 
-#[derive(Clone, Debug)]
-struct SlotStep {
-    v: Vec<f32>,
-    s: Vec<f32>,
-    k_c: Vec<f32>,
-    k_alloc: Vec<f32>,
-    k_w: Vec<f32>,
-    p_prev: Vec<f32>,
+const STAPE_F: usize = 5;
+const F_S: usize = 0;
+const F_KC: usize = 1;
+const F_ALLOC: usize = 2;
+const F_KW: usize = 3;
+const F_PP: usize = 4;
+const SCAL_N: usize = 8;
+
+struct StepView<'a> {
+    v: &'a [f32],
+    s: &'a [f32],
+    k_c: &'a [f32],
+    k_alloc: &'a [f32],
+    k_w: &'a [f32],
+    p_prev: &'a [f32],
     link: f32,
     g_alloc: f32,
     beta_k: f32,
     beta_v: f32,
     mean_v: f32,
-}
-
-#[derive(Clone, Debug)]
-struct SlotCkpt {
-    key: Vec<f32>,
-    val: Vec<f32>,
+    sig_k: f32,
+    sig_v: f32,
 }
 
 #[derive(Clone, Debug, Default)]
 pub struct SlotTape {
-    steps: Vec<Vec<SlotStep>>,
-    ckpts: Vec<Vec<SlotCkpt>>,
+    b: usize,
+    t: usize,
+    s: usize,
+    d: usize,
     chunk: usize,
+    v: Vec<f32>,
+    stape: Vec<f32>,
+    scal: Vec<f32>,
+    ckpt_key: Vec<f32>,
+    ckpt_val: Vec<f32>,
+}
+
+impl SlotTape {
+    fn alloc(b: usize, t: usize, s: usize, d: usize, chunk: usize) -> Self {
+        let chunk = chunk.max(1);
+        let nck = t.div_ceil(chunk);
+        Self {
+            b,
+            t,
+            s,
+            d,
+            chunk,
+            v: vec![0.0; b.saturating_mul(t).saturating_mul(d)],
+            stape: vec![
+                0.0;
+                b.saturating_mul(t)
+                    .saturating_mul(STAPE_F)
+                    .saturating_mul(s)
+            ],
+            scal: vec![0.0; b.saturating_mul(t).saturating_mul(SCAL_N)],
+            ckpt_key: vec![0.0; b.saturating_mul(nck).saturating_mul(s).saturating_mul(d)],
+            ckpt_val: vec![0.0; b.saturating_mul(nck).saturating_mul(s).saturating_mul(d)],
+        }
+    }
+
+    fn n_ckpt(&self) -> usize {
+        self.t.div_ceil(self.chunk.max(1))
+    }
+
+    fn st_off(&self, bi: usize, ti: usize, field: usize) -> usize {
+        ((bi * self.t + ti) * STAPE_F + field) * self.s
+    }
 }
 
 const SLOT_CHUNK: usize = 16;
 /// Outer-parallelize independent batch rows once `B·T·S·D` is large enough
 /// that thread spawn is cheaper than the GEMVs.
 const PARALLEL_BTSD: usize = 65_536;
+
+/// Checkpoint every `chunk` steps. Live RAM is `Θ(B · 2SD · (T/chunk + chunk))`
+/// from stored snapshots plus the rematerialize buffer, so `chunk ≈ √T`.
+fn slot_chunk(t: usize, _n_slots: usize, _d: usize) -> usize {
+    let t = t.max(1);
+    let geo = (t as f64).sqrt().round() as usize;
+    geo.clamp(SLOT_CHUNK.min(t), t)
+}
 
 struct SlotScratch {
     q: Vec<f32>,
@@ -189,6 +249,9 @@ struct SlotScratch {
     gkey: Vec<f32>,
     gval: Vec<f32>,
     read: Vec<f32>,
+    dots: Vec<f32>,
+    kn: Vec<f32>,
+    d_dot: Vec<f32>,
 }
 
 impl SlotScratch {
@@ -217,6 +280,9 @@ impl SlotScratch {
             gkey: vec![0.0; d],
             gval: vec![0.0; d],
             read: vec![0.0; d],
+            dots: vec![0.0; s],
+            kn: vec![0.0; s],
+            d_dot: vec![0.0; s],
         }
     }
 }
@@ -261,9 +327,80 @@ fn softmax_bwd(y: &[f32], dy: &[f32], dx: &mut [f32]) {
     }
 }
 
-fn content_scores(key: &[f32], q: &[f32], n_slots: usize, d: usize, out: &mut [f32]) {
-    let scale = 24.0 / (d as f32).sqrt();
-    gemv(false, n_slots, d, scale, key, q, 0.0, out);
+fn l2_norm(x: &[f32]) -> f32 {
+    let mut s = 0.0f32;
+    for &v in x {
+        s += v * v;
+    }
+    s.sqrt()
+}
+
+fn row_l2(mat: &[f32], row: usize, d: usize) -> f32 {
+    l2_norm(&mat[row * d..row * d + d])
+}
+
+/// Cosine content scores `τ · (K q) / (||K_s|| ||q||)`. Empty keys (norm 0)
+/// stay at 0 so alloc, not content, claims a free slot.
+fn content_scores(
+    key: &[f32],
+    q: &[f32],
+    n_slots: usize,
+    d: usize,
+    dots: &mut [f32],
+    kn: &mut [f32],
+    out: &mut [f32],
+) {
+    gemv(false, n_slots, d, 1.0, key, q, 0.0, dots);
+    let qn = l2_norm(q).max(1e-6);
+    for s in 0..n_slots {
+        kn[s] = row_l2(key, s, d);
+        out[s] = if kn[s] < 1e-8 {
+            0.0
+        } else {
+            CONTENT_TEMP * dots[s] / (kn[s] * qn)
+        };
+    }
+}
+
+fn content_scores_bwd(
+    key: &[f32],
+    q: &[f32],
+    d_score: &[f32],
+    n_slots: usize,
+    d: usize,
+    d_key: &mut [f32],
+    d_q: &mut [f32],
+    dots: &mut [f32],
+    kn: &mut [f32],
+    d_dot: &mut [f32],
+) {
+    gemv(false, n_slots, d, 1.0, key, q, 0.0, dots);
+    let qn = l2_norm(q).max(1e-6);
+    d_dot[..n_slots].fill(0.0);
+    let mut d_qn = 0.0f32;
+    for s in 0..n_slots {
+        kn[s] = row_l2(key, s, d);
+        if kn[s] < 1e-8 {
+            continue;
+        }
+        let ds = d_score[s];
+        let inv = 1.0 / (kn[s] * qn);
+        let y = CONTENT_TEMP * dots[s] * inv;
+        d_dot[s] = CONTENT_TEMP * inv * ds;
+        let d_kn = -y / kn[s] * ds;
+        d_qn += -y / qn * ds;
+        let coef_k = d_kn / kn[s];
+        let k0 = s * d;
+        for c in 0..d {
+            d_key[k0 + c] += coef_k * key[k0 + c];
+        }
+    }
+    ger(n_slots, d, 1.0, d_dot, q, d_key);
+    gemv(true, n_slots, d, 1.0, key, d_dot, 1.0, d_q);
+    let coef_q = d_qn / qn;
+    for c in 0..d {
+        d_q[c] += coef_q * q[c];
+    }
 }
 
 fn alloc_weights(usage: &[f32], out: &mut [f32]) {
@@ -325,13 +462,23 @@ fn one_token(
     usage: &mut [f32],
     p_prev: &mut [f32],
     scratch: &mut SlotScratch,
-) -> (Vec<f32>, SlotStep) {
+    y_out: &mut [f32],
+    tape: Option<(&mut [f32], &mut [f32])>,
+) {
     let d = params.d;
     let s_n = params.n_slots;
     for c in 0..d {
         scratch.q[c] = params.w_q[c] * vt[c];
     }
-    content_scores(key, &scratch.q, s_n, d, &mut scratch.s_read);
+    content_scores(
+        key,
+        &scratch.q,
+        s_n,
+        d,
+        &mut scratch.dots,
+        &mut scratch.kn,
+        &mut scratch.s_read,
+    );
     softmax_inplace(&mut scratch.s_read);
     gemv(
         true,
@@ -346,7 +493,15 @@ fn one_token(
     for c in 0..d {
         scratch.q[c] = params.w_w[c] * vt[c];
     }
-    content_scores(key, &scratch.q, s_n, d, &mut scratch.k_c);
+    content_scores(
+        key,
+        &scratch.q,
+        s_n,
+        d,
+        &mut scratch.dots,
+        &mut scratch.kn,
+        &mut scratch.k_c,
+    );
     softmax_inplace(&mut scratch.k_c);
     alloc_weights(usage, &mut scratch.k_alloc);
     let mut link_logit = params.b_link;
@@ -366,21 +521,25 @@ fn one_token(
     let mean_v = vt.iter().sum::<f32>() / d as f32;
     let psum: f32 = p_prev.iter().sum();
     let follow = if psum < 1e-8 { 0.0 } else { link };
-    let beta_k = sigmoid(params.b_bk + params.w_bk * mean_v) * (1.0 - follow);
-    let beta_v = sigmoid(params.b_bv + params.w_bv * mean_v) * follow;
-    let step = SlotStep {
-        v: vt.to_vec(),
-        s: scratch.s_read.clone(),
-        k_c: scratch.k_c.clone(),
-        k_alloc: scratch.k_alloc.clone(),
-        k_w: scratch.k_w.clone(),
-        p_prev: p_prev.to_vec(),
-        link,
-        g_alloc,
-        beta_k,
-        beta_v,
-        mean_v,
-    };
+    let sig_k = sigmoid(params.b_bk + params.w_bk * mean_v);
+    let sig_v = sigmoid(params.b_bv + params.w_bv * mean_v);
+    let beta_k = sig_k * (1.0 - follow);
+    let beta_v = sig_v * follow;
+    if let Some((st, sc)) = tape {
+        st[F_S * s_n..(F_S + 1) * s_n].copy_from_slice(&scratch.s_read[..s_n]);
+        st[F_KC * s_n..(F_KC + 1) * s_n].copy_from_slice(&scratch.k_c[..s_n]);
+        st[F_ALLOC * s_n..(F_ALLOC + 1) * s_n].copy_from_slice(&scratch.k_alloc[..s_n]);
+        st[F_KW * s_n..(F_KW + 1) * s_n].copy_from_slice(&scratch.k_w[..s_n]);
+        st[F_PP * s_n..(F_PP + 1) * s_n].copy_from_slice(&p_prev[..s_n]);
+        sc[0] = link;
+        sc[1] = g_alloc;
+        sc[2] = beta_k;
+        sc[3] = beta_v;
+        sc[4] = mean_v;
+        sc[5] = sig_k;
+        sc[6] = sig_v;
+        sc[7] = 0.0;
+    }
     apply_write(
         key,
         &scratch.k_w,
@@ -405,37 +564,40 @@ fn one_token(
         usage[s] += scratch.k_w[s];
     }
     p_prev[..s_n].copy_from_slice(&scratch.k_w[..s_n]);
-    (scratch.y.clone(), step)
+    y_out.copy_from_slice(&scratch.y);
 }
 
 fn fwd_batch(
     params: &SlotParams,
     v: &[f32],
     t: usize,
+    chunk: usize,
     key: &mut [f32],
     val: &mut [f32],
     usage: &mut [f32],
     p_prev: &mut [f32],
     y: &mut [f32],
-    steps: &mut Vec<SlotStep>,
-    ckpts: &mut Vec<SlotCkpt>,
+    stape: &mut [f32],
+    scal: &mut [f32],
+    ckpt_key: &mut [f32],
+    ckpt_val: &mut [f32],
 ) {
     let d = params.d;
     let s_n = params.n_slots;
     let sd = s_n * d;
+    let chunk = chunk.max(1);
     let mut scratch = SlotScratch::new(d, s_n);
-    steps.clear();
-    steps.reserve(t);
-    ckpts.clear();
     for ti in 0..t {
-        if ti % SLOT_CHUNK == 0 {
-            ckpts.push(SlotCkpt {
-                key: key[..sd].to_vec(),
-                val: val[..sd].to_vec(),
-            });
+        if ti % chunk == 0 {
+            let ck = ti / chunk;
+            let off = ck * sd;
+            ckpt_key[off..off + sd].copy_from_slice(&key[..sd]);
+            ckpt_val[off..off + sd].copy_from_slice(&val[..sd]);
         }
         let row = ti * d;
-        let (yt, step) = one_token(
+        let st0 = ti * STAPE_F * s_n;
+        let sc0 = ti * SCAL_N;
+        one_token(
             params,
             &v[row..row + d],
             key,
@@ -443,9 +605,12 @@ fn fwd_batch(
             usage,
             p_prev,
             &mut scratch,
+            &mut y[row..row + d],
+            Some((
+                &mut stape[st0..st0 + STAPE_F * s_n],
+                &mut scal[sc0..sc0 + SCAL_N],
+            )),
         );
-        y[row..row + d].copy_from_slice(&yt);
-        steps.push(step);
     }
 }
 
@@ -467,12 +632,11 @@ pub fn slots_forward(
         state.reset();
     }
     let mut y = vec![0.0f32; v.len()];
-    let mut tape = SlotTape {
-        steps: (0..b).map(|_| Vec::with_capacity(t)).collect(),
-        ckpts: (0..b).map(|_| Vec::new()).collect(),
-        chunk: SLOT_CHUNK,
-    };
+    let chunk = slot_chunk(t, s_n, d);
+    let mut tape = SlotTape::alloc(b, t, s_n, d, chunk);
+    tape.v.copy_from_slice(v);
     let sd = s_n * d;
+    let nck = tape.n_ckpt();
     let parallel =
         b > 1 && b.saturating_mul(t).saturating_mul(s_n).saturating_mul(d) >= PARALLEL_BTSD;
     let key_ch = state.key.chunks_exact_mut(sd);
@@ -481,24 +645,32 @@ pub fn slots_forward(
     let prev_ch = state.p_prev.chunks_exact_mut(s_n);
     let y_ch = y.chunks_exact_mut(t * d);
     let v_ch = v.chunks_exact(t * d);
-    let step_ch = tape.steps.iter_mut();
-    let ckpt_ch = tape.ckpts.iter_mut();
+    let st_ch = tape.stape.chunks_exact_mut(t * STAPE_F * s_n);
+    let sc_ch = tape.scal.chunks_exact_mut(t * SCAL_N);
+    let ck_ch = tape.ckpt_key.chunks_exact_mut(nck * sd);
+    let cv_ch = tape.ckpt_val.chunks_exact_mut(nck * sd);
     std::thread::scope(|scope| {
-        for (((((((key, val), usage), p_prev), y_b), v_b), steps), ckpts) in key_ch
+        for (((((((((key, val), usage), p_prev), y_b), v_b), st), sc), ck), cv) in key_ch
             .zip(val_ch)
             .zip(use_ch)
             .zip(prev_ch)
             .zip(y_ch)
             .zip(v_ch)
-            .zip(step_ch)
-            .zip(ckpt_ch)
+            .zip(st_ch)
+            .zip(sc_ch)
+            .zip(ck_ch)
+            .zip(cv_ch)
         {
             if parallel {
                 scope.spawn(move || {
-                    fwd_batch(params, v_b, t, key, val, usage, p_prev, y_b, steps, ckpts);
+                    fwd_batch(
+                        params, v_b, t, chunk, key, val, usage, p_prev, y_b, st, sc, ck, cv,
+                    );
                 });
             } else {
-                fwd_batch(params, v_b, t, key, val, usage, p_prev, y_b, steps, ckpts);
+                fwd_batch(
+                    params, v_b, t, chunk, key, val, usage, p_prev, y_b, st, sc, ck, cv,
+                );
             }
         }
     });
@@ -523,7 +695,7 @@ pub fn slots_step(
     let mut scratch = SlotScratch::new(d, s_n);
     for bi in 0..b {
         let (k0, k1, p_off) = batch_span(s_n, d, bi);
-        let (yt, _) = one_token(
+        one_token(
             params,
             &v_tok[bi * d..(bi + 1) * d],
             &mut state.key[k0..k1],
@@ -531,25 +703,20 @@ pub fn slots_step(
             &mut state.usage[p_off..p_off + s_n],
             &mut state.p_prev[p_off..p_off + s_n],
             &mut scratch,
+            &mut y[bi * d..(bi + 1) * d],
+            None,
         );
-        y[bi * d..(bi + 1) * d].copy_from_slice(&yt);
     }
     Ok(y)
 }
 
-fn bwd_batch(
-    params: &mut SlotParams,
-    steps: &[SlotStep],
-    ckpts: &[SlotCkpt],
-    dy: &[f32],
-    t: usize,
-    chunk: usize,
-    dv: &mut [f32],
-) {
+fn bwd_batch(params: &mut SlotParams, tape: &SlotTape, bi: usize, dy: &[f32], dv: &mut [f32]) {
     let d = params.d;
     let s_n = params.n_slots;
+    let t = tape.t;
     let sd = s_n * d;
-    let chunk = chunk.max(1);
+    let chunk = tape.chunk.max(1);
+    let nck = tape.n_ckpt();
     let mut scratch = SlotScratch::new(d, s_n);
     let mut work_key = vec![0.0f32; sd];
     let mut work_val = vec![0.0f32; sd];
@@ -558,20 +725,22 @@ fn bwd_batch(
     let mut d_key = vec![0.0f32; sd];
     let mut d_val = vec![0.0f32; sd];
     let mut d_p = vec![0.0f32; s_n];
-    for seg in (0..ckpts.len()).rev() {
+    for seg in (0..nck).rev() {
         let t0 = seg * chunk;
         let t1 = (t0 + chunk).min(t);
         let n = t1 - t0;
-        work_key.copy_from_slice(&ckpts[seg].key);
-        work_val.copy_from_slice(&ckpts[seg].val);
+        let ck_off = (bi * nck + seg) * sd;
+        work_key.copy_from_slice(&tape.ckpt_key[ck_off..ck_off + sd]);
+        work_val.copy_from_slice(&tape.ckpt_val[ck_off..ck_off + sd]);
         for i in 0..n {
             seg_key[i * sd..(i + 1) * sd].copy_from_slice(&work_key);
             seg_val[i * sd..(i + 1) * sd].copy_from_slice(&work_val);
-            let st = &steps[t0 + i];
+            let ti = t0 + i;
+            let st = step_view(tape, bi, ti);
             apply_write(
                 &mut work_key,
-                &st.k_w,
-                &st.v,
+                st.k_w,
+                st.v,
                 st.beta_k,
                 s_n,
                 d,
@@ -580,8 +749,8 @@ fn bwd_batch(
             );
             apply_write(
                 &mut work_val,
-                &st.k_w,
-                &st.v,
+                st.k_w,
+                st.v,
                 st.beta_v,
                 s_n,
                 d,
@@ -591,9 +760,10 @@ fn bwd_batch(
         }
         for i in (0..n).rev() {
             let ti = t0 + i;
+            let st = step_view(tape, bi, ti);
             bwd_one(
                 params,
-                &steps[ti],
+                &st,
                 &seg_key[i * sd..(i + 1) * sd],
                 &seg_val[i * sd..(i + 1) * sd],
                 &dy[ti * d..ti * d + d],
@@ -604,6 +774,30 @@ fn bwd_batch(
                 &mut scratch,
             );
         }
+    }
+}
+
+fn step_view(tape: &SlotTape, bi: usize, ti: usize) -> StepView<'_> {
+    let s_n = tape.s;
+    let d = tape.d;
+    let st0 = tape.st_off(bi, ti, 0);
+    let sc0 = (bi * tape.t + ti) * SCAL_N;
+    let sc = &tape.scal[sc0..sc0 + SCAL_N];
+    let v0 = (bi * tape.t + ti) * d;
+    StepView {
+        v: &tape.v[v0..v0 + d],
+        s: &tape.stape[st0 + F_S * s_n..st0 + (F_S + 1) * s_n],
+        k_c: &tape.stape[st0 + F_KC * s_n..st0 + (F_KC + 1) * s_n],
+        k_alloc: &tape.stape[st0 + F_ALLOC * s_n..st0 + (F_ALLOC + 1) * s_n],
+        k_w: &tape.stape[st0 + F_KW * s_n..st0 + (F_KW + 1) * s_n],
+        p_prev: &tape.stape[st0 + F_PP * s_n..st0 + (F_PP + 1) * s_n],
+        link: sc[0],
+        g_alloc: sc[1],
+        beta_k: sc[2],
+        beta_v: sc[3],
+        mean_v: sc[4],
+        sig_k: sc[5],
+        sig_v: sc[6],
     }
 }
 
@@ -619,6 +813,9 @@ pub fn slots_backward(
     if dy.len() != b * t * d {
         bail!("slots_backward dy");
     }
+    if tape.b != b || tape.t != t || tape.s != s_n || tape.d != d {
+        bail!("slots tape shape");
+    }
     let mut dv = vec![0.0f32; b * t * d];
     let parallel =
         b > 1 && b.saturating_mul(t).saturating_mul(s_n).saturating_mul(d) >= PARALLEL_BTSD;
@@ -633,16 +830,9 @@ pub fn slots_backward(
         let dy_ch = dy.chunks_exact(t * d);
         let dv_ch = dv.chunks_exact_mut(t * d);
         std::thread::scope(|scope| {
-            for ((((lp, steps), ckpts), dy_b), dv_b) in locals
-                .iter_mut()
-                .zip(tape.steps.iter())
-                .zip(tape.ckpts.iter())
-                .zip(dy_ch)
-                .zip(dv_ch)
-            {
-                let chunk = tape.chunk;
+            for (bi, ((lp, dy_b), dv_b)) in locals.iter_mut().zip(dy_ch).zip(dv_ch).enumerate() {
                 scope.spawn(move || {
-                    bwd_batch(lp, steps, ckpts, dy_b, t, chunk, dv_b);
+                    bwd_batch(lp, tape, bi, dy_b, dv_b);
                 });
             }
         });
@@ -653,11 +843,9 @@ pub fn slots_backward(
         for bi in 0..b {
             bwd_batch(
                 params,
-                &tape.steps[bi],
-                &tape.ckpts[bi],
+                tape,
+                bi,
                 &dy[bi * t * d..(bi + 1) * t * d],
-                t,
-                tape.chunk,
                 &mut dv[bi * t * d..(bi + 1) * t * d],
             );
         }
@@ -667,7 +855,7 @@ pub fn slots_backward(
 
 fn bwd_one(
     params: &mut SlotParams,
-    step: &SlotStep,
+    step: &StepView<'_>,
     key_before: &[f32],
     val_before: &[f32],
     dy: &[f32],
@@ -679,7 +867,6 @@ fn bwd_one(
 ) {
     let d = params.d;
     let s_n = params.n_slots;
-    let scale = 24.0 / (d as f32).sqrt();
 
     gemv(
         true,
@@ -687,13 +874,13 @@ fn bwd_one(
         d,
         1.0,
         val_before,
-        &step.s,
+        step.s,
         0.0,
         &mut scratch.read,
     );
     params.grad_gamma += crate::accelerate::dot(dy, &scratch.read).unwrap_or(0.0);
 
-    ger(s_n, d, params.gamma, &step.s, dy, d_val);
+    ger(s_n, d, params.gamma, step.s, dy, d_val);
     gemv(
         false,
         s_n,
@@ -704,21 +891,23 @@ fn bwd_one(
         0.0,
         &mut scratch.d_s,
     );
-    softmax_bwd(&step.s, &scratch.d_s, &mut scratch.d_s_sm);
-    gemv(
-        true,
-        s_n,
-        d,
-        scale,
-        key_before,
-        &scratch.d_s_sm,
-        0.0,
-        &mut scratch.d_qr,
-    );
+    softmax_bwd(step.s, &scratch.d_s, &mut scratch.d_s_sm);
     for c in 0..d {
         scratch.wv[c] = params.w_q[c] * step.v[c];
     }
-    ger(s_n, d, scale, &scratch.d_s_sm, &scratch.wv, d_key);
+    scratch.d_qr.fill(0.0);
+    content_scores_bwd(
+        key_before,
+        &scratch.wv,
+        &scratch.d_s_sm,
+        s_n,
+        d,
+        d_key,
+        &mut scratch.d_qr,
+        &mut scratch.dots,
+        &mut scratch.kn,
+        &mut scratch.d_dot,
+    );
     for c in 0..d {
         params.grad_w_q[c] += scratch.d_qr[c] * step.v[c];
         dv[c] += scratch.d_qr[c] * params.w_q[c];
@@ -730,7 +919,7 @@ fn bwd_one(
         d,
         1.0,
         key_before,
-        &step.k_w,
+        step.k_w,
         0.0,
         &mut scratch.mk,
     );
@@ -740,7 +929,7 @@ fn bwd_one(
         d,
         1.0,
         val_before,
-        &step.k_w,
+        step.k_w,
         0.0,
         &mut scratch.mv,
     );
@@ -750,8 +939,8 @@ fn bwd_one(
         scratch.delta[c] = step.v[c] - scratch.mk[c];
         scratch.addr[c] = step.v[c] - scratch.mv[c];
     }
-    gemv(true, s_n, d, 1.0, d_key, &step.k_w, 0.0, &mut scratch.gkey);
-    gemv(true, s_n, d, 1.0, d_val, &step.k_w, 0.0, &mut scratch.gval);
+    gemv(true, s_n, d, 1.0, d_key, step.k_w, 0.0, &mut scratch.gkey);
+    gemv(true, s_n, d, 1.0, d_val, step.k_w, 0.0, &mut scratch.gval);
     let d_betak = crate::accelerate::dot(&scratch.gkey, &scratch.delta).unwrap_or(0.0);
     let d_betav = crate::accelerate::dot(&scratch.gval, &scratch.addr).unwrap_or(0.0);
     gemv(
@@ -779,8 +968,8 @@ fn bwd_one(
         scratch.d_mk[c] = -step.beta_k * scratch.gkey[c];
         scratch.d_mv[c] = -step.beta_v * scratch.gval[c];
     }
-    ger(s_n, d, 1.0, &step.k_w, &scratch.d_mk, d_key);
-    ger(s_n, d, 1.0, &step.k_w, &scratch.d_mv, d_val);
+    ger(s_n, d, 1.0, step.k_w, &scratch.d_mk, d_key);
+    ger(s_n, d, 1.0, step.k_w, &scratch.d_mv, d_val);
     gemv(
         false,
         s_n,
@@ -802,8 +991,10 @@ fn bwd_one(
         &mut scratch.d_kw,
     );
 
-    let dpre_bk = step.beta_k * (1.0 - step.beta_k) * d_betak;
-    let dpre_bv = step.beta_v * (1.0 - step.beta_v) * d_betav;
+    let psum: f32 = step.p_prev.iter().sum();
+    let follow = if psum < 1e-8 { 0.0 } else { step.link };
+    let dpre_bk = step.sig_k * (1.0 - step.sig_k) * (1.0 - follow) * d_betak;
+    let dpre_bv = step.sig_v * (1.0 - step.sig_v) * follow * d_betav;
     params.grad_b_bk += dpre_bk;
     params.grad_w_bk += dpre_bk * step.mean_v;
     params.grad_b_bv += dpre_bv;
@@ -813,8 +1004,8 @@ fn bwd_one(
     for c in 0..d {
         dv[c] += dmean * inv_d;
     }
+    let d_follow = -step.sig_k * d_betak + step.sig_v * d_betav;
 
-    let psum: f32 = step.p_prev.iter().sum();
     let mut d_link = 0.0f32;
     let mut d_galloc = 0.0f32;
     scratch.d_kc.fill(0.0);
@@ -831,6 +1022,9 @@ fn bwd_one(
             d_galloc += db * (step.k_alloc[s] - step.k_c[s]);
         }
     }
+    if psum >= 1e-8 {
+        d_link += d_follow;
+    }
     params.grad_b_alloc += step.g_alloc * (1.0 - step.g_alloc) * d_galloc;
     let dpre_l = step.link * (1.0 - step.link) * d_link;
     params.grad_b_link += dpre_l;
@@ -838,21 +1032,23 @@ fn bwd_one(
         params.grad_w_link[c] += dpre_l * step.v[c];
         dv[c] += dpre_l * params.w_link[c];
     }
-    softmax_bwd(&step.k_c, &scratch.d_kc, &mut scratch.d_kc_sm);
-    gemv(
-        true,
-        s_n,
-        d,
-        scale,
-        key_before,
-        &scratch.d_kc_sm,
-        0.0,
-        &mut scratch.d_qw,
-    );
+    softmax_bwd(step.k_c, &scratch.d_kc, &mut scratch.d_kc_sm);
     for c in 0..d {
         scratch.wv[c] = params.w_w[c] * step.v[c];
     }
-    ger(s_n, d, scale, &scratch.d_kc_sm, &scratch.wv, d_key);
+    scratch.d_qw.fill(0.0);
+    content_scores_bwd(
+        key_before,
+        &scratch.wv,
+        &scratch.d_kc_sm,
+        s_n,
+        d,
+        d_key,
+        &mut scratch.d_qw,
+        &mut scratch.dots,
+        &mut scratch.kn,
+        &mut scratch.d_dot,
+    );
     for c in 0..d {
         params.grad_w_w[c] += scratch.d_qw[c] * step.v[c];
         dv[c] += scratch.d_qw[c] * params.w_w[c];
@@ -896,6 +1092,42 @@ mod tests {
         assert!(
             dot_v > dot_n,
             "read should match value more than name (v={dot_v} n={dot_n})"
+        );
+    }
+
+    #[test]
+    fn cosine_read_finds_written_slot_at_language_embed_scale() {
+        let d = 32usize;
+        let s = 16usize;
+        let mut p = SlotParams::new(d, s);
+        p.w_link = vec![0.0; d];
+        p.b_link = 8.0;
+        p.b_bk = 4.0;
+        p.b_bv = 4.0;
+        p.gamma = 1.0;
+        p.b_alloc = 4.0;
+        let mut name = vec![0.0f32; d];
+        name[0] = 0.02;
+        name[1] = 0.03;
+        let mut val = vec![0.0f32; d];
+        val[4] = 0.04;
+        val[7] = -0.03;
+        let mut seq = vec![0.0f32; 3 * d];
+        seq[..d].copy_from_slice(&name);
+        seq[d..2 * d].copy_from_slice(&val);
+        seq[2 * d..].copy_from_slice(&name);
+        let mut st = SlotState::new(1, s, d);
+        let (y, _) = slots_forward(&p, &seq, 1, 3, &mut st).unwrap();
+        let read = &y[2 * d..];
+        let mut dot_v = 0.0f32;
+        let mut dot_n = 0.0f32;
+        for c in 0..d {
+            dot_v += read[c] * val[c];
+            dot_n += read[c] * name[c];
+        }
+        assert!(
+            dot_v > dot_n,
+            "cosine content must bind at N(0,0.02)-scale embeds (v={dot_v} n={dot_n})"
         );
     }
 

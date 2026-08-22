@@ -145,11 +145,9 @@ impl ScanParams {
 
 #[derive(Clone, Debug, Default)]
 pub struct ScanTape {
-    pub u_raw: Vec<f32>,
     pub u: Vec<f32>,
     pub alpha: Vec<f32>,
     pub i_gate: Vec<f32>,
-    pub pre_a: Vec<f32>,
     pub pre_i: Vec<f32>,
     pub h: Vec<f32>,
     pub h0: Vec<f32>,
@@ -178,7 +176,6 @@ pub fn scan_forward(
     }
     let mut alpha = vec![0.0f32; b * t * d];
     let mut i_gate = vec![0.0f32; b * t * d];
-    let mut pre_a = vec![0.0f32; b * t * d];
     let mut pre_i = vec![0.0f32; b * t * d];
     let mut h = vec![0.0f32; b * t * d];
     let mut h_last = h0v.clone();
@@ -189,7 +186,6 @@ pub fn scan_forward(
                 let uv = u[row + c];
                 let pa = params.w_alpha[c] * uv + params.b_alpha[c];
                 let pi = params.w_i[c] * uv + params.b_i[c];
-                pre_a[row + c] = pa;
                 pre_i[row + c] = pi;
                 let a = clamp_alpha(sigmoid(pa));
                 let ig = silu(pi);
@@ -204,11 +200,9 @@ pub fn scan_forward(
         }
     }
     let tape = ScanTape {
-        u_raw: u_raw.to_vec(),
         u,
         alpha,
         i_gate,
-        pre_a,
         pre_i,
         h: h.clone(),
         h0: h0v,

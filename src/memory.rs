@@ -61,7 +61,11 @@ impl MemoryBlock {
             crate::mixers::rand_kaiming(e, d, rng)
         };
         let slots = if layer % 2 == 0 && cfg.n_slots > 0 {
-            Some(SlotParams::new(d, cfg.n_slots))
+            let mut sp = SlotParams::new(d, cfg.n_slots);
+            // Residual injection starts small so scan/experts are not drowned
+            // while content addressing is still uniform (empty keys).
+            sp.gamma = 0.1;
+            Some(sp)
         } else {
             None
         };
@@ -242,7 +246,7 @@ impl UllisMemory {
         for i in 0..n * d {
             after_ff[i] = after[i] + ff[i];
         }
-        let (y, slot_tape) = if let Some(sp) = blk.slots.as_ref() {
+        let (y, slot_tape, after_ff_tape) = if let Some(sp) = blk.slots.as_ref() {
             let mut slot_n = vec![0.0f32; n * d];
             rmsnorm_into(
                 &after_ff,
@@ -258,9 +262,9 @@ impl UllisMemory {
             for i in 0..n * d {
                 out[i] += sv[i];
             }
-            (out, Some(tp))
+            (out, Some(tp), after_ff)
         } else {
-            (after_ff.clone(), None)
+            (after_ff, None, Vec::new())
         };
         if tape {
             self.tapes.push(BlockTape {
@@ -268,7 +272,7 @@ impl UllisMemory {
                 scan: scan_tape,
                 after_scan: after,
                 moe,
-                after_ff,
+                after_ff: after_ff_tape,
                 slot: slot_tape,
             });
         }

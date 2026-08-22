@@ -210,11 +210,7 @@ impl TernaryExpert {
                 x: x.to_vec(),
                 p,
                 gpre,
-                psi,
                 h,
-                up,
-                gate,
-                down,
             },
         ))
     }
@@ -225,8 +221,15 @@ impl TernaryExpert {
         if dy.len() != n * d {
             bail!("expert dy");
         }
+        let down = self.quant_mat(
+            &self.w_down,
+            d,
+            w,
+            &self.scale_down,
+            self.codes_down.as_ref(),
+        )?;
         let mut dh = vec![0.0f32; n * w];
-        sgemm(n, w, d, 1.0, dy, &cache.down, 0.0, &mut dh)?;
+        sgemm(n, w, d, 1.0, dy, &down, 0.0, &mut dh)?;
         sgemm_tn(d, w, n, 1.0, dy, &cache.h, 1.0, &mut self.grad_down)?;
         if self.qat() {
             for r in 0..d {
@@ -237,6 +240,30 @@ impl TernaryExpert {
             }
         }
 
+        let mut psi = vec![0.0f32; n * w * BUMP_G];
+        relu_bumps(
+            &cache.p,
+            n,
+            w,
+            &self.centers,
+            &self.inv_widths,
+            &mut psi,
+        )?;
+        let up = self.quant_mat(
+            &self.w_up,
+            w,
+            d,
+            &self.scale_up,
+            self.codes_up.as_ref(),
+        )?;
+        let gate = self.quant_mat(
+            &self.w_gate,
+            w,
+            d,
+            &self.scale_gate,
+            self.codes_gate.as_ref(),
+        )?;
+
         let mut dp = vec![0.0f32; n * w];
         let mut dgate_pre = vec![0.0f32; n * w];
         for t in 0..n {
@@ -244,7 +271,7 @@ impl TernaryExpert {
                 let mut bump = 0.0f32;
                 let base = (t * w + j) * BUMP_G;
                 for g in 0..BUMP_G {
-                    bump += self.bumps[j * BUMP_G + g] * cache.psi[base + g];
+                    bump += self.bumps[j * BUMP_G + g] * psi[base + g];
                 }
                 let pre = cache.gpre[t * w + j];
                 let gv = sigmoid(pre);
@@ -254,7 +281,7 @@ impl TernaryExpert {
                 dgate_pre[t * w + j] += gdh * inner * gv * (1.0 - gv);
                 for g in 0..BUMP_G {
                     let dpsi = gdh * gv * self.bumps[j * BUMP_G + g];
-                    self.grad_bumps[j * BUMP_G + g] += gdh * gv * cache.psi[base + g];
+                    self.grad_bumps[j * BUMP_G + g] += gdh * gv * psi[base + g];
                     let mut dc = 0.0f32;
                     bump_grads(
                         cache.p[t * w + j],
@@ -269,9 +296,9 @@ impl TernaryExpert {
         }
 
         let mut dx = vec![0.0f32; n * d];
-        sgemm(n, d, w, 1.0, &dp, &cache.up, 0.0, &mut dx)?;
+        sgemm(n, d, w, 1.0, &dp, &up, 0.0, &mut dx)?;
         sgemm_tn(w, d, n, 1.0, &dp, &cache.x, 1.0, &mut self.grad_up)?;
-        sgemm(n, d, w, 1.0, &dgate_pre, &cache.gate, 1.0, &mut dx)?;
+        sgemm(n, d, w, 1.0, &dgate_pre, &gate, 1.0, &mut dx)?;
         sgemm_tn(w, d, n, 1.0, &dgate_pre, &cache.x, 1.0, &mut self.grad_gate)?;
         if self.qat() {
             for r in 0..w {
@@ -299,11 +326,7 @@ pub struct ExpertCache {
     x: Vec<f32>,
     p: Vec<f32>,
     gpre: Vec<f32>,
-    psi: Vec<f32>,
     h: Vec<f32>,
-    up: Vec<f32>,
-    gate: Vec<f32>,
-    down: Vec<f32>,
 }
 
 /// Top-k over `E` experts. Unlike `apply_topk_gates`, `E` is not capped at 4.
@@ -318,6 +341,13 @@ pub fn topk_rows(gates: &mut [f32], n: usize, e: usize, k: usize) {
         for (rank, &i) in idx.iter().enumerate() {
             if rank >= k {
                 row[i] = 0.0;
+            }
+        }
+        let z: f32 = row.iter().sum();
+        if z > 1e-12 {
+            let inv = 1.0 / z;
+            for g in row.iter_mut() {
+                *g *= inv;
             }
         }
     }
@@ -461,7 +491,14 @@ pub fn moe_backward(
         }
         let ye = {
             let mut ye = vec![0.0f32; idx.len() * d];
-            sgemm_nt(idx.len(), d, experts[ei].w, 1.0, &ec.h, &ec.down, 0.0, &mut ye)?;
+            let down = experts[ei].quant_mat(
+                &experts[ei].w_down,
+                d,
+                experts[ei].w,
+                &experts[ei].scale_down,
+                experts[ei].codes_down.as_ref(),
+            )?;
+            sgemm_nt(idx.len(), d, experts[ei].w, 1.0, &ec.h, &down, 0.0, &mut ye)?;
             ye
         };
         for (row, &t) in idx.iter().enumerate() {
@@ -508,7 +545,20 @@ fn softmax_bwd_row(y: &[f32], dy: &[f32], dx: &mut [f32]) {
     }
 }
 
+fn expert_weight_count(experts: &[TernaryExpert]) -> usize {
+    experts
+        .iter()
+        .map(|e| e.w_up.len() + e.w_gate.len() + e.w_down.len() + e.bumps.len())
+        .sum()
+}
+
+/// Mean |w| over expert maps, matching KAN `l1_penalty`. The previous sum
+/// made `l1=1e-3` a ~200 nats term on a 10M model and dominated the clip.
 pub fn l1_experts(experts: &[TernaryExpert]) -> f32 {
+    let n = expert_weight_count(experts);
+    if n == 0 {
+        return 0.0;
+    }
     let mut s = 0.0f32;
     for e in experts {
         for w in [&e.w_up, &e.w_gate, &e.w_down, &e.bumps] {
@@ -517,13 +567,18 @@ pub fn l1_experts(experts: &[TernaryExpert]) -> f32 {
             }
         }
     }
-    s
+    s / n as f32
 }
 
 pub fn l1_experts_grad(experts: &mut [TernaryExpert], coef: f32) {
     if coef == 0.0 {
         return;
     }
+    let n = expert_weight_count(experts);
+    if n == 0 {
+        return;
+    }
+    let gscale = coef / n as f32;
     for e in experts {
         for (w, g) in [
             (&e.w_up, &mut e.grad_up),
@@ -532,8 +587,30 @@ pub fn l1_experts_grad(experts: &mut [TernaryExpert], coef: f32) {
             (&e.bumps, &mut e.grad_bumps),
         ] {
             for i in 0..w.len() {
-                g[i] += coef * w[i].signum();
+                g[i] += gscale * w[i].signum();
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::device::rng_from_seed;
+
+    #[test]
+    fn l1_is_mean_not_sum() {
+        let mut rng = rng_from_seed(0);
+        let e = TernaryExpert::new(8, 4, &mut rng);
+        let n = e.w_up.len() + e.w_gate.len() + e.w_down.len() + e.bumps.len();
+        let mean = l1_experts(std::slice::from_ref(&e));
+        let mut sum = 0.0f32;
+        for w in [&e.w_up, &e.w_gate, &e.w_down, &e.bumps] {
+            for &v in w {
+                sum += v.abs();
+            }
+        }
+        assert!((mean - sum / n as f32).abs() < 1e-6);
+        assert!(mean < 2.0, "mean |w| should be O(1), got {mean}");
     }
 }

@@ -279,11 +279,22 @@ pub fn encode_supervised_windows(
         }
     }
 
-    if think.len() > keep.saturating_mul(2) {
-        let start = (think.len() - keep) / 2;
-        let slice = think[start..start + keep].to_vec();
-        let n = slice.len();
-        push_unique_window(&mut windows, slice, vec![1u8; n]);
+    if think.len() > keep {
+        let stride = (keep / 2).max(1);
+        let mut start = stride;
+        let mut extra = 0u32;
+        while start < think.len() && extra < 6 {
+            let end = (start + keep).min(think.len());
+            let begin = end.saturating_sub(keep);
+            if begin == 0 {
+                break;
+            }
+            let slice = think[begin..end].to_vec();
+            let n = slice.len();
+            push_unique_window(&mut windows, slice, vec![1u8; n]);
+            start = start.saturating_add(stride);
+            extra += 1;
+        }
     }
 
     if windows.is_empty() {
@@ -491,6 +502,22 @@ impl SovereignFlashBuffer {
     }
 }
 
+fn sample_thinking_chars(s: &str, budget: usize) -> String {
+    let n = s.chars().count();
+    if n <= budget {
+        return s.to_string();
+    }
+    let part = (budget / 3).max(1);
+    let mid0 = n.saturating_sub(part) / 2;
+    let mut out = String::with_capacity(budget + 2);
+    out.extend(s.chars().take(part));
+    out.push('\n');
+    out.extend(s.chars().skip(mid0).take(part));
+    out.push('\n');
+    out.extend(s.chars().skip(n.saturating_sub(part)));
+    out
+}
+
 /// Packed 4-key strings for tokenizer training. Training never synthesizes text.
 pub fn jsonl_corpus_texts(path: impl AsRef<Path>, max_records: usize) -> Result<Vec<String>> {
     let path = path.as_ref();
@@ -503,7 +530,8 @@ pub fn jsonl_corpus_texts(path: impl AsRef<Path>, max_records: usize) -> Result<
             continue;
         };
         // Truncate thinking so BPE training does not hold a 19 MB dump.
-        let think = rec.thinking.chars().take(512).collect::<String>();
+        // Head-only clips hide the bulk of 10k+ char traces, so take head/mid/tail.
+        let think = sample_thinking_chars(&rec.thinking, 768);
         texts.push(format!("{}\n{think}\n{}", rec.user, rec.output));
         if texts.len() >= max_records {
             break;

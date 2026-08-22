@@ -157,15 +157,37 @@ pub struct DenseSgd {
     pub momentum: f32,
     pub max_norm: f32,
     vel: Vec<Vec<f32>>,
+    vel_q8: Option<Vec<(Vec<i8>, f32)>>,
 }
 
 impl DenseSgd {
     pub fn new(lens: &[usize], lr: f64, momentum: f64, max_norm: f64) -> Self {
+        Self::new_dtype(lens, lr, momentum, max_norm, MomDtype::Fp32)
+    }
+
+    pub fn new_dtype(
+        lens: &[usize],
+        lr: f64,
+        momentum: f64,
+        max_norm: f64,
+        mom: MomDtype,
+    ) -> Self {
+        let vel: Vec<Vec<f32>> = lens.iter().map(|&n| vec![0.0f32; n]).collect();
+        let vel_q8 = if mom == MomDtype::Q8 {
+            Some(
+                vel.iter()
+                    .map(|v| (vec![0i8; v.len()], 1e-12f32))
+                    .collect(),
+            )
+        } else {
+            None
+        };
         Self {
             lr: lr as f32,
             momentum: momentum as f32,
             max_norm: max_norm as f32,
-            vel: lens.iter().map(|&n| vec![0.0f32; n]).collect(),
+            vel,
+            vel_q8,
         }
     }
 
@@ -193,9 +215,25 @@ impl DenseSgd {
         let mu = self.momentum;
         let vel = &mut self.vel[i];
         let n = w.len().min(g.len());
+        if vel.len() != w.len() {
+            vel.resize(w.len(), 0.0);
+        }
+        if let Some(q8) = self.vel_q8.as_mut() {
+            if i >= q8.len() {
+                q8.resize(i + 1, (Vec::new(), 1e-12));
+            }
+            if q8[i].0.len() != vel.len() {
+                q8[i] = (vec![0i8; vel.len()], 1e-12);
+            }
+            dequant_q8(&q8[i].0, q8[i].1, vel);
+        }
         for j in 0..n {
             vel[j] = vel[j] * mu + g[j] * scale;
             w[j] -= lr * vel[j];
+        }
+        if let Some(q8) = self.vel_q8.as_mut() {
+            q8[i] = quant_q8(vel);
+            vel.clear();
         }
     }
 
