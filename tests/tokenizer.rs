@@ -1,4 +1,4 @@
-use ullis::tokenizer::{train_bpe, StreamDecoder};
+use ullis::tokenizer::{train_bpe, train_bpe_from_reader, StreamDecoder};
 
 fn fixture_texts() -> Vec<String> {
     vec![
@@ -23,18 +23,21 @@ fn roundtrip_code() {
     for s in samples {
         let ids = tok.encode(s, false, false);
         assert_eq!(tok.decode(&ids), s);
-        assert!(*ids.iter().min().unwrap() < tok.vocab_size);
+        assert!(*ids.iter().min().unwrap() < tok.vocab_size());
     }
 }
 
 #[test]
-fn code_atoms_compress() {
-    let texts = fixture_texts();
+fn corpus_bpe_compresses_repeated_domain_text() {
+    let mut texts = fixture_texts();
+    texts.extend((0..64).map(|_| "ullis_engine ullis_engine\n".into()));
     let mut tok = train_bpe(&texts, 1024, 2).unwrap();
-    for atom in ["def ", "fn ", "return", "impl", "match"] {
-        let ids = tok.encode(atom, false, false);
-        assert_eq!(ids.len(), 1, "{atom:?} used {} tokens: {ids:?}", ids.len());
-    }
+    let ids = tok.encode("ullis_engine", false, false);
+    assert!(
+        ids.len() <= 2,
+        "domain term used {} tokens: {ids:?}",
+        ids.len()
+    );
 }
 
 #[test]
@@ -49,4 +52,12 @@ fn stream_decoder_utf8() {
     }
     out.push_str(&dec.flush());
     assert_eq!(out, text);
+}
+
+#[test]
+fn reader_training_does_not_require_a_text_vector() {
+    let mut tok = train_bpe_from_reader(&b"micro micro micro\n"[..], 512, 3).unwrap();
+    assert!(tok.vocab_size() < 512);
+    let ids = tok.encode("micro", false, false);
+    assert_eq!(tok.decode(&ids), "micro");
 }

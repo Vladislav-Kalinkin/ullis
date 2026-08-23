@@ -1,105 +1,84 @@
 # Ullis
 
-Standalone ternary Mixture-of-Bumps Kolmogorov–Arnold engine.
-Zero Python at runtime. One binary: train, chat, smoke.
+Ullis is a dense ternary Hyena language-model core for Apple Silicon.
 
+The project has one architecture only: token embeddings, stacked causal Hyena
+long-convolution blocks, tied output projection, and two Multi-Token
+Prediction heads (`t+1`, `t+2`). Every learned projection is represented by
+ternary codes `{-1, 0, +1}` derived from FP32 master weights.
+
+Ternary projections keep their inference codes in two packed bitplanes
+(`positive` and `negative`): two bits per weight. FP32 master weights remain
+only for training and are updated through a clipped STE interface. Each output
+row has a compact FP32 dequantisation scale, preventing ternary sums from
+growing with model width.
+
+Training uses Lion rather than AdamW: Lion retains one FP32 momentum value per
+master weight and no variance state. The admission estimate therefore reserves
+master weights, gradients, and one momentum vector (12 bytes per FP32
+parameter), plus packed ternary codes and activations.
+
+## Current refactor boundary
+
+The CPU radix-2 FFT implementation is the tested semantic reference for a
+future Metal kernel. It performs causal zero-padded long convolutions in
+`O(T log T)` and deliberately contains no recurrent state, attention matrix,
+router, expert stack, spline grid, or slot/BPTT tape.
+
+Its reference path generates the implicit filter one channel at a time and
+reuses FFT workspace, so it does not allocate a full `[D,T]` filter tensor.
+The memory admission estimate includes that reusable workspace explicitly.
+
+The Metal backend now executes shared-buffer FP32 identity and RMSNorm
+references plus the packed two-bitplane ternary projection on Apple Silicon.
+Each projection is compared against the CPU implementation in tests. A
+caller-owned `MetalRuntime` retains the ternary pipeline, command queue, and
+grow-only shared buffers across layer calls; it has no global cache or hidden
+locking. Its fused RMSNorm-plus-ternary kernel keeps normalized rows virtual,
+so that pre-projection normalization adds no activation buffer. The runtime is
+still a numerical-reference component rather than the model's full forward
+path. FFT convolution, STE backward, checkpointing, and GRPO remain follow-up
+milestones. Every GPU kernel must preserve this reference implementation's
+causal convolution semantics and tests.
+
+Metal now also owns a staged radix-2 complex FFT reference (`bit-reversal`
+plus ping-pong butterfly passes) with cached complex buffers. Its known
+spectrum and forward/inverse round-trip are verified on Apple GPU. The next
+Hyena milestone is to keep signal FFT, filter FFT, frequency multiply, and
+inverse FFT in one command buffer; until then the model sequence mixer remains
+on the CPU reference path.
+
+`TrainConfig` validates an explicit 1 GiB default process budget before model
+allocation. Materialising `[B,T,V]` MTP logits is intentionally rejected when
+it would consume more than one quarter of that budget. `streamed_mtp_loss`
+instead computes stable cross-entropy one vocabulary row at a time, retaining
+only `O(B·T·D)` activations.
+The two MTP heads are evaluated serially in this path, so their activation
+buffers never overlap.
+Hyena gating is also applied in-place, avoiding another `[B,T,D]` buffer per
+block.
+The pre-projection RMSNorm is fused into the ternary projection, so it adds no
+normalized activation tensor.
+
+`MtpBatcher` lends fixed `[B,T]` windows directly from the caller's token
+corpus. It makes no copy of the corpus and never pads the final partial batch,
+so dataset size does not become part of the trainer's RAM footprint.
+
+The tokenizer is byte-level BPE trained solely from the supplied corpus. It
+has no built-in language, code, or chat-token word list; only four special
+tokens and a 256-byte fallback are fixed. Saved legacy WordPiece tokenizers
+must be retrained, which prevents mixing an old embedding table with a new
+token-id scheme.
+
+`max_vocab_size` is a ceiling, not a reservation: BPE returns only populated
+ids, so a small corpus cannot waste embedding and output rows on an empty
+vocabulary tail. `train_bpe_from_reader` ingests a text source line-by-line,
+without first retaining the full corpus as `Vec<String>`.
+
+Run a small validation forward pass:
+
+```sh
+cargo run -- --smoke
 ```
-tokens → embed → L × (causal mixer + TernaryKanLinear) → RMSNorm → tied logits
-```
 
-Thinking is no longer silent. The REPL streams the hidden trajectory in
-dim italic gray, prints `└──`, then streams the `output` block in bold green.
-Ephemeral GC (`ReasoningScratch::clear`) wipes the think ring the instant
-the output stream ends.
-
----
-
-## Absolute 8 GB Mac M1 benchmarks
-
-| Surface                 | Number          | Notes                                                           |
-| ----------------------- | --------------- | --------------------------------------------------------------- |
-| Pre-training throughput | **~7500 tok/s** | 4-phase ternary QAT, Metal, defaults `d=32 L=3 G=4→12 T=96 B=4` |
-| Deep inference RSS      | **< 15 MB**     | packed-i8 embed, last-token logits; think scratch is ephemeral  |
-| Unified memory          | **8 GB M1**     | SGD (no Adam states); JSONL I/O independent of corpus size      |
-
-Working set is designed to stay **flat**: dialogue cache never stores
-`thinking` tokens, the token ring is capped at 32 768 ids (~128 KB),
-and Gauss–Jordan grid projection stays on Metal (`G ≤ 12`).
-
----
-
-## Quick start
-
-```bash
-cargo build --release
-./target/release/ullis train --data data/thinking-train.jsonl --steps 200 --out checkpoints/
-./target/release/ullis chat  --model checkpoints/packed.bin --thinking medium
-./target/release/ullis chat  --model checkpoints/packed.bin --thinking xhigh --prompt "fn add("
-./target/release/ullis smoke
-```
-
-`--thinking low|medium|high|xhigh` sets the KAN eval budget. `low` masks
-routed (thinking) weights and emits output immediately. `xhigh` runs three
-residual KAN loops per block on the G=12 MoE stack, streamed live.
-
----
-
-## Data — strict 4-key JSONL
-
-Every training line is exactly:
-
-```json
-{ "system": "...", "user": "...", "thinking": "...", "output": "..." }
-```
-
-Packed as:
-
-```
-<|system|> … <|user|> … <|thinking|> … <|/thinking|> <|output|> …
-```
-
-Loss is masked onto `thinking` + `output` so the KAN layer learns the
-logical chain (bracket matching, import tracking, lifetime ownership,
-pipeline quoting). A verified sample corpus lives at
-[`data/thinking-train.jsonl`](data/thinking-train.jsonl) (Rust, Python, Bash).
-Lines that are not this 4-key object are skipped.
-
----
-
-## Visual reasoning UI
-
-| Lane     | ANSI                     | Marker                   |
-| -------- | ------------------------ | ------------------------ |
-| thinking | `\x1b[2;3m` dim + italic | `[Ullis is thinking...]` |
-| close    | reset                    | `└──`                    |
-| output   | `\x1b[1;32m` bold green  | code stream              |
-
-Colors honor `NO_COLOR` and non-TTY stdout. Persistent dialogue keeps only
-`system` / `user` / `output`.
-
----
-
-## Crate map
-
-| Module       | Role                                                          |
-| ------------ | ------------------------------------------------------------- |
-| `quant`      | TWN 2-bit pack/unpack + packed-i8 embedding plane             |
-| `gauss`      | G×G Gauss–Jordan (`matmul` / broadcast / `cat`, Metal-safe)   |
-| `kan`        | `TernaryKanLinear` + ReLU-bump basis + MoB router             |
-| `mixers`     | `CausalShift` (0 params) / tiny causal attention              |
-| `model`      | `UllisKan`: i8 embed → L × (shift + KAN) → RMSNorm → i8 logits|
-| `tokenizer`  | Byte-fallback WordPiece, vocab 8192                           |
-| `data`       | 4-key JSONL, `SovereignFlashBuffer` token ring                |
-| `think`      | budgets, ephemeral GC, dialogue cache                         |
-| `train`      | 4-phase QAT, G = 4→8→12 projection, masked CE                 |
-| `checkpoint` | `packed.bin` (magic `ULLIS03`)                                |
-| `chat`       | ANSI token streamer                                           |
-| `telemetry`  | RSS / tok/s / ternary histogram                               |
-
-Design matrix: [`DESIGN.md`](DESIGN.md).
-
----
-
-## License — MIT
-
-Ullis is open-source software licensed under the **MIT License**. See [`LICENSE`](LICENSE).
+The smoke path uses streamed MTP loss rather than allocating vocabulary logits.

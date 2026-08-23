@@ -1,0 +1,1365 @@
+//! Metal forward-path admission and shader-pipeline validation.
+//!
+//! This module intentionally starts with pipeline construction only. Buffer
+//! mapping is the one place where Metal requires raw pointers; it will live in
+//! a small, audited follow-up boundary rather than weakening the safe CPU model
+//! API throughout the crate.
+
+use anyhow::{Result, bail};
+
+/// A validated one-dimensional dispatch.
+///
+/// The first GPU kernels operate on flattened `[batch, time, channels]`
+/// tensors, so every index is representable by Metal's 32-bit `uint` without
+/// relying on truncating casts.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct MetalDispatchShape {
+    pub batch: usize,
+    pub time: usize,
+    pub channels: usize,
+}
+
+impl MetalDispatchShape {
+    pub fn new(batch: usize, time: usize, channels: usize) -> Result<Self> {
+        if batch == 0 || time == 0 || channels == 0 {
+            bail!("Metal dispatch dimensions must be non-zero");
+        }
+        let elements = batch
+            .checked_mul(time)
+            .and_then(|rows| rows.checked_mul(channels))
+            .ok_or_else(|| anyhow::anyhow!("Metal dispatch shape overflow"))?;
+        if u32::try_from(elements).is_err() {
+            bail!("Metal dispatch has more than u32::MAX elements");
+        }
+        Ok(Self {
+            batch,
+            time,
+            channels,
+        })
+    }
+
+    pub fn elements(self) -> usize {
+        self.batch * self.time * self.channels
+    }
+}
+
+/// The first compiled pipeline. It is an elementwise identity kernel used to
+/// prove buffer layout and dispatch mechanics before replacing it with fused
+/// RMSNorm/ternary and FFT stages.
+pub const IDENTITY_KERNEL_NAME: &str = "ullis_identity";
+pub const RMS_NORM_KERNEL_NAME: &str = "ullis_rms_norm";
+pub const TERNARY_LINEAR_KERNEL_NAME: &str = "ullis_ternary_linear";
+pub const RMS_NORM_TERNARY_LINEAR_KERNEL_NAME: &str = "ullis_rms_norm_ternary_linear";
+pub const FFT_BITREVERSE_KERNEL_NAME: &str = "ullis_fft_bitreverse";
+pub const FFT_STAGE_KERNEL_NAME: &str = "ullis_fft_stage";
+pub const FFT_COMPLEX_MULTIPLY_KERNEL_NAME: &str = "ullis_fft_complex_multiply";
+pub const FFT_EXTRACT_CAUSAL_KERNEL_NAME: &str = "ullis_fft_extract_causal";
+pub const HYENA_METAL_SOURCE: &str = include_str!("metal/hyena.metal");
+
+/// Checked dimensions for one packed-ternary projection.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TernaryLinearShape {
+    pub rows: usize,
+    pub in_features: usize,
+    pub out_features: usize,
+}
+
+impl TernaryLinearShape {
+    pub fn new(rows: usize, in_features: usize, out_features: usize) -> Result<Self> {
+        MetalDispatchShape::new(rows, 1, out_features)?;
+        if in_features == 0 || u32::try_from(in_features).is_err() {
+            bail!("Metal ternary input width is invalid");
+        }
+        Ok(Self {
+            rows,
+            in_features,
+            out_features,
+        })
+    }
+
+    pub fn packed_words(self) -> Result<usize> {
+        self.in_features
+            .checked_mul(self.out_features)
+            .ok_or_else(|| anyhow::anyhow!("Metal ternary weight shape overflow"))
+            .map(|weights| weights.div_ceil(64))
+    }
+}
+
+/// CPU reference for the exact packed-bitplane convention used by the Metal
+/// ternary shader. It is kept public for GPU equivalence tests and contains no
+/// model state or allocation beyond its output.
+pub fn ternary_reference(
+    input: &[f32],
+    positive: &[u64],
+    negative: &[u64],
+    scales: &[f32],
+    shape: TernaryLinearShape,
+) -> Result<Vec<f32>> {
+    let input_len = shape
+        .rows
+        .checked_mul(shape.in_features)
+        .ok_or_else(|| anyhow::anyhow!("ternary input shape overflow"))?;
+    let output_len = shape
+        .rows
+        .checked_mul(shape.out_features)
+        .ok_or_else(|| anyhow::anyhow!("ternary output shape overflow"))?;
+    let weights = shape
+        .in_features
+        .checked_mul(shape.out_features)
+        .ok_or_else(|| anyhow::anyhow!("ternary weight shape overflow"))?;
+    if input.len() != input_len
+        || positive.len() != shape.packed_words()?
+        || negative.len() != shape.packed_words()?
+        || scales.len() != shape.out_features
+    {
+        bail!("ternary reference shape mismatch");
+    }
+    let mut output = vec![0.0; output_len];
+    for row in 0..shape.rows {
+        for out in 0..shape.out_features {
+            let mut sum = 0.0;
+            for i in 0..shape.in_features {
+                let w = out * shape.in_features + i;
+                let bit = 1_u64 << (w % 64);
+                let code = if positive[w / 64] & bit != 0 {
+                    1.0
+                } else if negative[w / 64] & bit != 0 {
+                    -1.0
+                } else {
+                    0.0
+                };
+                sum += input[row * shape.in_features + i] * code;
+            }
+            output[row * shape.out_features + out] = sum * scales[out];
+        }
+    }
+    debug_assert_eq!(weights.div_ceil(64), positive.len());
+    Ok(output)
+}
+
+/// CPU reference for fused RMSNorm and packed ternary projection. The
+/// normalized row is never materialized, mirroring the GPU kernel's memory
+/// contract.
+pub fn rms_norm_ternary_reference(
+    input: &[f32],
+    positive: &[u64],
+    negative: &[u64],
+    scales: &[f32],
+    shape: TernaryLinearShape,
+) -> Result<Vec<f32>> {
+    let input_len = shape
+        .rows
+        .checked_mul(shape.in_features)
+        .ok_or_else(|| anyhow::anyhow!("fused ternary input shape overflow"))?;
+    if input.len() != input_len
+        || positive.len() != shape.packed_words()?
+        || negative.len() != shape.packed_words()?
+        || scales.len() != shape.out_features
+    {
+        bail!("fused ternary reference shape mismatch");
+    }
+    let output_len = shape
+        .rows
+        .checked_mul(shape.out_features)
+        .ok_or_else(|| anyhow::anyhow!("fused ternary output shape overflow"))?;
+    let mut output = vec![0.0; output_len];
+    for row in 0..shape.rows {
+        let source = &input[row * shape.in_features..(row + 1) * shape.in_features];
+        let inverse_rms = (source.iter().map(|value| value * value).sum::<f32>()
+            / shape.in_features as f32
+            + 1e-5)
+            .sqrt()
+            .recip();
+        for out in 0..shape.out_features {
+            let mut sum = 0.0;
+            for (i, value) in source.iter().enumerate() {
+                let weight = out * shape.in_features + i;
+                let bit = 1_u64 << (weight % 64);
+                let code = if positive[weight / 64] & bit != 0 {
+                    1.0
+                } else if negative[weight / 64] & bit != 0 {
+                    -1.0
+                } else {
+                    0.0
+                };
+                sum += value * code;
+            }
+            output[row * shape.out_features + out] = sum * inverse_rms * scales[out];
+        }
+    }
+    Ok(output)
+}
+
+#[cfg(target_os = "macos")]
+pub fn validate_metal_pipeline(shape: MetalDispatchShape) -> Result<usize> {
+    validate_metal_kernel(IDENTITY_KERNEL_NAME, shape)
+}
+
+/// Compiles a named Ullis MSL entry point and checks its dispatch capacity.
+/// This admits a kernel before it is allowed into the model execution path.
+#[cfg(target_os = "macos")]
+pub fn validate_metal_kernel(kernel_name: &str, shape: MetalDispatchShape) -> Result<usize> {
+    use objc2_foundation::NSString;
+    use objc2_metal::{
+        MTLCompileOptions, MTLComputePipelineState, MTLCreateSystemDefaultDevice, MTLDevice,
+        MTLLibrary,
+    };
+
+    let device = MTLCreateSystemDefaultDevice()
+        .ok_or_else(|| anyhow::anyhow!("Metal device is unavailable"))?;
+    let source = NSString::from_str(HYENA_METAL_SOURCE);
+    let options = MTLCompileOptions::new();
+    let library = device
+        .newLibraryWithSource_options_error(&source, Some(&options))
+        .map_err(|error| anyhow::anyhow!("Metal shader compilation failed: {error}"))?;
+    let name = NSString::from_str(kernel_name);
+    let function = library
+        .newFunctionWithName(&name)
+        .ok_or_else(|| anyhow::anyhow!("Metal function {kernel_name:?} is missing"))?;
+    let pipeline = device
+        .newComputePipelineStateWithFunction_error(&function)
+        .map_err(|error| anyhow::anyhow!("Metal pipeline creation failed: {error}"))?;
+    let width = pipeline.maxTotalThreadsPerThreadgroup();
+    if width == 0 {
+        bail!("Metal pipeline reported zero threads per threadgroup");
+    }
+    // The checked shape is deliberately consumed here: later dispatch code can
+    // use the same type without a second unchecked `usize -> uint` conversion.
+    let _ = shape.elements();
+    Ok(width)
+}
+
+#[cfg(not(target_os = "macos"))]
+pub fn validate_metal_pipeline(_shape: MetalDispatchShape) -> Result<usize> {
+    bail!("Ullis Metal backend requires macOS on Apple Silicon")
+}
+
+#[cfg(not(target_os = "macos"))]
+pub fn validate_metal_kernel(_kernel_name: &str, _shape: MetalDispatchShape) -> Result<usize> {
+    bail!("Ullis Metal backend requires macOS on Apple Silicon")
+}
+
+/// Executes the stage-zero Metal kernel and returns a fresh output vector.
+///
+/// This is intentionally a correctness harness, not the final tensor runtime:
+/// it proves the owned-buffer, command-buffer, and `[B,T,D]` dispatch contract
+/// against the CPU before more complex kernels are introduced.
+#[cfg(target_os = "macos")]
+#[allow(unsafe_code)]
+fn execute_reference_kernel(
+    input: &[f32],
+    kernel_name: &str,
+    grid_width: usize,
+    scalars: &[u32],
+) -> Result<Vec<f32>> {
+    use core::ffi::c_void;
+    use core::ptr::NonNull;
+    use objc2_foundation::NSString;
+    use objc2_metal::{
+        MTLBuffer, MTLCommandBuffer, MTLCommandEncoder, MTLCommandQueue, MTLCompileOptions,
+        MTLComputeCommandEncoder, MTLComputePipelineState, MTLCreateSystemDefaultDevice, MTLDevice,
+        MTLLibrary, MTLResourceOptions, MTLSize,
+    };
+
+    MetalDispatchShape::new(1, input.len(), 1)?;
+    if grid_width == 0 || u32::try_from(grid_width).is_err() {
+        bail!("Metal grid width is invalid");
+    }
+    let bytes = input
+        .len()
+        .checked_mul(size_of::<f32>())
+        .ok_or_else(|| anyhow::anyhow!("Metal buffer byte size overflow"))?;
+    let device = MTLCreateSystemDefaultDevice()
+        .ok_or_else(|| anyhow::anyhow!("Metal device is unavailable"))?;
+    let source = NSString::from_str(HYENA_METAL_SOURCE);
+    let options = MTLCompileOptions::new();
+    let library = device
+        .newLibraryWithSource_options_error(&source, Some(&options))
+        .map_err(|error| anyhow::anyhow!("Metal shader compilation failed: {error}"))?;
+    let name = NSString::from_str(kernel_name);
+    let function = library
+        .newFunctionWithName(&name)
+        .ok_or_else(|| anyhow::anyhow!("Metal identity function is missing"))?;
+    let pipeline = device
+        .newComputePipelineStateWithFunction_error(&function)
+        .map_err(|error| anyhow::anyhow!("Metal pipeline creation failed: {error}"))?;
+    let queue = device
+        .newCommandQueue()
+        .ok_or_else(|| anyhow::anyhow!("Metal command queue is unavailable"))?;
+    let input_buffer = device
+        .newBufferWithLength_options(bytes, MTLResourceOptions::StorageModeShared)
+        .ok_or_else(|| anyhow::anyhow!("Metal input buffer allocation failed"))?;
+    let output_buffer = device
+        .newBufferWithLength_options(bytes, MTLResourceOptions::StorageModeShared)
+        .ok_or_else(|| anyhow::anyhow!("Metal output buffer allocation failed"))?;
+
+    // SAFETY: Shared buffers are allocated for exactly `bytes`, which was
+    // checked from `input.len() * size_of::<f32>()`; both pointers stay valid
+    // while their retained buffers are in scope and Metal has not been sent a
+    // command buffer yet.
+    unsafe {
+        input_buffer
+            .contents()
+            .cast::<f32>()
+            .as_ptr()
+            .copy_from_nonoverlapping(input.as_ptr(), input.len());
+    }
+
+    let command = queue
+        .commandBuffer()
+        .ok_or_else(|| anyhow::anyhow!("Metal command buffer allocation failed"))?;
+    let encoder = command
+        .computeCommandEncoder()
+        .ok_or_else(|| anyhow::anyhow!("Metal compute encoder allocation failed"))?;
+    encoder.setComputePipelineState(&pipeline);
+    // SAFETY: indices 0 and 1 are the shared buffers in every reference MSL
+    // kernel. Scalar words are copied synchronously into consecutive slots.
+    unsafe {
+        encoder.setBuffer_offset_atIndex(Some(&input_buffer), 0, 0);
+        encoder.setBuffer_offset_atIndex(Some(&output_buffer), 0, 1);
+        for (offset, scalar) in scalars.iter().enumerate() {
+            encoder.setBytes_length_atIndex(
+                NonNull::from(scalar).cast::<c_void>(),
+                size_of::<u32>(),
+                offset + 2,
+            );
+        }
+    }
+    let thread_width = pipeline.maxTotalThreadsPerThreadgroup().min(grid_width);
+    if thread_width == 0 {
+        bail!("Metal pipeline reported zero threads per threadgroup");
+    }
+    encoder.dispatchThreads_threadsPerThreadgroup(
+        MTLSize {
+            width: grid_width,
+            height: 1,
+            depth: 1,
+        },
+        MTLSize {
+            width: thread_width,
+            height: 1,
+            depth: 1,
+        },
+    );
+    encoder.endEncoding();
+    command.commit();
+    command.waitUntilCompleted();
+    if let Some(error) = command.error() {
+        bail!("Metal identity command failed: {error}");
+    }
+
+    let mut output = vec![0.0; input.len()];
+    // SAFETY: GPU work is complete, `output_buffer` remains retained, and the
+    // destination vector has exactly the number of initialized `f32` slots
+    // represented by the source buffer.
+    unsafe {
+        output.as_mut_ptr().copy_from_nonoverlapping(
+            output_buffer.contents().cast::<f32>().as_ptr(),
+            output.len(),
+        );
+    }
+    Ok(output)
+}
+
+#[cfg(target_os = "macos")]
+pub fn identity_forward(input: &[f32]) -> Result<Vec<f32>> {
+    let elements = u32::try_from(input.len())
+        .map_err(|_| anyhow::anyhow!("Metal element count exceeds u32"))?;
+    execute_reference_kernel(input, IDENTITY_KERNEL_NAME, input.len(), &[elements])
+}
+
+/// GPU numerical-reference RMSNorm over contiguous rows.
+#[cfg(target_os = "macos")]
+pub fn rms_norm_forward(input: &[f32], rows: usize, channels: usize) -> Result<Vec<f32>> {
+    let shape = MetalDispatchShape::new(rows, 1, channels)?;
+    if input.len() != shape.elements() {
+        bail!("RMSNorm input shape mismatch");
+    }
+    let rows = u32::try_from(rows).map_err(|_| anyhow::anyhow!("RMSNorm rows exceed u32"))?;
+    let channels =
+        u32::try_from(channels).map_err(|_| anyhow::anyhow!("RMSNorm channels exceed u32"))?;
+    execute_reference_kernel(
+        input,
+        RMS_NORM_KERNEL_NAME,
+        rows as usize,
+        &[rows, channels],
+    )
+}
+
+/// Reusable Metal objects for the hot ternary projection path.
+///
+/// The runtime is intentionally single-threaded (`RefCell` protects its
+/// scratch buffers). A trainer should own one runtime on its dispatch thread;
+/// this prevents hidden locks and makes resource lifetime explicit.
+#[cfg(target_os = "macos")]
+pub struct MetalRuntime {
+    device: objc2::rc::Retained<objc2::runtime::ProtocolObject<dyn objc2_metal::MTLDevice>>,
+    queue: objc2::rc::Retained<objc2::runtime::ProtocolObject<dyn objc2_metal::MTLCommandQueue>>,
+    ternary_pipeline: objc2::rc::Retained<
+        objc2::runtime::ProtocolObject<dyn objc2_metal::MTLComputePipelineState>,
+    >,
+    fused_rms_norm_ternary_pipeline: objc2::rc::Retained<
+        objc2::runtime::ProtocolObject<dyn objc2_metal::MTLComputePipelineState>,
+    >,
+    fft_bitreverse_pipeline: objc2::rc::Retained<
+        objc2::runtime::ProtocolObject<dyn objc2_metal::MTLComputePipelineState>,
+    >,
+    fft_stage_pipeline: objc2::rc::Retained<
+        objc2::runtime::ProtocolObject<dyn objc2_metal::MTLComputePipelineState>,
+    >,
+    ternary_buffers: std::cell::RefCell<TernaryBuffers>,
+    fft_buffers: std::cell::RefCell<FftBuffers>,
+}
+
+#[cfg(target_os = "macos")]
+#[derive(Default)]
+struct TernaryBuffers {
+    input: Option<objc2::rc::Retained<objc2::runtime::ProtocolObject<dyn objc2_metal::MTLBuffer>>>,
+    positive:
+        Option<objc2::rc::Retained<objc2::runtime::ProtocolObject<dyn objc2_metal::MTLBuffer>>>,
+    negative:
+        Option<objc2::rc::Retained<objc2::runtime::ProtocolObject<dyn objc2_metal::MTLBuffer>>>,
+    scales: Option<objc2::rc::Retained<objc2::runtime::ProtocolObject<dyn objc2_metal::MTLBuffer>>>,
+    output: Option<objc2::rc::Retained<objc2::runtime::ProtocolObject<dyn objc2_metal::MTLBuffer>>>,
+    input_capacity: usize,
+    packed_capacity: usize,
+    scale_capacity: usize,
+    output_capacity: usize,
+}
+
+#[cfg(target_os = "macos")]
+#[derive(Default)]
+struct FftBuffers {
+    first: Option<objc2::rc::Retained<objc2::runtime::ProtocolObject<dyn objc2_metal::MTLBuffer>>>,
+    second: Option<objc2::rc::Retained<objc2::runtime::ProtocolObject<dyn objc2_metal::MTLBuffer>>>,
+    capacity: usize,
+}
+
+#[cfg(target_os = "macos")]
+impl FftBuffers {
+    fn ensure(
+        &mut self,
+        device: &objc2::runtime::ProtocolObject<dyn objc2_metal::MTLDevice>,
+        bytes: usize,
+    ) -> Result<()> {
+        use objc2_metal::{MTLDevice, MTLResourceOptions};
+
+        if self.capacity < bytes {
+            let shared = MTLResourceOptions::StorageModeShared;
+            self.first = Some(
+                device
+                    .newBufferWithLength_options(bytes, shared)
+                    .ok_or_else(|| anyhow::anyhow!("Metal FFT source allocation failed"))?,
+            );
+            self.second = Some(
+                device
+                    .newBufferWithLength_options(bytes, shared)
+                    .ok_or_else(|| anyhow::anyhow!("Metal FFT scratch allocation failed"))?,
+            );
+            self.capacity = bytes;
+        }
+        Ok(())
+    }
+}
+
+#[cfg(target_os = "macos")]
+impl TernaryBuffers {
+    fn ensure(
+        &mut self,
+        device: &objc2::runtime::ProtocolObject<dyn objc2_metal::MTLDevice>,
+        input_bytes: usize,
+        packed_bytes: usize,
+        scale_bytes: usize,
+        output_bytes: usize,
+    ) -> Result<()> {
+        use objc2_metal::{MTLDevice, MTLResourceOptions};
+
+        let shared = MTLResourceOptions::StorageModeShared;
+        if self.input_capacity < input_bytes {
+            self.input = Some(
+                device
+                    .newBufferWithLength_options(input_bytes, shared)
+                    .ok_or_else(|| anyhow::anyhow!("Metal input buffer allocation failed"))?,
+            );
+            self.input_capacity = input_bytes;
+        }
+        if self.packed_capacity < packed_bytes {
+            self.positive = Some(
+                device
+                    .newBufferWithLength_options(packed_bytes, shared)
+                    .ok_or_else(|| anyhow::anyhow!("Metal positive bitplane allocation failed"))?,
+            );
+            self.negative = Some(
+                device
+                    .newBufferWithLength_options(packed_bytes, shared)
+                    .ok_or_else(|| anyhow::anyhow!("Metal negative bitplane allocation failed"))?,
+            );
+            self.packed_capacity = packed_bytes;
+        }
+        if self.scale_capacity < scale_bytes {
+            self.scales = Some(
+                device
+                    .newBufferWithLength_options(scale_bytes, shared)
+                    .ok_or_else(|| anyhow::anyhow!("Metal scale buffer allocation failed"))?,
+            );
+            self.scale_capacity = scale_bytes;
+        }
+        if self.output_capacity < output_bytes {
+            self.output = Some(
+                device
+                    .newBufferWithLength_options(output_bytes, shared)
+                    .ok_or_else(|| anyhow::anyhow!("Metal output buffer allocation failed"))?,
+            );
+            self.output_capacity = output_bytes;
+        }
+        Ok(())
+    }
+}
+
+#[cfg(target_os = "macos")]
+impl MetalRuntime {
+    /// Compiles the ternary pipeline once and creates its command queue.
+    pub fn new() -> Result<Self> {
+        use objc2_foundation::NSString;
+        use objc2_metal::{MTLCompileOptions, MTLCreateSystemDefaultDevice, MTLDevice, MTLLibrary};
+
+        let device = MTLCreateSystemDefaultDevice()
+            .ok_or_else(|| anyhow::anyhow!("Metal device is unavailable"))?;
+        let source = NSString::from_str(HYENA_METAL_SOURCE);
+        let options = MTLCompileOptions::new();
+        let library = device
+            .newLibraryWithSource_options_error(&source, Some(&options))
+            .map_err(|error| anyhow::anyhow!("Metal shader compilation failed: {error}"))?;
+        let name = NSString::from_str(TERNARY_LINEAR_KERNEL_NAME);
+        let function = library
+            .newFunctionWithName(&name)
+            .ok_or_else(|| anyhow::anyhow!("Metal ternary function is missing"))?;
+        let ternary_pipeline = device
+            .newComputePipelineStateWithFunction_error(&function)
+            .map_err(|error| anyhow::anyhow!("Metal pipeline creation failed: {error}"))?;
+        let fused_name = NSString::from_str(RMS_NORM_TERNARY_LINEAR_KERNEL_NAME);
+        let fused_function = library
+            .newFunctionWithName(&fused_name)
+            .ok_or_else(|| anyhow::anyhow!("Metal fused ternary function is missing"))?;
+        let fused_rms_norm_ternary_pipeline = device
+            .newComputePipelineStateWithFunction_error(&fused_function)
+            .map_err(|error| anyhow::anyhow!("Metal fused pipeline creation failed: {error}"))?;
+        let bitreverse_name = NSString::from_str(FFT_BITREVERSE_KERNEL_NAME);
+        let bitreverse_function = library
+            .newFunctionWithName(&bitreverse_name)
+            .ok_or_else(|| anyhow::anyhow!("Metal FFT bitreverse function is missing"))?;
+        let fft_bitreverse_pipeline = device
+            .newComputePipelineStateWithFunction_error(&bitreverse_function)
+            .map_err(|error| {
+                anyhow::anyhow!("Metal FFT bitreverse pipeline creation failed: {error}")
+            })?;
+        let stage_name = NSString::from_str(FFT_STAGE_KERNEL_NAME);
+        let stage_function = library
+            .newFunctionWithName(&stage_name)
+            .ok_or_else(|| anyhow::anyhow!("Metal FFT stage function is missing"))?;
+        let fft_stage_pipeline = device
+            .newComputePipelineStateWithFunction_error(&stage_function)
+            .map_err(|error| {
+                anyhow::anyhow!("Metal FFT stage pipeline creation failed: {error}")
+            })?;
+        let queue = device
+            .newCommandQueue()
+            .ok_or_else(|| anyhow::anyhow!("Metal command queue is unavailable"))?;
+        Ok(Self {
+            device,
+            queue,
+            ternary_pipeline,
+            fused_rms_norm_ternary_pipeline,
+            fft_bitreverse_pipeline,
+            fft_stage_pipeline,
+            ternary_buffers: std::cell::RefCell::new(TernaryBuffers::default()),
+            fft_buffers: std::cell::RefCell::new(FftBuffers::default()),
+        })
+    }
+
+    /// Runs a projection without recompiling MSL or reallocating buffers when
+    /// the existing capacities already fit the requested shape.
+    #[allow(unsafe_code)]
+    fn dispatch_ternary(
+        &self,
+        input: &[f32],
+        positive: &[u64],
+        negative: &[u64],
+        scales: &[f32],
+        shape: TernaryLinearShape,
+        pipeline: &objc2::runtime::ProtocolObject<dyn objc2_metal::MTLComputePipelineState>,
+        fused_rms_norm: bool,
+    ) -> Result<Vec<f32>> {
+        use core::ffi::c_void;
+        use core::ptr::NonNull;
+        use objc2_metal::{
+            MTLBuffer, MTLCommandBuffer, MTLCommandEncoder, MTLCommandQueue,
+            MTLComputeCommandEncoder, MTLComputePipelineState, MTLSize,
+        };
+
+        let input_len = shape
+            .rows
+            .checked_mul(shape.in_features)
+            .ok_or_else(|| anyhow::anyhow!("ternary input shape overflow"))?;
+        let output_len = shape
+            .rows
+            .checked_mul(shape.out_features)
+            .ok_or_else(|| anyhow::anyhow!("ternary output shape overflow"))?;
+        let packed_words = shape.packed_words()?;
+        if input.len() != input_len
+            || positive.len() != packed_words
+            || negative.len() != packed_words
+            || scales.len() != shape.out_features
+        {
+            bail!("Metal ternary projection shape mismatch");
+        }
+        let input_bytes = input_len
+            .checked_mul(size_of::<f32>())
+            .ok_or_else(|| anyhow::anyhow!("Metal input buffer byte size overflow"))?;
+        let packed_bytes = packed_words
+            .checked_mul(size_of::<u64>())
+            .ok_or_else(|| anyhow::anyhow!("Metal ternary buffer byte size overflow"))?;
+        let scale_bytes = scales
+            .len()
+            .checked_mul(size_of::<f32>())
+            .ok_or_else(|| anyhow::anyhow!("Metal scale buffer byte size overflow"))?;
+        let output_bytes = output_len
+            .checked_mul(size_of::<f32>())
+            .ok_or_else(|| anyhow::anyhow!("Metal output buffer byte size overflow"))?;
+        let rows =
+            u32::try_from(shape.rows).map_err(|_| anyhow::anyhow!("Metal rows exceed u32"))?;
+        let in_features = u32::try_from(shape.in_features)
+            .map_err(|_| anyhow::anyhow!("Metal input width exceeds u32"))?;
+        let out_features = u32::try_from(shape.out_features)
+            .map_err(|_| anyhow::anyhow!("Metal output width exceeds u32"))?;
+        let mut buffers = self.ternary_buffers.borrow_mut();
+        buffers.ensure(
+            &self.device,
+            input_bytes,
+            packed_bytes,
+            scale_bytes,
+            output_bytes,
+        )?;
+        let input_buffer = buffers.input.as_ref().expect("checked Metal input buffer");
+        let positive_buffer = buffers
+            .positive
+            .as_ref()
+            .expect("checked Metal positive buffer");
+        let negative_buffer = buffers
+            .negative
+            .as_ref()
+            .expect("checked Metal negative buffer");
+        let scale_buffer = buffers.scales.as_ref().expect("checked Metal scale buffer");
+        let output_buffer = buffers
+            .output
+            .as_ref()
+            .expect("checked Metal output buffer");
+        // SAFETY: Capacities were checked above; host writes complete before
+        // submission and the mutable scratch borrow lasts through completion.
+        unsafe {
+            input_buffer
+                .contents()
+                .cast::<f32>()
+                .as_ptr()
+                .copy_from_nonoverlapping(input.as_ptr(), input_len);
+            positive_buffer
+                .contents()
+                .cast::<u64>()
+                .as_ptr()
+                .copy_from_nonoverlapping(positive.as_ptr(), packed_words);
+            negative_buffer
+                .contents()
+                .cast::<u64>()
+                .as_ptr()
+                .copy_from_nonoverlapping(negative.as_ptr(), packed_words);
+            scale_buffer
+                .contents()
+                .cast::<f32>()
+                .as_ptr()
+                .copy_from_nonoverlapping(scales.as_ptr(), scales.len());
+        }
+        let command = self
+            .queue
+            .commandBuffer()
+            .ok_or_else(|| anyhow::anyhow!("Metal command buffer allocation failed"))?;
+        let encoder = command
+            .computeCommandEncoder()
+            .ok_or_else(|| anyhow::anyhow!("Metal compute encoder allocation failed"))?;
+        encoder.setComputePipelineState(pipeline);
+        // SAFETY: Buffer and scalar slots exactly match the MSL declaration.
+        unsafe {
+            encoder.setBuffer_offset_atIndex(Some(input_buffer), 0, 0);
+            encoder.setBuffer_offset_atIndex(Some(positive_buffer), 0, 1);
+            encoder.setBuffer_offset_atIndex(Some(negative_buffer), 0, 2);
+            encoder.setBuffer_offset_atIndex(Some(scale_buffer), 0, 3);
+            encoder.setBuffer_offset_atIndex(Some(output_buffer), 0, 4);
+            encoder.setBytes_length_atIndex(
+                NonNull::from(&rows).cast::<c_void>(),
+                size_of::<u32>(),
+                5,
+            );
+            encoder.setBytes_length_atIndex(
+                NonNull::from(&in_features).cast::<c_void>(),
+                size_of::<u32>(),
+                6,
+            );
+            encoder.setBytes_length_atIndex(
+                NonNull::from(&out_features).cast::<c_void>(),
+                size_of::<u32>(),
+                7,
+            );
+        }
+        let width = if fused_rms_norm {
+            pipeline.maxTotalThreadsPerThreadgroup().min(256)
+        } else {
+            pipeline.maxTotalThreadsPerThreadgroup().min(output_len)
+        };
+        if width == 0 {
+            bail!("Metal ternary pipeline reported zero threads per threadgroup");
+        }
+        if fused_rms_norm {
+            encoder.dispatchThreadgroups_threadsPerThreadgroup(
+                MTLSize {
+                    width: shape.rows,
+                    height: 1,
+                    depth: 1,
+                },
+                MTLSize {
+                    width,
+                    height: 1,
+                    depth: 1,
+                },
+            );
+        } else {
+            encoder.dispatchThreads_threadsPerThreadgroup(
+                MTLSize {
+                    width: output_len,
+                    height: 1,
+                    depth: 1,
+                },
+                MTLSize {
+                    width,
+                    height: 1,
+                    depth: 1,
+                },
+            );
+        }
+        encoder.endEncoding();
+        command.commit();
+        command.waitUntilCompleted();
+        if let Some(error) = command.error() {
+            bail!("Metal ternary command failed: {error}");
+        }
+        let mut output = vec![0.0; output_len];
+        // SAFETY: Command completion makes the output shared buffer readable;
+        // its initialized elements exactly match the destination allocation.
+        unsafe {
+            output.as_mut_ptr().copy_from_nonoverlapping(
+                output_buffer.contents().cast::<f32>().as_ptr(),
+                output_len,
+            );
+        }
+        Ok(output)
+    }
+
+    /// Runs the unfused packed ternary projection through cached Metal state.
+    #[allow(unsafe_code)]
+    pub fn ternary_linear_forward(
+        &self,
+        input: &[f32],
+        positive: &[u64],
+        negative: &[u64],
+        scales: &[f32],
+        shape: TernaryLinearShape,
+    ) -> Result<Vec<f32>> {
+        self.dispatch_ternary(
+            input,
+            positive,
+            negative,
+            scales,
+            shape,
+            &self.ternary_pipeline,
+            false,
+        )
+    }
+
+    /// Fuses RMSNorm with ternary projection, keeping normalized activations
+    /// virtual and reusing the runtime's packed-weight buffers.
+    #[allow(unsafe_code)]
+    pub fn rms_norm_ternary_linear_forward(
+        &self,
+        input: &[f32],
+        positive: &[u64],
+        negative: &[u64],
+        scales: &[f32],
+        shape: TernaryLinearShape,
+    ) -> Result<Vec<f32>> {
+        self.dispatch_ternary(
+            input,
+            positive,
+            negative,
+            scales,
+            shape,
+            &self.fused_rms_norm_ternary_pipeline,
+            true,
+        )
+    }
+
+    /// Runs batched complex radix-2 FFTs through cached ping-pong buffers.
+    /// Values are interleaved as `(real, imaginary)` and each transform must
+    /// have the same power-of-two width.
+    #[allow(unsafe_code)]
+    pub fn fft_reference(
+        &self,
+        values: &[(f32, f32)],
+        transforms: usize,
+        inverse: bool,
+    ) -> Result<Vec<(f32, f32)>> {
+        use core::ffi::c_void;
+        use core::ptr::NonNull;
+        use objc2_metal::{
+            MTLBuffer, MTLCommandBuffer, MTLCommandEncoder, MTLCommandQueue,
+            MTLComputeCommandEncoder, MTLComputePipelineState, MTLSize,
+        };
+
+        if transforms == 0 || values.is_empty() || !values.len().is_multiple_of(transforms) {
+            bail!("Metal FFT shape mismatch");
+        }
+        let fft_len = values.len() / transforms;
+        if !fft_len.is_power_of_two() || u32::try_from(values.len()).is_err() {
+            bail!("Metal FFT length must be a non-zero u32 power of two");
+        }
+        let fft_len_u32 =
+            u32::try_from(fft_len).map_err(|_| anyhow::anyhow!("Metal FFT length exceeds u32"))?;
+        let transforms_u32 = u32::try_from(transforms)
+            .map_err(|_| anyhow::anyhow!("Metal FFT transform count exceeds u32"))?;
+        let bytes = values
+            .len()
+            .checked_mul(size_of::<(f32, f32)>())
+            .ok_or_else(|| anyhow::anyhow!("Metal FFT byte size overflow"))?;
+        let mut buffers = self.fft_buffers.borrow_mut();
+        buffers.ensure(&self.device, bytes)?;
+        let first = buffers
+            .first
+            .as_ref()
+            .expect("checked Metal FFT source buffer");
+        let second = buffers
+            .second
+            .as_ref()
+            .expect("checked Metal FFT scratch buffer");
+        // SAFETY: The shared source capacity was checked from `values`, and
+        // the borrow keeps both ping-pong buffers stable until GPU completion.
+        unsafe {
+            first
+                .contents()
+                .cast::<(f32, f32)>()
+                .as_ptr()
+                .copy_from_nonoverlapping(values.as_ptr(), values.len());
+        }
+        let command = self
+            .queue
+            .commandBuffer()
+            .ok_or_else(|| anyhow::anyhow!("Metal command buffer allocation failed"))?;
+        let encoder = command
+            .computeCommandEncoder()
+            .ok_or_else(|| anyhow::anyhow!("Metal compute encoder allocation failed"))?;
+        let dispatch = |encoder: &objc2::runtime::ProtocolObject<dyn MTLComputeCommandEncoder>,
+                        pipeline: &objc2::runtime::ProtocolObject<dyn MTLComputePipelineState>,
+                        input: &objc2::runtime::ProtocolObject<dyn MTLBuffer>,
+                        output: &objc2::runtime::ProtocolObject<dyn MTLBuffer>,
+                        scalars: &[u32]|
+         -> Result<()> {
+            encoder.setComputePipelineState(pipeline);
+            // SAFETY: Slots 0/1 and scalar slots beginning at 2 match both
+            // FFT MSL signatures; `setBytes` copies each scalar immediately.
+            unsafe {
+                encoder.setBuffer_offset_atIndex(Some(input), 0, 0);
+                encoder.setBuffer_offset_atIndex(Some(output), 0, 1);
+                for (offset, scalar) in scalars.iter().enumerate() {
+                    encoder.setBytes_length_atIndex(
+                        NonNull::from(scalar).cast::<c_void>(),
+                        size_of::<u32>(),
+                        offset + 2,
+                    );
+                }
+            }
+            let width = pipeline.maxTotalThreadsPerThreadgroup().min(values.len());
+            if width == 0 {
+                bail!("Metal FFT pipeline reported zero threads per threadgroup");
+            }
+            encoder.dispatchThreads_threadsPerThreadgroup(
+                MTLSize {
+                    width: values.len(),
+                    height: 1,
+                    depth: 1,
+                },
+                MTLSize {
+                    width,
+                    height: 1,
+                    depth: 1,
+                },
+            );
+            Ok(())
+        };
+        dispatch(
+            encoder.as_ref(),
+            &self.fft_bitreverse_pipeline,
+            first.as_ref(),
+            second.as_ref(),
+            &[fft_len_u32, transforms_u32],
+        )?;
+        let mut source_is_first = false;
+        for stage in 1..=fft_len.ilog2() {
+            let (input, output) = if source_is_first {
+                (first.as_ref(), second.as_ref())
+            } else {
+                (second.as_ref(), first.as_ref())
+            };
+            dispatch(
+                encoder.as_ref(),
+                &self.fft_stage_pipeline,
+                input,
+                output,
+                &[fft_len_u32, transforms_u32, stage, u32::from(inverse)],
+            )?;
+            source_is_first = !source_is_first;
+        }
+        encoder.endEncoding();
+        command.commit();
+        command.waitUntilCompleted();
+        if let Some(error) = command.error() {
+            bail!("Metal FFT command failed: {error}");
+        }
+        let result = if source_is_first { first } else { second };
+        let mut output = vec![(0.0, 0.0); values.len()];
+        // SAFETY: Command completion makes the selected result buffer readable
+        // and it has exactly the requested complex element capacity.
+        unsafe {
+            output.as_mut_ptr().copy_from_nonoverlapping(
+                result.contents().cast::<(f32, f32)>().as_ptr(),
+                values.len(),
+            );
+        }
+        if inverse {
+            let scale = fft_len as f32;
+            for value in &mut output {
+                value.0 /= scale;
+                value.1 /= scale;
+            }
+        }
+        Ok(output)
+    }
+}
+
+/// Executes one packed ternary projection on Metal.
+///
+/// This is still a numerical-reference path: buffers and pipeline are created
+/// per call so the result can be compared directly with the safe CPU model.
+/// A later persistent runtime will own and reuse these Metal objects.
+#[cfg(target_os = "macos")]
+#[allow(unsafe_code)]
+pub fn ternary_linear_forward(
+    input: &[f32],
+    positive: &[u64],
+    negative: &[u64],
+    scales: &[f32],
+    shape: TernaryLinearShape,
+) -> Result<Vec<f32>> {
+    use core::ffi::c_void;
+    use core::ptr::NonNull;
+    use objc2_foundation::NSString;
+    use objc2_metal::{
+        MTLBuffer, MTLCommandBuffer, MTLCommandEncoder, MTLCommandQueue, MTLCompileOptions,
+        MTLComputeCommandEncoder, MTLComputePipelineState, MTLCreateSystemDefaultDevice, MTLDevice,
+        MTLLibrary, MTLResourceOptions, MTLSize,
+    };
+
+    let input_len = shape
+        .rows
+        .checked_mul(shape.in_features)
+        .ok_or_else(|| anyhow::anyhow!("ternary input shape overflow"))?;
+    let output_len = shape
+        .rows
+        .checked_mul(shape.out_features)
+        .ok_or_else(|| anyhow::anyhow!("ternary output shape overflow"))?;
+    let packed_words = shape.packed_words()?;
+    if input.len() != input_len
+        || positive.len() != packed_words
+        || negative.len() != packed_words
+        || scales.len() != shape.out_features
+    {
+        bail!("Metal ternary projection shape mismatch");
+    }
+    let input_bytes = input_len
+        .checked_mul(size_of::<f32>())
+        .ok_or_else(|| anyhow::anyhow!("Metal input buffer byte size overflow"))?;
+    let packed_bytes = packed_words
+        .checked_mul(size_of::<u64>())
+        .ok_or_else(|| anyhow::anyhow!("Metal ternary buffer byte size overflow"))?;
+    let scale_bytes = scales
+        .len()
+        .checked_mul(size_of::<f32>())
+        .ok_or_else(|| anyhow::anyhow!("Metal scale buffer byte size overflow"))?;
+    let output_bytes = output_len
+        .checked_mul(size_of::<f32>())
+        .ok_or_else(|| anyhow::anyhow!("Metal output buffer byte size overflow"))?;
+    let rows = u32::try_from(shape.rows).map_err(|_| anyhow::anyhow!("Metal rows exceed u32"))?;
+    let in_features = u32::try_from(shape.in_features)
+        .map_err(|_| anyhow::anyhow!("Metal input width exceeds u32"))?;
+    let out_features = u32::try_from(shape.out_features)
+        .map_err(|_| anyhow::anyhow!("Metal output width exceeds u32"))?;
+
+    let device = MTLCreateSystemDefaultDevice()
+        .ok_or_else(|| anyhow::anyhow!("Metal device is unavailable"))?;
+    let source = NSString::from_str(HYENA_METAL_SOURCE);
+    let options = MTLCompileOptions::new();
+    let library = device
+        .newLibraryWithSource_options_error(&source, Some(&options))
+        .map_err(|error| anyhow::anyhow!("Metal shader compilation failed: {error}"))?;
+    let name = NSString::from_str(TERNARY_LINEAR_KERNEL_NAME);
+    let function = library
+        .newFunctionWithName(&name)
+        .ok_or_else(|| anyhow::anyhow!("Metal ternary function is missing"))?;
+    let pipeline = device
+        .newComputePipelineStateWithFunction_error(&function)
+        .map_err(|error| anyhow::anyhow!("Metal pipeline creation failed: {error}"))?;
+    let queue = device
+        .newCommandQueue()
+        .ok_or_else(|| anyhow::anyhow!("Metal command queue is unavailable"))?;
+    let shared = MTLResourceOptions::StorageModeShared;
+    let input_buffer = device
+        .newBufferWithLength_options(input_bytes, shared)
+        .ok_or_else(|| anyhow::anyhow!("Metal input buffer allocation failed"))?;
+    let positive_buffer = device
+        .newBufferWithLength_options(packed_bytes, shared)
+        .ok_or_else(|| anyhow::anyhow!("Metal positive bitplane allocation failed"))?;
+    let negative_buffer = device
+        .newBufferWithLength_options(packed_bytes, shared)
+        .ok_or_else(|| anyhow::anyhow!("Metal negative bitplane allocation failed"))?;
+    let scale_buffer = device
+        .newBufferWithLength_options(scale_bytes, shared)
+        .ok_or_else(|| anyhow::anyhow!("Metal scale buffer allocation failed"))?;
+    let output_buffer = device
+        .newBufferWithLength_options(output_bytes, shared)
+        .ok_or_else(|| anyhow::anyhow!("Metal output buffer allocation failed"))?;
+
+    // SAFETY: Each shared buffer was allocated from the exact checked byte
+    // count of its source slice. The command is only submitted after all host
+    // copies complete, and retained buffers outlive the command.
+    unsafe {
+        input_buffer
+            .contents()
+            .cast::<f32>()
+            .as_ptr()
+            .copy_from_nonoverlapping(input.as_ptr(), input_len);
+        positive_buffer
+            .contents()
+            .cast::<u64>()
+            .as_ptr()
+            .copy_from_nonoverlapping(positive.as_ptr(), packed_words);
+        negative_buffer
+            .contents()
+            .cast::<u64>()
+            .as_ptr()
+            .copy_from_nonoverlapping(negative.as_ptr(), packed_words);
+        scale_buffer
+            .contents()
+            .cast::<f32>()
+            .as_ptr()
+            .copy_from_nonoverlapping(scales.as_ptr(), scales.len());
+    }
+
+    let command = queue
+        .commandBuffer()
+        .ok_or_else(|| anyhow::anyhow!("Metal command buffer allocation failed"))?;
+    let encoder = command
+        .computeCommandEncoder()
+        .ok_or_else(|| anyhow::anyhow!("Metal compute encoder allocation failed"))?;
+    encoder.setComputePipelineState(&pipeline);
+    // SAFETY: Buffer slots and scalar slots exactly mirror the MSL signature
+    // for `ullis_ternary_linear`; scalar values are copied synchronously.
+    unsafe {
+        encoder.setBuffer_offset_atIndex(Some(&input_buffer), 0, 0);
+        encoder.setBuffer_offset_atIndex(Some(&positive_buffer), 0, 1);
+        encoder.setBuffer_offset_atIndex(Some(&negative_buffer), 0, 2);
+        encoder.setBuffer_offset_atIndex(Some(&scale_buffer), 0, 3);
+        encoder.setBuffer_offset_atIndex(Some(&output_buffer), 0, 4);
+        encoder.setBytes_length_atIndex(NonNull::from(&rows).cast::<c_void>(), size_of::<u32>(), 5);
+        encoder.setBytes_length_atIndex(
+            NonNull::from(&in_features).cast::<c_void>(),
+            size_of::<u32>(),
+            6,
+        );
+        encoder.setBytes_length_atIndex(
+            NonNull::from(&out_features).cast::<c_void>(),
+            size_of::<u32>(),
+            7,
+        );
+    }
+    let thread_width = pipeline.maxTotalThreadsPerThreadgroup().min(output_len);
+    if thread_width == 0 {
+        bail!("Metal ternary pipeline reported zero threads per threadgroup");
+    }
+    encoder.dispatchThreads_threadsPerThreadgroup(
+        MTLSize {
+            width: output_len,
+            height: 1,
+            depth: 1,
+        },
+        MTLSize {
+            width: thread_width,
+            height: 1,
+            depth: 1,
+        },
+    );
+    encoder.endEncoding();
+    command.commit();
+    command.waitUntilCompleted();
+    if let Some(error) = command.error() {
+        bail!("Metal ternary command failed: {error}");
+    }
+    let mut output = vec![0.0; output_len];
+    // SAFETY: The command completed successfully, so Metal no longer writes
+    // the retained shared buffer, whose initialized byte count matches output.
+    unsafe {
+        output
+            .as_mut_ptr()
+            .copy_from_nonoverlapping(output_buffer.contents().cast::<f32>().as_ptr(), output_len);
+    }
+    Ok(output)
+}
+
+#[cfg(not(target_os = "macos"))]
+pub fn identity_forward(_input: &[f32]) -> Result<Vec<f32>> {
+    bail!("Ullis Metal backend requires macOS on Apple Silicon")
+}
+
+#[cfg(not(target_os = "macos"))]
+pub fn rms_norm_forward(_input: &[f32], _rows: usize, _channels: usize) -> Result<Vec<f32>> {
+    bail!("Ullis Metal backend requires macOS on Apple Silicon")
+}
+
+#[cfg(not(target_os = "macos"))]
+pub fn ternary_linear_forward(
+    _input: &[f32],
+    _positive: &[u64],
+    _negative: &[u64],
+    _scales: &[f32],
+    _shape: TernaryLinearShape,
+) -> Result<Vec<f32>> {
+    bail!("Ullis Metal backend requires macOS on Apple Silicon")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn dispatch_shape_rejects_zero_and_32_bit_overflow() {
+        assert!(MetalDispatchShape::new(0, 1, 1).is_err());
+        assert!(MetalDispatchShape::new(1, 1, 0).is_err());
+        assert!(MetalDispatchShape::new(65_536, 65_536, 1).is_err());
+        assert_eq!(MetalDispatchShape::new(2, 3, 4).unwrap().elements(), 24);
+    }
+
+    #[test]
+    fn ternary_shape_uses_two_packed_bitplanes() {
+        assert_eq!(
+            TernaryLinearShape::new(2, 65, 3)
+                .unwrap()
+                .packed_words()
+                .unwrap(),
+            4
+        );
+    }
+
+    #[test]
+    fn ternary_reference_decodes_both_bitplanes() {
+        let shape = TernaryLinearShape::new(1, 3, 2).unwrap();
+        let output = ternary_reference(
+            &[2.0, 3.0, 5.0],
+            &[0b011001],
+            &[0b000010],
+            &[2.0, 0.5],
+            shape,
+        )
+        .unwrap();
+        assert_eq!(output, vec![-2.0, 2.5]);
+    }
+
+    #[test]
+    fn fused_reference_keeps_normalized_rows_virtual() {
+        let shape = TernaryLinearShape::new(1, 3, 2).unwrap();
+        let output = rms_norm_ternary_reference(
+            &[3.0, 4.0, 0.0],
+            &[0b011001],
+            &[0b000010],
+            &[2.0, 0.5],
+            shape,
+        )
+        .unwrap();
+        let inverse_rms = (25.0_f32 / 3.0 + 1e-5).sqrt().recip();
+        assert!((output[0] + 2.0 * inverse_rms).abs() < 1e-6);
+        assert!((output[1] - 3.5 * inverse_rms).abs() < 1e-6);
+    }
+
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn fft_stage_kernels_compile_on_the_local_metal_device() {
+        let shape = MetalDispatchShape::new(1, 8, 1).unwrap();
+        for kernel in [
+            FFT_BITREVERSE_KERNEL_NAME,
+            FFT_STAGE_KERNEL_NAME,
+            FFT_COMPLEX_MULTIPLY_KERNEL_NAME,
+            FFT_EXTRACT_CAUSAL_KERNEL_NAME,
+        ] {
+            if let Ok(width) = validate_metal_kernel(kernel, shape) {
+                assert!(width > 0);
+            }
+        }
+    }
+
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn identity_shader_compiles_on_the_local_metal_device() {
+        // CI and sandboxed shells may deliberately expose no GPU. The public
+        // constructor reports that condition as a recoverable error; a local
+        // Metal-enabled run still compiles the shader and checks its pipeline.
+        if let Ok(width) = validate_metal_pipeline(MetalDispatchShape::new(1, 8, 16).unwrap()) {
+            assert!(width > 0);
+        }
+    }
+
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn rms_norm_shader_compiles_on_the_local_metal_device() {
+        if let Ok(width) = validate_metal_kernel(
+            RMS_NORM_KERNEL_NAME,
+            MetalDispatchShape::new(1, 8, 16).unwrap(),
+        ) {
+            assert!(width > 0);
+        }
+    }
+
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn ternary_shader_compiles_on_the_local_metal_device() {
+        if let Ok(width) = validate_metal_kernel(
+            TERNARY_LINEAR_KERNEL_NAME,
+            MetalDispatchShape::new(1, 8, 16).unwrap(),
+        ) {
+            assert!(width > 0);
+        }
+    }
+
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn identity_kernel_round_trips_fp32_data_when_metal_is_available() {
+        let input = [-1.0, 0.0, 0.5, 3.25];
+        if let Ok(output) = identity_forward(&input) {
+            assert_eq!(output, input);
+        }
+    }
+
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn rms_norm_matches_cpu_reference_when_metal_is_available() {
+        let input = [3.0, 4.0, 0.0, 2.0, -2.0, 1.0];
+        if let Ok(output) = rms_norm_forward(&input, 2, 3) {
+            for (row, actual) in output.chunks_exact(3).enumerate() {
+                let source = &input[row * 3..row * 3 + 3];
+                let inv = (source.iter().map(|x| x * x).sum::<f32>() / 3.0 + 1e-5)
+                    .sqrt()
+                    .recip();
+                for (&value, expected) in actual.iter().zip(source.iter().map(|x| x * inv)) {
+                    assert!((value - expected).abs() < 1e-5);
+                }
+            }
+        }
+    }
+
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn ternary_kernel_matches_cpu_reference_when_metal_is_available() {
+        let shape = TernaryLinearShape::new(2, 3, 2).unwrap();
+        let input = [2.0, 3.0, 5.0, -1.0, 4.0, 2.0];
+        let positive = [0b011001];
+        let negative = [0b000010];
+        let scales = [2.0, 0.5];
+        let expected = ternary_reference(&input, &positive, &negative, &scales, shape).unwrap();
+        if let Ok(actual) = ternary_linear_forward(&input, &positive, &negative, &scales, shape) {
+            for (actual, expected) in actual.iter().zip(expected) {
+                assert!((actual - expected).abs() < 1e-6);
+            }
+        }
+    }
+
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn runtime_reuses_ternary_pipeline_and_buffers_when_metal_is_available() {
+        let shape = TernaryLinearShape::new(2, 3, 2).unwrap();
+        let input = [2.0, 3.0, 5.0, -1.0, 4.0, 2.0];
+        let positive = [0b011001];
+        let negative = [0b000010];
+        let scales = [2.0, 0.5];
+        let expected = ternary_reference(&input, &positive, &negative, &scales, shape).unwrap();
+        if let Ok(runtime) = MetalRuntime::new() {
+            let first = runtime
+                .ternary_linear_forward(&input, &positive, &negative, &scales, shape)
+                .unwrap();
+            let second = runtime
+                .ternary_linear_forward(&input, &positive, &negative, &scales, shape)
+                .unwrap();
+            assert_eq!(first, expected);
+            assert_eq!(second, expected);
+        }
+    }
+
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn fused_runtime_matches_cpu_reference_when_metal_is_available() {
+        let shape = TernaryLinearShape::new(2, 3, 2).unwrap();
+        let input = [3.0, 4.0, 0.0, -1.0, 4.0, 2.0];
+        let positive = [0b011001];
+        let negative = [0b000010];
+        let scales = [2.0, 0.5];
+        let expected =
+            rms_norm_ternary_reference(&input, &positive, &negative, &scales, shape).unwrap();
+        if let Ok(runtime) = MetalRuntime::new() {
+            let actual = runtime
+                .rms_norm_ternary_linear_forward(&input, &positive, &negative, &scales, shape)
+                .unwrap();
+            for (actual, expected) in actual.iter().zip(expected) {
+                assert!((actual - expected).abs() < 1e-5);
+            }
+        }
+    }
+
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn cached_fft_round_trips_complex_data_when_metal_is_available() {
+        let input = [(1.0, 0.0), (2.0, -1.0), (0.5, 3.0), (-2.0, 0.25)];
+        if let Ok(runtime) = MetalRuntime::new() {
+            let spectrum = runtime.fft_reference(&input, 1, false).unwrap();
+            let output = runtime.fft_reference(&spectrum, 1, true).unwrap();
+            for (actual, expected) in output.iter().zip(input) {
+                assert!((actual.0 - expected.0).abs() < 1e-5);
+                assert!((actual.1 - expected.1).abs() < 1e-5);
+            }
+        }
+    }
+
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn cached_fft_matches_known_forward_spectrum_when_metal_is_available() {
+        let input = [(1.0, 0.0), (2.0, 0.0), (0.0, 0.0), (0.0, 0.0)];
+        let expected = [(3.0, 0.0), (1.0, -2.0), (-1.0, 0.0), (1.0, 2.0)];
+        if let Ok(runtime) = MetalRuntime::new() {
+            let actual = runtime.fft_reference(&input, 1, false).unwrap();
+            for (actual, expected) in actual.iter().zip(expected) {
+                assert!((actual.0 - expected.0).abs() < 1e-5);
+                assert!((actual.1 - expected.1).abs() < 1e-5);
+            }
+        }
+    }
+}

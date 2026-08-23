@@ -1,352 +1,243 @@
+//! Configuration for the single supported architecture: dense ternary Hyena.
+use crate::optimizer::LionConfig;
+use crate::tokenizer::{BpeTokenizer, MIN_VOCAB};
 use anyhow::{bail, Result};
 use serde::{Deserialize, Serialize};
+pub const MAX_CONTEXT_LEN: usize = 32_768;
+/// Default process budget.  Leaving headroom is essential on unified memory:
+/// macOS needs room for the window server, Metal driver, and file cache.
+pub const DEFAULT_MEMORY_BUDGET_BYTES: usize = 1_073_741_824;
 
-pub const N_EXPERTS: usize = 3;
-pub const EXPERT_NAMES: [&str; N_EXPERTS] = ["python", "rust", "bash"];
+/// Conservative, overflow-checked upper bounds used before allocation.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct MemoryEstimate {
+    /// FP32 trainable state before optimiser copies.
+    pub parameters: usize,
+    /// Two packed bitplanes for each ternary projection.
+    pub ternary_codes: usize,
+    /// Per-output dequantisation scales for ternary projections.
+    pub ternary_scales: usize,
+    pub forward_working_set: usize,
+    /// Reused real filter and two complex FFT work buffers for one channel.
+    pub hyena_workspace: usize,
+    pub materialized_mtp_logits: usize,
+}
 
-/// Defaults fit an M1 8 GB unified-memory budget (Ullis v0.5).
+impl MemoryEstimate {
+    pub fn inference_peak(self) -> Option<usize> {
+        self.parameters
+            .checked_add(self.ternary_codes)
+            .and_then(|total| total.checked_add(self.ternary_scales))
+            .and_then(|total| total.checked_add(self.forward_working_set))
+            .and_then(|total| total.checked_add(self.hyena_workspace))
+    }
+
+    pub fn training_peak(self) -> Option<usize> {
+        // FP32 master weights, gradient, and Lion's one momentum vector.
+        // Packed codes are resident independently and remain needed for the
+        // forward pass.
+        self.parameters
+            .checked_mul(12)
+            .and_then(|weights| weights.checked_add(self.ternary_codes))
+            .and_then(|total| total.checked_add(self.ternary_scales))
+            .and_then(|total| total.checked_add(self.forward_working_set))
+            .and_then(|total| total.checked_add(self.hyena_workspace))
+    }
+}
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct TrainConfig {
     pub d_model: usize,
     pub n_layers: usize,
-    /// Current / start grid; updated as the grid grows.
-    pub n_basis: usize,
-    pub grid_start: usize,
-    pub grid_mid: usize,
-    pub grid_final: usize,
-    pub seq_len: usize,
-    /// Continuous `SovereignFlashBuffer` cap (token ids). Independent of `seq_len`.
-    #[serde(default = "default_context_len")]
+    pub vocab_size: usize,
     pub context_len: usize,
     pub batch_size: usize,
-    /// `"shift"` (0 extra params) or `"attn"`.
-    pub mixer: String,
-    pub n_heads: usize,
-    pub vocab_size: usize,
-    pub lr: f64,
-    pub lr_qat: f64,
-    pub lr_harden: f64,
-    pub momentum: f64,
-    pub l1: f64,
-    pub ternary_delta: f64,
-    pub steps_per_epoch: usize,
-    pub epochs_warmup: usize,
-    pub epochs_sparsify: usize,
-    pub epochs_qat: usize,
-    pub epochs_harden: usize,
-    pub max_norm: f64,
+    pub filter_order: usize,
+    pub ternary_delta: f32,
     pub seed: u64,
-    pub ckpt_dir: String,
-    pub log_every: usize,
-    pub tokenizer_path: String,
-    pub data_path: String,
-    /// Mixture-of-Bumps: split G into shared + routed experts.
-    pub moe: bool,
-    pub n_experts: usize,
-    /// Shannon entropy penalty on vocab softmax (`λ_H`). Language-agnostic.
-    #[serde(default = "default_entropy_coef")]
-    pub entropy_coef: f64,
-    /// Shannon entropy penalty on the K-expert router (`λ_R`).
-    #[serde(default = "default_router_entropy_coef")]
-    pub router_entropy_coef: f64,
-    /// Insert one non-uniform knot every N steps during phases 1–2.
-    #[serde(default = "default_knot_insert_every")]
-    pub knot_insert_every: usize,
-    /// EMA decay for per-knot residual energy / per-edge grad variance.
-    #[serde(default = "default_knot_ema")]
-    pub knot_ema: f64,
-    /// Recompute layer activations on the backward pass (fused Metal / host).
-    #[serde(default = "default_fused_grad_ckpt")]
-    pub fused_grad_ckpt: bool,
-    /// Storage master for KAN weights. Compute is always FP32 (hot unpack).
     #[serde(default)]
-    pub master: MasterDtype,
-    /// Momentum storage. Compute is always FP32.
-    #[serde(default)]
-    pub mom: MomDtype,
-    /// 0 = dense MoB (bit-identical). 1|2 = per-token top-k after full softmax.
-    #[serde(default)]
-    pub moe_topk: u32,
-    /// Switch load-balance `α · K · Σ f_i P_i`. Used only when `moe_topk > 0`.
-    #[serde(default = "default_moe_aux")]
-    pub moe_aux: f64,
-    /// KAN factorization. Shared-edge is the production layout; `None` is rejected.
-    #[serde(default)]
-    pub kan_factor: KanFactor,
-    /// `kan` (production) or `memory` (experimental).
-    #[serde(default)]
-    pub arch: ModelArch,
-    /// Memory-arch expert inner width `W`.
-    #[serde(default = "default_expert_width")]
-    pub expert_width: usize,
-    /// Memory-arch slot count `S`.
-    #[serde(default = "default_n_slots")]
-    pub n_slots: usize,
-    /// Memory-arch expert count `E`. Independent of MoB `n_experts`.
-    #[serde(default = "default_mem_experts")]
-    pub mem_experts: usize,
-    /// Causal local mix width. 0 disables. Clamped to 64 — never `T`.
-    #[serde(default = "default_window")]
-    pub window: usize,
-    /// If true, CE is only on the output span (thinking is context).
-    #[serde(default)]
-    pub mask_output: bool,
+    pub lion: LionConfig,
+    /// Hard allocation budget.  Runtime paths reject oversized requests before
+    /// building vectors; callers may set a lower value for constrained Macs.
+    #[serde(default = "default_memory_budget_bytes")]
+    pub memory_budget_bytes: usize,
 }
-
-/// Trainable model class.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
-pub enum ModelArch {
-    #[default]
-    Kan,
-    Memory,
-}
-
-impl ModelArch {
-    pub fn parse_name(s: &str) -> Result<Self> {
-        match s.to_ascii_lowercase().as_str() {
-            "kan" | "ulliskan" | "" => Ok(Self::Kan),
-            "memory" | "mem" => Ok(Self::Memory),
-            other => bail!("--arch {other}: expected kan|memory"),
-        }
-    }
-}
-
-/// Spline coefficient layout. Shared-edge is the only production path.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
-pub enum KanFactor {
-    None,
-    #[default]
-    SharedEdge,
-}
-
-impl KanFactor {
-    pub fn parse_name(s: &str) -> Result<Self> {
-        match s.to_ascii_lowercase().as_str() {
-            "none" | "off" | "unfactored" => Ok(Self::None),
-            "shared-edge" | "shared_edge" | "edge" => Ok(Self::SharedEdge),
-            other => bail!("--kan-factor {other}: expected none|shared-edge"),
-        }
-    }
-
-    pub fn as_u32(self) -> u32 {
-        match self {
-            Self::None => 0,
-            Self::SharedEdge => 1,
-        }
-    }
-
-    pub fn shared_edge(self) -> bool {
-        matches!(self, Self::SharedEdge)
-    }
-}
-
-/// KAN weight storage dtype. Centers / Gauss / knots stay FP32.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
-pub enum MasterDtype {
-    #[default]
-    Fp32,
-    Fp16,
-}
-
-impl MasterDtype {
-    pub fn parse_name(s: &str) -> Result<Self> {
-        match s.to_ascii_lowercase().as_str() {
-            "fp32" | "f32" => Ok(Self::Fp32),
-            "fp16" | "f16" => Ok(Self::Fp16),
-            other => bail!("--master {other}: expected fp32|fp16"),
-        }
-    }
-}
-
-/// SGD velocity storage.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
-pub enum MomDtype {
-    #[default]
-    Fp32,
-    Q8,
-}
-
-impl MomDtype {
-    pub fn parse_name(s: &str) -> Result<Self> {
-        match s.to_ascii_lowercase().as_str() {
-            "fp32" | "f32" => Ok(Self::Fp32),
-            "q8" | "int8" | "i8" => Ok(Self::Q8),
-            other => bail!("--mom {other}: expected fp32|q8"),
-        }
-    }
-}
-
-fn default_entropy_coef() -> f64 {
-    0.0
-}
-fn default_router_entropy_coef() -> f64 {
-    0.05
-}
-fn default_knot_insert_every() -> usize {
-    50
-}
-fn default_knot_ema() -> f64 {
-    0.9
-}
-fn default_context_len() -> usize {
-    crate::data::MAX_TOKEN_BUF
-}
-fn default_fused_grad_ckpt() -> bool {
-    true
-}
-fn default_moe_aux() -> f64 {
-    0.01
-}
-fn default_expert_width() -> usize {
-    64
-}
-fn default_n_slots() -> usize {
-    32
-}
-fn default_mem_experts() -> usize {
-    4
-}
-fn default_window() -> usize {
-    16
-}
-
 impl Default for TrainConfig {
     fn default() -> Self {
         Self {
-            d_model: 32,
-            n_layers: 3,
-            n_basis: 4,
-            grid_start: 4,
-            grid_mid: 8,
-            grid_final: 12,
-            seq_len: 96,
-            context_len: default_context_len(),
-            batch_size: 4,
-            mixer: "shift".into(),
-            n_heads: 1,
+            d_model: 256,
+            n_layers: 6,
             vocab_size: 8192,
-            lr: 3e-3,
-            lr_qat: 1e-3,
-            lr_harden: 3e-4,
-            momentum: 0.9,
-            l1: 1e-3,
+            context_len: MAX_CONTEXT_LEN,
+            batch_size: 1,
+            filter_order: 8,
             ternary_delta: 0.7,
-            steps_per_epoch: 200,
-            epochs_warmup: 3,
-            epochs_sparsify: 2,
-            epochs_qat: 4,
-            epochs_harden: 2,
-            max_norm: 1.0,
             seed: 7,
-            ckpt_dir: "checkpoints".into(),
-            log_every: 20,
-            tokenizer_path: String::new(),
-            data_path: "data/thinking-train.jsonl".into(),
-            moe: true,
-            n_experts: N_EXPERTS,
-            entropy_coef: default_entropy_coef(),
-            router_entropy_coef: default_router_entropy_coef(),
-            knot_insert_every: default_knot_insert_every(),
-            knot_ema: default_knot_ema(),
-            fused_grad_ckpt: default_fused_grad_ckpt(),
-            master: MasterDtype::Fp32,
-            mom: MomDtype::Fp32,
-            moe_topk: 0,
-            moe_aux: default_moe_aux(),
-            kan_factor: KanFactor::SharedEdge,
-            arch: ModelArch::Kan,
-            expert_width: default_expert_width(),
-            n_slots: default_n_slots(),
-            mem_experts: default_mem_experts(),
-            window: default_window(),
-            mask_output: false,
+            lion: LionConfig::default(),
+            memory_budget_bytes: DEFAULT_MEMORY_BUDGET_BYTES,
         }
     }
 }
-
 impl TrainConfig {
-    /// Shared / routed split of the bump grid.
-    ///
-    /// G=4 → (3,1), G=8 → (6,2), G=12 → (8,4). All-shared when MoB is off.
-    pub fn split_basis(&self) -> (usize, usize) {
-        split_basis(self.n_basis, self.moe)
+    pub fn validate(&self) -> Result<()> {
+        if self.d_model == 0 || self.n_layers == 0 || self.vocab_size < MIN_VOCAB as usize {
+            bail!("d_model, n_layers, and vocab_size must be non-zero (vocab >= {MIN_VOCAB})");
+        }
+        if self.context_len == 0 || self.context_len > MAX_CONTEXT_LEN {
+            bail!("context_len must be in 1..={MAX_CONTEXT_LEN}");
+        }
+        if self.filter_order == 0 || !self.ternary_delta.is_finite() || self.ternary_delta <= 0.0 {
+            bail!("filter_order and ternary_delta must be positive");
+        }
+        self.lion.validate()?;
+        let estimate = self.memory_estimate()?;
+        if !matches!(estimate.training_peak(), Some(n) if n <= self.memory_budget_bytes) {
+            bail!(
+                "configuration needs more than the {} MiB memory budget; reduce d_model, layers, batch_size, or context_len",
+                self.memory_budget_bytes / (1024 * 1024)
+            );
+        }
+        Ok(())
+    }
+
+    pub fn memory_estimate(&self) -> Result<MemoryEstimate> {
+        let mul = |a: usize, b: usize| {
+            a.checked_mul(b)
+                .ok_or_else(|| anyhow::anyhow!("model size overflow"))
+        };
+        let add = |a: usize, b: usize| {
+            a.checked_add(b)
+                .ok_or_else(|| anyhow::anyhow!("model size overflow"))
+        };
+        let d2 = mul(self.d_model, self.d_model)?;
+        let embedding = mul(self.vocab_size, self.d_model)?;
+        // Every layer has a D→2D and D→D ternary projection, plus three
+        // FP32 vectors for the implicit filter's compact generator.
+        let layer_projection = mul(3, d2)?;
+        let layer_filter = mul(3, mul(self.d_model, self.filter_order)?)?;
+        let per_layer = add(layer_projection, layer_filter)?;
+        let block_parameters = mul(self.n_layers, per_layer)?;
+        let mtp_parameters = mul(2, d2)?;
+        let parameter_floats = add(add(embedding, block_parameters)?, mtp_parameters)?;
+        let parameters = mul(parameter_floats, size_of::<f32>())?;
+        // Codes are stored in separate positive/negative 64-bit bitplanes.
+        // Each projection is rounded independently, matching the model layout.
+        let packed = |weights: usize| {
+            weights
+                .checked_add(63)
+                .and_then(|n| n.checked_div(64))
+                .and_then(|words| words.checked_mul(2 * size_of::<u64>()))
+                .ok_or_else(|| anyhow::anyhow!("ternary code size overflow"))
+        };
+        let input_codes = packed(mul(2, d2)?)?;
+        let output_codes = packed(d2)?;
+        let layer_codes = add(input_codes, output_codes)?;
+        let mtp_codes = add(packed(d2)?, packed(d2)?)?;
+        let ternary_codes = add(mul(self.n_layers, layer_codes)?, mtp_codes)?;
+        let layer_scales = mul(3, self.d_model)?;
+        let ternary_scales = mul(
+            add(mul(self.n_layers, layer_scales)?, mul(2, self.d_model)?)?,
+            size_of::<f32>(),
+        )?;
+        let rows = mul(self.batch_size, self.context_len)?;
+        let activations = mul(rows, self.d_model)?;
+        // Seven [B,T,D] FP32 buffers safely cover the residual input, 2D
+        // projection (which also holds the gate), convolution output, update,
+        // replacement residual, MTP head overlap, and allocator headroom.
+        let forward_working_set = mul(activations, 7 * size_of::<f32>())?;
+        let convolution_len = self
+            .context_len
+            .checked_mul(2)
+            .and_then(|n| n.checked_sub(1))
+            .ok_or_else(|| anyhow::anyhow!("FFT workspace size overflow"))?;
+        let fft_len = convolution_len
+            .checked_next_power_of_two()
+            .ok_or_else(|| anyhow::anyhow!("FFT workspace size overflow"))?;
+        let complex_work = mul(2, mul(fft_len, 2 * size_of::<f32>())?)?;
+        let hyena_workspace = add(complex_work, mul(self.context_len, size_of::<f32>())?)?;
+        let materialized_mtp_logits = mul(mul(rows, self.vocab_size)?, 2 * size_of::<f32>())?;
+        Ok(MemoryEstimate {
+            parameters,
+            ternary_codes,
+            ternary_scales,
+            forward_working_set,
+            hyena_workspace,
+            materialized_mtp_logits,
+        })
+    }
+
+    /// Binds model output rows to the tokenizer that will actually produce
+    /// training ids. A BPE ceiling must not reserve embedding rows for merges
+    /// which were never learned.
+    pub fn with_tokenizer(mut self, tokenizer: &BpeTokenizer) -> Result<Self> {
+        self.vocab_size = tokenizer.vocab_size() as usize;
+        self.validate()?;
+        Ok(self)
+    }
+
+    /// Full vocab logits are useful for tiny tests and generation, but must
+    /// never be allocated for 32k pretraining.  The trainer will use streamed
+    /// cross-entropy instead.
+    pub fn validate_materialized_mtp(&self, time: usize) -> Result<()> {
+        if time == 0 || time > self.context_len {
+            bail!("time must be in 1..=context_len");
+        }
+        let rows = self
+            .batch_size
+            .checked_mul(time)
+            .ok_or_else(|| anyhow::anyhow!("MTP rows overflow"))?;
+        let bytes = rows
+            .checked_mul(self.vocab_size)
+            .and_then(|n| n.checked_mul(2 * size_of::<f32>()))
+            .ok_or_else(|| anyhow::anyhow!("MTP logits size overflow"))?;
+        if bytes > self.memory_budget_bytes / 4 {
+            bail!(
+                "materialized MTP logits require {} MiB; use streamed MTP loss instead",
+                bytes / (1024 * 1024)
+            );
+        }
+        Ok(())
     }
 }
 
-pub fn split_basis(g: usize, moe: bool) -> (usize, usize) {
-    if !moe || g < 4 {
-        return (g, 0);
-    }
-    let routed = (g / 3).max(1);
-    let routed = routed.min(g.saturating_sub(1));
-    (g - routed, routed)
-}
-
-pub fn grid_target(cfg: &TrainConfig, phase: u8, epoch: usize) -> usize {
-    if phase >= 3 {
-        return cfg.n_basis;
-    }
-    if phase >= 2 {
-        return cfg.grid_final;
-    }
-    let mid = cfg.epochs_warmup / 2;
-    if epoch >= mid || epoch + 1 == cfg.epochs_warmup {
-        cfg.grid_mid
-    } else {
-        cfg.grid_start
-    }
-}
-
-/// Continuous knot scheduler: grow `G` by one every `knot_insert_every` steps
-/// until `grid_final`, frozen from QAT onward. Placement is non-uniform.
-pub fn next_grid_size(cfg: &TrainConfig, phase: u8, global_step: usize, current: usize) -> usize {
-    if phase >= 3 || current >= cfg.grid_final {
-        return current;
-    }
-    if cfg.knot_insert_every == 0 {
-        return current;
-    }
-    if global_step > 0 && global_step % cfg.knot_insert_every == 0 {
-        (current + 1)
-            .min(cfg.grid_final)
-            .min(crate::accelerate::MobKanSpec::MAX_G as usize)
-    } else {
-        current
-    }
+const fn default_memory_budget_bytes() -> usize {
+    DEFAULT_MEMORY_BUDGET_BYTES
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::tokenizer::train_bpe;
 
     #[test]
-    fn grid_schedule() {
+    fn estimate_accounts_for_two_bit_ternary_planes() {
         let cfg = TrainConfig {
-            epochs_warmup: 3,
-            grid_start: 4,
-            grid_mid: 8,
-            grid_final: 12,
-            knot_insert_every: 50,
-            n_basis: 4,
-            ..TrainConfig::default()
+            vocab_size: 320,
+            d_model: 8,
+            n_layers: 1,
+            context_len: 8,
+            ..Default::default()
         };
-        assert_eq!(grid_target(&cfg, 1, 0), 4);
-        assert_eq!(grid_target(&cfg, 1, 1), 8);
-        assert_eq!(grid_target(&cfg, 1, 2), 8);
-        assert_eq!(grid_target(&cfg, 2, 0), 12);
-        assert_eq!(grid_target(&cfg, 3, 0), cfg.n_basis);
-        assert_eq!(next_grid_size(&cfg, 1, 0, 4), 4);
-        assert_eq!(next_grid_size(&cfg, 1, 50, 4), 5);
-        assert_eq!(next_grid_size(&cfg, 1, 49, 4), 4);
-        assert_eq!(next_grid_size(&cfg, 3, 50, 12), 12);
-        assert_eq!(next_grid_size(&cfg, 1, 50, 12), 12);
+        // D→2D: 128 weights -> 32 bytes; D→D: 64 -> 16; two MTP D→D
+        // heads add 32 bytes, for 80 bytes total.
+        assert_eq!(cfg.memory_estimate().unwrap().ternary_codes, 80);
+        assert_eq!(cfg.memory_estimate().unwrap().ternary_scales, 160);
     }
 
     #[test]
-    fn split_matches_spec() {
-        assert_eq!(split_basis(4, true), (3, 1));
-        assert_eq!(split_basis(8, true), (6, 2));
-        assert_eq!(split_basis(12, true), (8, 4));
-        assert_eq!(split_basis(12, false), (12, 0));
+    fn estimate_includes_reused_fft_workspace() {
+        let cfg = TrainConfig {
+            context_len: 32,
+            ..Default::default()
+        };
+        // FFT length is 64. Two complex FP32 buffers use 1024 bytes; the
+        // real filter channel uses another 128 bytes.
+        assert_eq!(cfg.memory_estimate().unwrap().hyena_workspace, 1_152);
+    }
+
+    #[test]
+    fn tokenizer_binding_uses_compact_vocab_and_revalidates_budget() {
+        let tokenizer = train_bpe(&["tiny tiny corpus".into()], 512, 1).unwrap();
+        let config = TrainConfig::default().with_tokenizer(&tokenizer).unwrap();
+        assert_eq!(config.vocab_size, tokenizer.vocab_size() as usize);
     }
 }

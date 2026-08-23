@@ -1,43 +1,14 @@
-//! Ullis AI Engine v0.9 Infinite Lexicon — expandable WordPiece, packed-i8 embed.
-
-pub mod accelerate;
-pub mod chat;
-pub mod checkpoint;
+//! Ullis: a dense ternary Hyena language-model core for Apple Silicon.
+//! KAN, recurrent slot memory, routing, and experts are intentionally absent.
+pub mod batch;
 pub mod config;
-pub mod data;
-pub mod device;
-pub mod expert;
-pub mod gauss;
-pub mod hadamard;
-pub mod kan;
-pub mod memory;
-pub mod mixers;
+pub mod hyena;
+pub mod metal;
 pub mod model;
-pub mod optim;
-pub mod quant;
-pub mod scan;
-pub mod slots;
-pub mod telemetry;
-pub mod tensor;
-pub mod think;
+pub mod optimizer;
 pub mod tokenizer;
-pub mod train;
-pub mod window;
-
-pub use accelerate::{FusedBwdGrads, MobKanSpec};
-pub use config::{KanFactor, MasterDtype, ModelArch, MomDtype, TrainConfig};
-pub use memory::UllisMemory;
-pub use data::SovereignFlashBuffer;
-pub use device::prefer_host_bwd;
-pub use device::SovereignDevice;
-pub use kan::TernaryKanLinear;
-pub use model::UllisKan;
-pub use quant::{
-    f16_bits_to_f32, f32_to_f16_bits, pack_f16, pack_i8_rows, pack_ternary, unpack_f16,
-    unpack_i8_rows, unpack_ternary, PackedI8Matrix,
-};
-pub use tensor::SovereignTensor;
-pub use think::ThinkingMode;
-pub use tokenizer::{validate_vocab_size, BpeTokenizer, DEFAULT_VOCAB, MAX_VOCAB, MIN_VOCAB};
-
+pub use batch::{MtpBatch, MtpBatcher};
+pub use config::{MemoryEstimate, TrainConfig};
+pub use model::{MtpLoss, UllisHyena};
+pub use optimizer::{Lion, LionConfig};
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");

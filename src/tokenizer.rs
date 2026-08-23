@@ -1,22 +1,21 @@
-//! Byte-fallback WordPiece (language-agnostic). No tiktoken / HuggingFace.
+//! Dataset-trained byte-level BPE (language-agnostic). No tiktoken / HuggingFace.
 //!
 //! Layout:
 //! - ids `0..3`     specials `<pad> <bos> <eos> <unk>`
 //! - ids `4..259`   raw UTF-8 bytes (`BYTE_OFFSET + b`)
-//! - ids `260..V-1` WordPiece atoms (whole words / syntax) then trained pieces
+//! - ids `260..V-1` merges learned only from the supplied corpus
 //!
-//! Encode is greedy longest-match over the piece table. Unmapped UTF-8, including
+//! Encode is greedy longest-match over the learned piece table. Unmapped UTF-8, including
 //! incomplete multi-byte sequences, falls back to raw byte ids in-stream and
 //! never panics.
 //!
-//! Production scale is `V ≥ 8192` ([`MIN_VOCAB`]), selectable at runtime via
-//! `--vocab-size` up to [`MAX_VOCAB`] (1 048 576). Tables below [`MIN_VOCAB`] are rejected.
-//! Empty tail ids (when pair-merges exhaust before `V`) occupy no piece bytes and
-//! decode as empty, so the lexicon can grow without a dense rewrite.
+//! The tokenizer has no language or code seed list: reserving vocabulary slots for
+//! guessed words made small, domain-specific training corpora less efficient. Its
+//! vocabulary is reproducible from the corpus and configuration instead.
 
 use std::collections::HashMap;
+use std::io::BufRead;
 use std::path::Path;
-use std::sync::LazyLock;
 
 use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
@@ -28,18 +27,21 @@ pub const UNK: &str = "<unk>";
 pub const N_SPECIAL: u32 = 4;
 /// ids `4..259` are raw UTF-8 bytes. Byte *values* are still `0..=255`.
 pub const BYTE_OFFSET: u32 = N_SPECIAL;
-/// Hard minimum production vocabulary.
-pub const MIN_VOCAB: u32 = 8192;
-/// Memory-arch overfit / tiny corpora. `V=8192` on 15 JSONL rows cannot
-/// copy C9 (that test uses V=512). Production chat still requires [`MIN_VOCAB`].
-pub const MIN_VOCAB_MEMORY: u32 = 512;
-/// Default production scale (equals [`MIN_VOCAB`]).
-pub const DEFAULT_VOCAB: u32 = MIN_VOCAB;
-/// Absolute ceiling for `--vocab-size` (131 072+; Metal buffer / i8-block cap).
+/// Default size for general-purpose micro-model corpora. Smaller vocabularies are
+/// valid and often preferable for small specialised datasets.
+pub const DEFAULT_VOCAB: u32 = 8192;
+/// The byte alphabet plus the four special tokens.
+pub const MIN_VOCAB: u32 = BYTE_OFFSET + 256;
+/// A safety limit; the model configuration performs the RAM admission check.
 pub const MAX_VOCAB: u32 = 1_048_576;
+/// Encoding is often fed line-sized chunks. Do not retain a whole corpus line
+/// merely because it was encoded once.
+const ENCODE_CACHE_MAX_ENTRY_BYTES: usize = 4 * 1024;
+/// A fixed byte budget keeps the convenience cache from competing with the
+/// training batch and activation buffers on small unified-memory Macs.
+const ENCODE_CACHE_MAX_BYTES: usize = 1024 * 1024;
 
-/// Runtime `--vocab-size` gate. Unit tests may construct smaller tables via
-/// [`BpeTokenizer::new`] so encode/decode math stays cheap.
+/// Runtime `--vocab-size` gate.
 pub fn validate_vocab_size(vocab_size: u32) -> Result<u32> {
     if vocab_size < MIN_VOCAB {
         bail!("vocab-size {vocab_size} is below the hard minimum {MIN_VOCAB}");
@@ -50,527 +52,8 @@ pub fn validate_vocab_size(vocab_size: u32) -> Result<u32> {
     Ok(vocab_size)
 }
 
-pub fn validate_vocab_size_arch(vocab_size: u32, memory: bool) -> Result<u32> {
-    let min = if memory { MIN_VOCAB_MEMORY } else { MIN_VOCAB };
-    if vocab_size < min {
-        bail!("vocab-size {vocab_size} is below the minimum {min}");
-    }
-    if vocab_size > MAX_VOCAB {
-        bail!("vocab-size {vocab_size} exceeds the absolute ceiling {MAX_VOCAB}");
-    }
-    Ok(vocab_size)
-}
-
-pub const CODE_SEEDS: &[&str] = &[
-    "def ",
-    "fn ",
-    "impl ",
-    "impl",
-    "match ",
-    "match",
-    "return ",
-    "return",
-    "class ",
-    "import ",
-    "from ",
-    "pub ",
-    "let ",
-    "mut ",
-    "const ",
-    "async ",
-    "await ",
-    "struct ",
-    "enum ",
-    "trait ",
-    "where ",
-    "if ",
-    "elif ",
-    "else",
-    "for ",
-    "while ",
-    "loop ",
-    "try:",
-    "except ",
-    "raise ",
-    "self",
-    "Self",
-    "True",
-    "False",
-    "None",
-    "Ok(",
-    "Err(",
-    "print",
-    "println",
-    "    ",
-    "\t",
-    "        ",
-    "->",
-    "::",
-    "=>",
-    "()",
-    "{}",
-    "[]",
-    "==",
-    "!=",
-    "&&",
-    "||",
-    "+=",
-    "-=",
-    "-> ",
-    ":\n",
-    "{\n",
-    "\n    ",
-    "#!/usr/bin/env bash",
-    "set -euo pipefail",
-    "use std::",
-    "std::io::",
-    "__name__",
-    "Path",
-    "<|system|>",
-    "<|user|>",
-    "<|thinking|>",
-    "<|/thinking|>",
-    "<|output|>",
-];
-
-/// High-frequency English / Russian function words and syntax identifiers.
-/// Each occupies a single token id when `V` has room (WordPiece atoms).
-pub const LANG_SEEDS: &[&str] = &[
-    "the ",
-    "of ",
-    "and ",
-    "to ",
-    "in ",
-    "is ",
-    "you ",
-    "that ",
-    "it ",
-    "he ",
-    "was ",
-    "for ",
-    "on ",
-    "are ",
-    "as ",
-    "with ",
-    "his ",
-    "they ",
-    "at ",
-    "be ",
-    "this ",
-    "have ",
-    "from ",
-    "or ",
-    "one ",
-    "had ",
-    "by ",
-    "but ",
-    "not ",
-    "what ",
-    "all ",
-    "were ",
-    "we ",
-    "when ",
-    "your ",
-    "can ",
-    "said ",
-    "there ",
-    "use ",
-    "an ",
-    "each ",
-    "which ",
-    "she ",
-    "do ",
-    "how ",
-    "their ",
-    "if ",
-    "will ",
-    "up ",
-    "other ",
-    "about ",
-    "out ",
-    "many ",
-    "then ",
-    "them ",
-    "these ",
-    "so ",
-    "some ",
-    "her ",
-    "would ",
-    "make ",
-    "like ",
-    "him ",
-    "into ",
-    "time ",
-    "has ",
-    "look ",
-    "two ",
-    "more ",
-    "write ",
-    "go ",
-    "see ",
-    "no ",
-    "way ",
-    "could ",
-    "people ",
-    "my ",
-    "than ",
-    "first ",
-    "been ",
-    "who ",
-    "its ",
-    "now ",
-    "find ",
-    "long ",
-    "down ",
-    "day ",
-    "did ",
-    "get ",
-    "come ",
-    "made ",
-    "may ",
-    "part ",
-    "function ",
-    "class",
-    "import",
-    "struct",
-    "enum",
-    "trait",
-    "const",
-    "async",
-    "await",
-    "while",
-    "break",
-    "continue",
-    "yield",
-    "where",
-    "type",
-    "mod ",
-    "true",
-    "false",
-    "null",
-    "error",
-    "result",
-    "option",
-    "string",
-    "vector",
-    "list",
-    "dict",
-    "file",
-    "open",
-    "read",
-    "write",
-    "load",
-    "save",
-    "train",
-    "model",
-    "token",
-    "layer",
-    "weight",
-    "tensor",
-    "kernel",
-    "buffer",
-    "device",
-    "metal",
-    "rust",
-    "python",
-    "bash",
-    "json",
-    "data",
-    "code",
-    "main",
-    "test",
-    "assert",
-    "debug",
-    "info",
-    "warn",
-    "panic",
-    "unwrap",
-    "clone",
-    "copy",
-    "drop",
-    "default",
-    "spawn",
-    "thread",
-    "process",
-    "config",
-    "vocab",
-    "embed",
-    "logit",
-    "softmax",
-    "loss",
-    "grad",
-    "scale",
-    "pack",
-    "quant",
-    "ternary",
-    "spline",
-    "knot",
-    "grid",
-    "expert",
-    "router",
-    "think",
-    "output",
-    "system",
-    "user",
-    "the",
-    "and",
-    "that",
-    "with",
-    "from",
-    "this",
-    "function",
-    "return",
-    "и ",
-    "в ",
-    "не ",
-    "на ",
-    "что ",
-    "я ",
-    "он ",
-    "с ",
-    "как ",
-    "а ",
-    "то ",
-    "все ",
-    "она ",
-    "так ",
-    "его ",
-    "но ",
-    "да ",
-    "ты ",
-    "к ",
-    "у ",
-    "же ",
-    "вы ",
-    "за ",
-    "бы ",
-    "по ",
-    "только ",
-    "мне ",
-    "было ",
-    "вот ",
-    "от ",
-    "меня ",
-    "ещё ",
-    "нет ",
-    "о ",
-    "из ",
-    "ему ",
-    "теперь ",
-    "когда ",
-    "даже ",
-    "ну ",
-    "вдруг ",
-    "ли ",
-    "если ",
-    "уже ",
-    "или ",
-    "ни ",
-    "быть ",
-    "был ",
-    "до ",
-    "вас ",
-    "опять ",
-    "вам ",
-    "ведь ",
-    "там ",
-    "потом ",
-    "себя ",
-    "ничего ",
-    "ей ",
-    "может ",
-    "они ",
-    "тут ",
-    "где ",
-    "есть ",
-    "надо ",
-    "для ",
-    "мы ",
-    "тебя ",
-    "их ",
-    "чем ",
-    "была ",
-    "сам ",
-    "чтоб ",
-    "без ",
-    "будто ",
-    "чего ",
-    "раз ",
-    "тоже ",
-    "себе ",
-    "под ",
-    "будет ",
-    "тогда ",
-    "кто ",
-    "этот ",
-    "того ",
-    "потому ",
-    "этого ",
-    "какой ",
-    "совсем ",
-    "ним ",
-    "здесь ",
-    "этом ",
-    "один ",
-    "почти ",
-    "мой ",
-    "тем ",
-    "чтобы ",
-    "кажется ",
-    "сейчас ",
-    "были ",
-    "куда ",
-    "зачем ",
-    "сказать ",
-    "никогда ",
-    "можно ",
-    "при ",
-    "наконец ",
-    "два ",
-    "об ",
-    "другой ",
-    "хоть ",
-    "после ",
-    "над ",
-    "больше ",
-    "тот ",
-    "через ",
-    "эти ",
-    "нас ",
-    "про ",
-    "всего ",
-    "них ",
-    "какая ",
-    "много ",
-    "разве ",
-    "три ",
-    "эту ",
-    "моя ",
-    "впрочем ",
-    "хорошо ",
-    "свою ",
-    "этой ",
-    "перед ",
-    "иногда ",
-    "лучше ",
-    "чуть ",
-    "том ",
-    "нельзя ",
-    "такой ",
-    "им ",
-    "более ",
-    "всегда ",
-    "конечно ",
-    "всю ",
-    "между ",
-    "функция ",
-    "вернуть ",
-    "результат ",
-    "модель ",
-    "токен ",
-    "слой ",
-    "вес ",
-    "ошибка ",
-    "файл ",
-    "данные ",
-    "код ",
-    "привет ",
-    "мир ",
-    "и",
-    "в",
-    "не",
-    "на",
-    "что",
-    "я",
-    "он",
-    "как",
-    "это",
-    "для",
-    "или",
-    "если",
-    "при",
-    "self.",
-    "Self::",
-    "std::",
-    "let mut ",
-    "pub fn ",
-    "pub struct ",
-    "pub enum ",
-    "pub trait ",
-    "impl ",
-    "async fn ",
-    "-> Result",
-    "unwrap()",
-    "to_string()",
-    "into()",
-    "as_str()",
-    "as_slice()",
-    "to_vec()",
-    "len()",
-    "is_empty()",
-    "push(",
-    "pop()",
-    "insert(",
-    "remove(",
-    "HashMap",
-    "VecDeque",
-    "Option<",
-    "Result<",
-    "String",
-    "usize",
-    "i32",
-    "i64",
-    "u32",
-    "u64",
-    "f32",
-    "f64",
-    "bool",
-    "def ",
-    "lambda ",
-    "None",
-    "True",
-    "False",
-    "print(",
-    "len(",
-    "range(",
-    "enumerate(",
-    "zip(",
-    "open(",
-    "read()",
-    "write(",
-    "os.path",
-    "pathlib",
-    "numpy",
-    "torch",
-    "return",
-    "#!/bin/bash",
-    "set -euo",
-    "pipefail",
-    "local ",
-    "then",
-    "fi",
-    "done",
-    "esac",
-    "echo ",
-    "export ",
-    "source ",
-    "[[ ",
-    "]]",
-];
-
-static ATOMS_SORTED: LazyLock<Vec<&'static str>> = LazyLock::new(|| {
-    let mut v: Vec<&'static str> = CODE_SEEDS
-        .iter()
-        .chain(LANG_SEEDS.iter())
-        .copied()
-        .collect();
-    v.sort_by_key(|s| std::cmp::Reverse(s.len()));
-    v.dedup();
-    v
-});
-
-pub fn byte_id(b: u8) -> u32 {
-    BYTE_OFFSET + u32::from(b)
+pub const fn byte_id(byte: u8) -> u32 {
+    BYTE_OFFSET + byte as u32
 }
 
 pub fn apply_merge(seq: &[u32], left: u32, right: u32, new_id: u32) -> Vec<u32> {
@@ -593,30 +76,28 @@ pub struct TokenizerJson {
     pub vocab_size: u32,
     pub merges: Vec<[u32; 2]>,
     pub specials: Vec<String>,
-    #[serde(default)]
-    pub atoms: Vec<String>,
-    #[serde(default = "wordpiece_model")]
+    #[serde(default = "byte_bpe_model")]
     pub model: String,
 }
 
-fn wordpiece_model() -> String {
-    "wordpiece".into()
+fn byte_bpe_model() -> String {
+    "byte_bpe_v1".into()
 }
 
 #[derive(Clone, Debug)]
 pub struct BpeTokenizer {
-    pub vocab_size: u32,
+    vocab_size: u32,
     pub specials: Vec<String>,
     pub pad_id: u32,
     pub bos_id: u32,
     pub eos_id: u32,
     pub unk_id: u32,
     pub merges: Vec<(u32, u32)>,
-    pub atoms: Vec<String>,
     id_to_bytes: Vec<Vec<u8>>,
     piece_to_id: HashMap<Vec<u8>, u32>,
     max_piece_len: usize,
     encode_cache: HashMap<Vec<u8>, Vec<u32>>,
+    encode_cache_bytes: usize,
 }
 
 impl BpeTokenizer {
@@ -625,20 +106,21 @@ impl BpeTokenizer {
         merges: Vec<(u32, u32)>,
         specials: Option<Vec<String>>,
     ) -> Result<Self> {
-        Self::new_with_atoms(vocab_size, merges, Vec::new(), specials)
-    }
-
-    pub fn new_with_atoms(
-        vocab_size: u32,
-        merges: Vec<(u32, u32)>,
-        atoms: Vec<String>,
-        specials: Option<Vec<String>>,
-    ) -> Result<Self> {
-        if vocab_size < BYTE_OFFSET + 256 {
+        validate_vocab_size(vocab_size)?;
+        let expected_vocab = MIN_VOCAB
+            .checked_add(u32::try_from(merges.len()).context("tokenizer merge count overflow")?)
+            .ok_or_else(|| anyhow::anyhow!("tokenizer merge count overflow"))?;
+        if vocab_size != expected_vocab {
             bail!(
-                "vocab_size must be >= {} (byte-fallback floor)",
-                BYTE_OFFSET + 256
+                "vocab_size {vocab_size} is not compact for {} merges (expected {expected_vocab})",
+                merges.len()
             );
+        }
+        for (index, &(left, right)) in merges.iter().enumerate() {
+            let new_id = MIN_VOCAB + index as u32;
+            if left >= new_id || right >= new_id {
+                bail!("merge {index} references a token not defined before it");
+            }
         }
         let specials = specials.unwrap_or_else(|| {
             vec![
@@ -648,6 +130,9 @@ impl BpeTokenizer {
                 UNK.to_string(),
             ]
         });
+        if specials.as_slice() != [PAD, BOS, EOS, UNK] {
+            bail!("tokenizer specials must be exactly <pad>, <bos>, <eos>, <unk>");
+        }
         let mut tok = Self {
             vocab_size,
             specials,
@@ -656,44 +141,29 @@ impl BpeTokenizer {
             eos_id: 2,
             unk_id: 3,
             merges,
-            atoms,
             id_to_bytes: vec![Vec::new(); vocab_size as usize],
             piece_to_id: HashMap::new(),
             max_piece_len: 1,
             encode_cache: HashMap::new(),
+            encode_cache_bytes: 0,
         };
         tok.rebuild();
         Ok(tok)
     }
 
-    /// Grow the id plane in place. Existing pieces stay put; new slots are empty
-    /// until later merges or [`crate::quant::PackedI8Matrix`] block allocation.
-    pub fn expand_to(&mut self, vocab_size: u32) -> Result<()> {
-        if vocab_size < self.vocab_size {
-            bail!(
-                "cannot shrink tokenizer vocab {} -> {vocab_size}",
-                self.vocab_size
-            );
-        }
-        if vocab_size == self.vocab_size {
-            return Ok(());
-        }
-        self.vocab_size = vocab_size;
-        self.id_to_bytes.resize(vocab_size as usize, Vec::new());
-        self.encode_cache.clear();
-        Ok(())
+    pub fn populated(&self) -> u32 {
+        self.vocab_size
     }
 
-    pub fn populated(&self) -> u32 {
-        let mut n = BYTE_OFFSET + 256;
-        n += self.atoms.len() as u32;
-        n += self.merges.len() as u32;
-        n.min(self.vocab_size)
+    /// Exact, compact number of token ids emitted by this tokenizer.
+    pub const fn vocab_size(&self) -> u32 {
+        self.vocab_size
     }
 
     fn rebuild(&mut self) {
         self.piece_to_id.clear();
         self.encode_cache.clear();
+        self.encode_cache_bytes = 0;
         self.id_to_bytes = vec![Vec::new(); self.vocab_size as usize];
         self.max_piece_len = 1;
         for b in 0..=255u8 {
@@ -703,46 +173,20 @@ impl BpeTokenizer {
             self.piece_to_id.insert(bytes, id);
         }
         let mut next_id = BYTE_OFFSET + 256;
-        let mut kept_atoms = Vec::new();
-        for atom in &self.atoms {
-            if next_id >= self.vocab_size {
-                break;
-            }
-            let bytes = atom.as_bytes().to_vec();
-            if bytes.is_empty() {
-                continue;
-            }
-            if self.piece_to_id.contains_key(&bytes) {
-                continue;
-            }
-            self.id_to_bytes[next_id as usize] = bytes.clone();
-            self.max_piece_len = self.max_piece_len.max(bytes.len());
-            self.piece_to_id.insert(bytes, next_id);
-            kept_atoms.push(atom.clone());
-            next_id += 1;
-        }
-        self.atoms = kept_atoms;
-        let mut kept = Vec::new();
         for &(left, right) in &self.merges {
-            if next_id >= self.vocab_size {
-                break;
-            }
             let lu = left as usize;
             let ru = right as usize;
-            if lu >= self.id_to_bytes.len() || ru >= self.id_to_bytes.len() {
-                continue;
-            }
             let mut bytes = self.id_to_bytes[lu].clone();
             bytes.extend_from_slice(&self.id_to_bytes[ru]);
-            if !bytes.is_empty() {
-                self.piece_to_id.entry(bytes.clone()).or_insert(next_id);
-                self.max_piece_len = self.max_piece_len.max(bytes.len());
-            }
+            debug_assert!(
+                !bytes.is_empty(),
+                "validated merge inputs are defined pieces"
+            );
+            self.piece_to_id.insert(bytes.clone(), next_id);
+            self.max_piece_len = self.max_piece_len.max(bytes.len());
             self.id_to_bytes[next_id as usize] = bytes;
-            kept.push((left, right));
             next_id += 1;
         }
-        self.merges = kept;
     }
 
     /// Greedy longest-match WordPiece. Unknown bytes become `byte_id(b)`.
@@ -751,8 +195,14 @@ impl BpeTokenizer {
             return cached.clone();
         }
         let ids = self.encode_bytes_uncached(data);
-        if self.encode_cache.len() < 4096 {
+        let cache_bytes = data
+            .len()
+            .saturating_add(ids.len().saturating_mul(size_of::<u32>()));
+        if data.len() <= ENCODE_CACHE_MAX_ENTRY_BYTES
+            && cache_bytes <= ENCODE_CACHE_MAX_BYTES.saturating_sub(self.encode_cache_bytes)
+        {
             self.encode_cache.insert(data.to_vec(), ids.clone());
+            self.encode_cache_bytes += cache_bytes;
         }
         ids
     }
@@ -821,19 +271,25 @@ impl BpeTokenizer {
                 .map(|&(left, right)| [left, right])
                 .collect(),
             specials: self.specials.clone(),
-            atoms: self.atoms.clone(),
-            model: "wordpiece".into(),
+            model: byte_bpe_model(),
         }
     }
 
     pub fn from_json(data: &TokenizerJson) -> Result<Self> {
-        let merges = data.merges.iter().map(|p| (p[0], p[1])).collect();
-        Self::new_with_atoms(
-            data.vocab_size,
-            merges,
-            data.atoms.clone(),
-            Some(data.specials.clone()),
-        )
+        if data.model != byte_bpe_model() {
+            bail!(
+                "unsupported tokenizer model {:?}; retrain this tokenizer with the current byte_bpe_v1 trainer",
+                data.model
+            );
+        }
+        let merges: Vec<_> = data.merges.iter().map(|p| (p[0], p[1])).collect();
+        let compact_vocab = MIN_VOCAB
+            .checked_add(u32::try_from(merges.len()).context("tokenizer merge count overflow")?)
+            .ok_or_else(|| anyhow::anyhow!("tokenizer merge count overflow"))?;
+        if data.vocab_size < compact_vocab {
+            bail!("tokenizer merge table exceeds its declared vocabulary");
+        }
+        Self::new(compact_vocab, merges, Some(data.specials.clone()))
     }
 
     pub fn save(&self, path: impl AsRef<Path>) -> Result<()> {
@@ -853,7 +309,7 @@ impl BpeTokenizer {
     }
 
     pub fn load_default() -> Result<Self> {
-        train_wordpiece(&[], DEFAULT_VOCAB, 7)
+        train_bpe(&[], DEFAULT_VOCAB, 7)
     }
 }
 
@@ -910,65 +366,63 @@ impl<'a> StreamDecoder<'a> {
     }
 }
 
-fn collect_atoms(vocab_size: u32) -> Vec<String> {
-    let floor = (BYTE_OFFSET + 256) as usize;
-    let room = (vocab_size as usize).saturating_sub(floor);
-    // Longest-first seeds used to consume the whole table at V≤512, so a
-    // tiny corpus got zero pair-merges and "hello" stayed five byte ids.
-    // Production V=8192 still fits every seed (≈480) after a 20% reserve.
-    let budget = room.saturating_sub(room / 5);
-    let mut atoms = Vec::new();
-    let mut seen = std::collections::HashSet::new();
-    for s in CODE_SEEDS.iter().chain(LANG_SEEDS.iter()) {
-        if atoms.len() >= budget {
-            break;
-        }
-        let b = s.as_bytes();
-        if b.is_empty() || !seen.insert(b.to_vec()) {
-            continue;
-        }
-        atoms.push((*s).to_string());
+/// Byte-level BPE trainer. `max_vocab_size` is an upper limit, not a promise:
+/// the returned vocabulary is compact and contains no unused token ids.
+pub fn train_bpe(texts: &[String], max_vocab_size: u32, seed: u64) -> Result<BpeTokenizer> {
+    let mut chunk_freq = HashMap::new();
+    for text in texts {
+        add_chunks(&mut chunk_freq, text);
     }
-    atoms
+    train_bpe_from_chunks(chunk_freq, max_vocab_size, seed)
 }
 
-/// Byte-fallback WordPiece trainer. Seeds occupy single ids; remaining slots
-/// are filled by frequency pair-merges on unique pretokenized chunks.
+/// Trains BPE while reading text line-by-line. The full source corpus never
+/// needs to be collected as `Vec<String>`; only unique chunk frequencies and
+/// the merge working set are retained.
+pub fn train_bpe_from_reader<R: BufRead>(
+    mut reader: R,
+    max_vocab_size: u32,
+    seed: u64,
+) -> Result<BpeTokenizer> {
+    let mut chunk_freq = HashMap::new();
+    let mut line = String::new();
+    loop {
+        line.clear();
+        if reader.read_line(&mut line)? == 0 {
+            break;
+        }
+        add_chunks(&mut chunk_freq, &line);
+    }
+    train_bpe_from_chunks(chunk_freq, max_vocab_size, seed)
+}
+
+fn add_chunks(chunk_freq: &mut HashMap<Vec<u8>, u32>, text: &str) {
+    for chunk in text.split_inclusive(char::is_whitespace) {
+        if !chunk.is_empty() {
+            let frequency = chunk_freq.entry(chunk.as_bytes().to_vec()).or_insert(0);
+            *frequency = frequency.saturating_add(1);
+        }
+    }
+}
+
+/// All non-special vocabulary slots are filled by frequency pair-merges on
+/// unique whitespace chunks from the supplied corpus.
 ///
 /// The previous trainer rescanned the whole corpus (byte ids) on every merge.
 /// At `V=65536` and a ~20 MB JSONL that is tens of thousands of O(N) passes
-/// and looks like a hang after `metal_hello`. This path BPE-s unique
-/// whitespace chunks with incremental pair counts.
-pub fn train_wordpiece(texts: &[String], vocab_size: u32, seed: u64) -> Result<BpeTokenizer> {
+/// and looks like a hang after `metal_hello`. This path BPE-s unique whitespace
+/// chunks with incremental pair counts.
+fn train_bpe_from_chunks(
+    chunk_freq: HashMap<Vec<u8>, u32>,
+    max_vocab_size: u32,
+    seed: u64,
+) -> Result<BpeTokenizer> {
     use std::collections::BinaryHeap;
-    use std::io::Write;
 
     let _ = seed;
-    let atoms = collect_atoms(vocab_size);
-    let mut proto = BpeTokenizer::new_with_atoms(vocab_size, Vec::new(), atoms.clone(), None)?;
-    let mut next_id = BYTE_OFFSET + 256 + proto.atoms.len() as u32;
-    if next_id >= vocab_size {
-        return BpeTokenizer::new_with_atoms(vocab_size, Vec::new(), atoms, None);
-    }
-
-    let mut chunk_freq: HashMap<Vec<u8>, u32> = HashMap::new();
-    if texts.iter().all(|t| t.is_empty()) {
-        *chunk_freq
-            .entry(ATOMS_SORTED.join("").into_bytes())
-            .or_insert(0) += 1;
-        for atom in ATOMS_SORTED.iter() {
-            *chunk_freq.entry(atom.as_bytes().to_vec()).or_insert(0) += 1;
-        }
-    } else {
-        for t in texts {
-            for chunk in t.split_inclusive(char::is_whitespace) {
-                if chunk.is_empty() {
-                    continue;
-                }
-                *chunk_freq.entry(chunk.as_bytes().to_vec()).or_insert(0) += 1;
-            }
-        }
-    }
+    validate_vocab_size(max_vocab_size)?;
+    let mut proto = BpeTokenizer::new(MIN_VOCAB, Vec::new(), None)?;
+    let mut next_id = BYTE_OFFSET + 256;
 
     let mut words: Vec<Vec<u32>> = Vec::with_capacity(chunk_freq.len());
     let mut freqs: Vec<u32> = Vec::with_capacity(chunk_freq.len());
@@ -998,10 +452,9 @@ pub fn train_wordpiece(texts: &[String], vocab_size: u32, seed: u64) -> Result<B
     }
 
     let mut merges: Vec<(u32, u32)> = Vec::new();
-    let start_id = next_id;
     let mut seen_words = vec![0u32; words.len()];
     let mut stamp = 1u32;
-    while next_id < vocab_size {
+    while next_id < max_vocab_size {
         let Some((cnt, a, b)) = heap.pop() else {
             break;
         };
@@ -1053,65 +506,32 @@ pub fn train_wordpiece(texts: &[String], vocab_size: u32, seed: u64) -> Result<B
             words[i] = new_sym;
         }
         pair_count.remove(&(a, b));
-
-        let done = next_id - start_id;
-        if done == 1 || done % 2048 == 0 {
-            println!(
-                "  tokenizer merge {done} / {}  chunks={} heap={}",
-                vocab_size.saturating_sub(start_id),
-                words.len(),
-                heap.len()
-            );
-            let _ = std::io::stdout().flush();
-        }
     }
 
-    BpeTokenizer::new_with_atoms(vocab_size, merges, atoms, None)
-}
-
-pub fn train_bpe(texts: &[String], vocab_size: u32, seed: u64) -> Result<BpeTokenizer> {
-    train_wordpiece(texts, vocab_size, seed)
+    BpeTokenizer::new(next_id, merges, None)
 }
 
 pub fn load_or_train(
-    vocab_size: u32,
+    max_vocab_size: u32,
     texts: &[String],
     path: Option<&Path>,
     seed: u64,
 ) -> Result<BpeTokenizer> {
-    // Caller already applied production vs memory floor. Do not re-impose
-    // MIN_VOCAB=8192 here — that blocked `--arch memory --vocab-size 512`.
-    if vocab_size < BYTE_OFFSET + 256 {
-        bail!(
-            "vocab-size {vocab_size} is below the byte-fallback floor {}",
-            BYTE_OFFSET + 256
-        );
-    }
-    if vocab_size > MAX_VOCAB {
-        bail!("vocab-size {vocab_size} exceeds the absolute ceiling {MAX_VOCAB}");
-    }
-    let mut candidates: Vec<std::path::PathBuf> = Vec::new();
+    validate_vocab_size(max_vocab_size)?;
     if let Some(p) = path {
-        if !p.as_os_str().is_empty() {
-            candidates.push(p.to_path_buf());
+        if p.as_os_str().is_empty() {
+            return train_bpe(texts, max_vocab_size, seed);
         }
-    }
-    candidates.push(Path::new("assets/tokenizer-8192.json").to_path_buf());
-    candidates.push(Path::new("ullis/assets/tokenizer-8192.json").to_path_buf());
-    candidates.push(Path::new("checkpoints/tokenizer.json").to_path_buf());
-    for cand in candidates {
-        if cand.exists() {
-            let mut tok = BpeTokenizer::load(&cand)?;
-            if tok.vocab_size == vocab_size {
-                return Ok(tok);
-            }
-            if tok.vocab_size < vocab_size && tok.vocab_size >= MIN_VOCAB {
-                tok.expand_to(vocab_size)?;
-                return Ok(tok);
-            }
+        let tok = BpeTokenizer::load(p)?;
+        if tok.vocab_size > max_vocab_size {
+            bail!(
+                "tokenizer vocabulary {} exceeds requested maximum {max_vocab_size}",
+                tok.vocab_size,
+            );
         }
+        return Ok(tok);
     }
-    train_wordpiece(texts, vocab_size, seed)
+    train_bpe(texts, max_vocab_size, seed)
 }
 
 #[cfg(test)]
@@ -1120,43 +540,25 @@ mod tests {
 
     #[test]
     fn default_vocab() {
-        let tok = train_wordpiece(&[], DEFAULT_VOCAB, 7).unwrap();
-        assert_eq!(tok.vocab_size, 8192);
-        assert!(!tok.atoms.is_empty());
-        assert!(tok.merges.len() + tok.atoms.len() >= 256);
+        let tok = train_bpe(&[], DEFAULT_VOCAB, 7).unwrap();
+        assert_eq!(tok.vocab_size(), MIN_VOCAB);
+        assert!(tok.merges.is_empty());
     }
 
     #[test]
     fn roundtrip_ascii() {
-        let mut tok = train_wordpiece(&[], 1024, 1).unwrap();
+        let mut tok = train_bpe(&[], 1024, 1).unwrap();
         let s = "def load(path):\n    return path\n";
         let ids = tok.encode(s, false, false);
         assert_eq!(tok.decode(&ids), s);
     }
 
     #[test]
-    fn seeds_are_single_tokens() {
-        let mut tok = train_wordpiece(&[], 2048, 1).unwrap();
-        for atom in ["def ", "fn ", "return", "<|system|>", "the ", "и "] {
-            let ids = tok.encode(atom, false, false);
-            assert_eq!(ids.len(), 1, "{atom:?} -> {ids:?}");
-        }
-    }
-
-    #[test]
-    fn seed_fill_vs_corpus_hello() {
-        let n_atoms = collect_atoms(MAX_VOCAB).len();
-        assert!(n_atoms > 400, "seed table unexpectedly small: {n_atoms}");
-        assert_eq!(
-            collect_atoms(8192).len(),
-            n_atoms,
-            "V=8192 must still fit every seed"
-        );
-        let mut tok512 =
-            train_wordpiece(&["hello hello hello hello hello".into()], 512, 1).unwrap();
+    fn corpus_drives_merges() {
+        let mut tok512 = train_bpe(&["hello hello hello hello hello".into()], 512, 1).unwrap();
         assert!(
             !tok512.merges.is_empty(),
-            "V=512 must reserve merge slots, got 0"
+            "repeated corpus text should create merges"
         );
         let hello = tok512.encode("hello", false, false);
         assert!(
@@ -1172,19 +574,19 @@ mod tests {
 
     #[test]
     fn byte_fallback_never_panics() {
-        let mut tok = train_wordpiece(&[], 320, 0).unwrap();
+        let mut tok = train_bpe(&[], 320, 0).unwrap();
         let junk: Vec<u8> = (0u8..=255).chain([0xFF, 0xFE, 0x80, 0xC0, 0xC1]).collect();
         let ids = tok.encode_bytes(&junk);
         assert!(!ids.is_empty());
         for &id in &ids {
-            assert!(id < tok.vocab_size);
+            assert!(id < tok.vocab_size());
         }
         let _ = tok.decode(&ids);
     }
 
     #[test]
     fn bilingual_roundtrip() {
-        let mut tok = train_wordpiece(&[], 2048, 2).unwrap();
+        let mut tok = train_bpe(&[], 2048, 2).unwrap();
         let s = "Hello мир fn main()";
         let ids = tok.encode(s, false, false);
         assert_eq!(tok.decode(&ids), s);
@@ -1192,26 +594,54 @@ mod tests {
 
     #[test]
     fn rejects_below_min_vocab() {
-        assert!(validate_vocab_size(4096).is_err());
         assert!(validate_vocab_size(MIN_VOCAB - 1).is_err());
+        assert_eq!(validate_vocab_size(320).unwrap(), 320);
         assert_eq!(validate_vocab_size(MIN_VOCAB).unwrap(), MIN_VOCAB);
         assert_eq!(validate_vocab_size(131_072).unwrap(), 131_072);
         assert!(validate_vocab_size(MAX_VOCAB + 1).is_err());
-        assert!(validate_vocab_size_arch(256, true).is_err());
-        assert_eq!(validate_vocab_size_arch(512, true).unwrap(), 512);
-        assert!(validate_vocab_size_arch(512, false).is_err());
         let tok = load_or_train(512, &["fn add(a: i32, b: i32)".into()], None, 1).unwrap();
-        assert_eq!(tok.vocab_size, 512);
+        assert!(tok.vocab_size() <= 512);
     }
 
     #[test]
-    fn expand_keeps_pieces() {
-        let mut tok = train_wordpiece(&[], 1024, 1).unwrap();
-        let s = "fn main()";
-        let ids = tok.encode(s, false, false);
-        tok.expand_to(16_384).unwrap();
-        assert_eq!(tok.vocab_size, 16_384);
-        assert_eq!(tok.decode(&ids), s);
-        assert_eq!(tok.encode(s, false, false), ids);
+    fn reader_training_matches_slice_training() {
+        let texts = ["alpha beta\n".to_string(), "alpha beta\n".to_string()];
+        let from_slice = train_bpe(&texts, 512, 1).unwrap();
+        let from_reader = train_bpe_from_reader(&b"alpha beta\nalpha beta\n"[..], 512, 1).unwrap();
+        assert_eq!(from_reader.vocab_size(), from_slice.vocab_size());
+        assert_eq!(from_reader.merges, from_slice.merges);
+    }
+
+    #[test]
+    fn json_load_compacts_legacy_empty_ids() {
+        let tokenizer = train_bpe(&["alpha alpha alpha".into()], 512, 1).unwrap();
+        let mut json = tokenizer.to_json();
+        json.vocab_size = 512;
+        let loaded = BpeTokenizer::from_json(&json).unwrap();
+        assert_eq!(loaded.vocab_size(), tokenizer.vocab_size());
+    }
+
+    #[test]
+    fn constructor_rejects_unused_vocab_ids_and_invalid_merges() {
+        assert!(BpeTokenizer::new(MIN_VOCAB + 1, vec![], None).is_err());
+        assert!(BpeTokenizer::new(MIN_VOCAB + 1, vec![(MIN_VOCAB, byte_id(b'a'))], None).is_err());
+    }
+
+    #[test]
+    fn encode_cache_has_a_strict_byte_budget() {
+        let mut tokenizer = train_bpe(&[], MIN_VOCAB, 1).unwrap();
+        let oversized = vec![b'x'; ENCODE_CACHE_MAX_ENTRY_BYTES + 1];
+        let expected = tokenizer.encode_bytes(&oversized);
+        assert_eq!(tokenizer.encode_cache_bytes, 0);
+        assert_eq!(tokenizer.encode_bytes(&oversized), expected);
+
+        let chunk = vec![b'y'; ENCODE_CACHE_MAX_ENTRY_BYTES];
+        for suffix in 0..300u16 {
+            let mut unique = chunk.clone();
+            unique[0] = (suffix & 0xff) as u8;
+            unique[1] = (suffix >> 8) as u8;
+            tokenizer.encode_bytes(&unique);
+        }
+        assert!(tokenizer.encode_cache_bytes <= ENCODE_CACHE_MAX_BYTES);
     }
 }
