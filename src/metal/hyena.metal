@@ -219,6 +219,52 @@ kernel void ullis_tanh_gate_in_place(
     output[index] = feature < channels ? input[index] : tanh(input[index]);
 }
 
+// Converts the signal half of a `[B*T, 2D]` projection into the transform
+// layout `[B*D, N]`. The host clears the reusable FFT buffer once, so this
+// kernel only writes real values that belong to the unpadded sequence.
+kernel void ullis_pack_strided_real_to_complex(
+    device const float *input [[buffer(0)]],
+    device float2 *output [[buffer(1)]],
+    constant uint &time [[buffer(2)]],
+    constant uint &channels [[buffer(3)]],
+    constant uint &input_stride [[buffer(4)]],
+    constant uint &input_offset [[buffer(5)]],
+    constant uint &fft_len [[buffer(6)]],
+    constant uint &elements [[buffer(7)]],
+    uint index [[thread_position_in_grid]]) {
+    if (index >= elements) return;
+    const uint channel = index % channels;
+    const uint row = index / channels;
+    const uint sequence = row / time;
+    const uint position = row % time;
+    output[(sequence * channels + channel) * fft_len + position] =
+        float2(input[row * input_stride + input_offset + channel], 0.0f);
+}
+
+kernel void ullis_apply_gate(
+    device const float *mixed [[buffer(0)]],
+    device const float *gated_projection [[buffer(1)]],
+    device float *output [[buffer(2)]],
+    constant uint &channels [[buffer(3)]],
+    constant uint &projection_stride [[buffer(4)]],
+    constant uint &gate_offset [[buffer(5)]],
+    constant uint &elements [[buffer(6)]],
+    uint index [[thread_position_in_grid]]) {
+    if (index >= elements) return;
+    const uint row = index / channels;
+    const uint channel = index % channels;
+    output[index] = mixed[index] * gated_projection[row * projection_stride + gate_offset + channel];
+}
+
+kernel void ullis_residual_add(
+    device const float *residual [[buffer(0)]],
+    device const float *update [[buffer(1)]],
+    device float *output [[buffer(2)]],
+    constant uint &elements [[buffer(3)]],
+    uint index [[thread_position_in_grid]]) {
+    if (index < elements) output[index] = residual[index] + update[index];
+}
+
 kernel void ullis_fft_extract_causal(
     device const float2 *input [[buffer(0)]],
     device float *output [[buffer(1)]],

@@ -242,6 +242,11 @@ impl TernaryLinear {
         }
         Ok(out)
     }
+
+    #[cfg(target_os = "macos")]
+    fn metal_parts(&self) -> (&[u64], &[u64], &[f32]) {
+        (&self.codes.positive, &self.codes.negative, &self.row_scales)
+    }
 }
 
 /// Deterministic initializer shared by FP32 embeddings and ternary master
@@ -343,6 +348,26 @@ impl HyenaBlock {
             .zip(update)
             .map(|(left, right)| left + right)
             .collect())
+    }
+
+    /// Executes one complete block with both residual states resident in the
+    /// runtime. The only host copies are the packed immutable weights.
+    #[cfg(target_os = "macos")]
+    fn forward_metal_resident(
+        &self,
+        runtime: &crate::metal::MetalRuntime,
+        slot: crate::metal::ResidentActivationSlot,
+        batch: usize,
+        time: usize,
+    ) -> Result<crate::metal::ResidentActivationSlot> {
+        let rows = batch
+            .checked_mul(time)
+            .ok_or_else(|| anyhow::anyhow!("Metal Hyena block row overflow"))?;
+        let (positive, negative, scales) = self.input.metal_parts();
+        runtime.resident_input_projection(slot, rows, self.d_model, positive, negative, scales)?;
+        runtime.resident_hyena_mixer(slot, batch, time, self.d_model, &self.filter)?;
+        let (positive, negative, scales) = self.output.metal_parts();
+        runtime.resident_output_projection(slot, rows, self.d_model, positive, negative, scales)
     }
 }
 
@@ -454,6 +479,50 @@ impl UllisHyena {
             x = block.forward_metal_reference(runtime, &x, batch, time)?;
         }
         Ok(x)
+    }
+
+    /// Complete Metal forward whose inter-block hidden state never crosses
+    /// the CPU/GPU boundary. This is the production inference shape; the
+    /// separate `hidden_metal_reference` remains useful for diagnostics.
+    #[cfg(target_os = "macos")]
+    pub fn hidden_metal_resident(
+        &self,
+        runtime: &crate::metal::MetalRuntime,
+        ids: &[u32],
+        batch: usize,
+        time: usize,
+    ) -> Result<Vec<f32>> {
+        let rows = batch
+            .checked_mul(time)
+            .ok_or_else(|| anyhow::anyhow!("token shape overflow"))?;
+        if batch == 0
+            || batch > self.cfg.batch_size
+            || ids.len() != rows
+            || time == 0
+            || time > self.cfg.context_len
+        {
+            bail!("token shape or context length is invalid");
+        }
+        let d = self.cfg.d_model;
+        let mut embedding_stream = vec![
+            0.0;
+            rows.checked_mul(d).ok_or_else(|| anyhow::anyhow!(
+                "hidden-state shape overflow"
+            ))?
+        ];
+        for (row, &id) in ids.iter().enumerate() {
+            let id = id as usize;
+            if id >= self.cfg.vocab_size {
+                bail!("token id {id} out of vocabulary");
+            }
+            embedding_stream[row * d..(row + 1) * d]
+                .copy_from_slice(&self.embedding[id * d..(id + 1) * d]);
+        }
+        let mut slot = runtime.upload_resident_activations(&embedding_stream, rows, d)?;
+        for block in &self.blocks {
+            slot = block.forward_metal_resident(runtime, slot, batch, time)?;
+        }
+        runtime.download_resident_activations(slot, rows, d)
     }
 
     /// Computes t+1 and t+2 cross-entropy without allocating vocab logits for
@@ -670,6 +739,29 @@ mod tests {
             for (actual, expected) in actual.iter().zip(expected) {
                 assert!((actual - expected).abs() < 1e-4, "{actual} != {expected}");
             }
+        }
+    }
+
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn resident_metal_forward_matches_cpu_across_two_blocks_when_available() {
+        let cfg = TrainConfig {
+            d_model: 4,
+            n_layers: 2,
+            vocab_size: 320,
+            context_len: 4,
+            batch_size: 1,
+            ..Default::default()
+        };
+        let model = UllisHyena::new(cfg).unwrap();
+        let ids = [1, 2, 3, 4];
+        let expected = model.hidden(&ids, 1, 4).unwrap();
+        let Ok(runtime) = crate::metal::MetalRuntime::new() else {
+            return;
+        };
+        let actual = model.hidden_metal_resident(&runtime, &ids, 1, 4).unwrap();
+        for (actual, expected) in actual.iter().zip(expected) {
+            assert!((actual - expected).abs() < 2e-4, "{actual} != {expected}");
         }
     }
 }

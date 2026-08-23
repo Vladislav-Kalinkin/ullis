@@ -59,6 +59,9 @@ pub const FFT_COMPLEX_MULTIPLY_KERNEL_NAME: &str = "ullis_fft_complex_multiply";
 pub const FFT_EXTRACT_CAUSAL_KERNEL_NAME: &str = "ullis_fft_extract_causal";
 pub const IMPLICIT_FILTER_KERNEL_NAME: &str = "ullis_generate_implicit_filter";
 pub const TANH_GATE_KERNEL_NAME: &str = "ullis_tanh_gate_in_place";
+pub const PACK_STRIDED_REAL_KERNEL_NAME: &str = "ullis_pack_strided_real_to_complex";
+pub const APPLY_GATE_KERNEL_NAME: &str = "ullis_apply_gate";
+pub const RESIDUAL_ADD_KERNEL_NAME: &str = "ullis_residual_add";
 pub const HYENA_METAL_SOURCE: &str = include_str!("metal/hyena.metal");
 
 /// Checked dimensions for one packed-ternary projection.
@@ -424,6 +427,15 @@ pub struct MetalRuntime {
     tanh_gate_pipeline: objc2::rc::Retained<
         objc2::runtime::ProtocolObject<dyn objc2_metal::MTLComputePipelineState>,
     >,
+    pack_strided_real_pipeline: objc2::rc::Retained<
+        objc2::runtime::ProtocolObject<dyn objc2_metal::MTLComputePipelineState>,
+    >,
+    apply_gate_pipeline: objc2::rc::Retained<
+        objc2::runtime::ProtocolObject<dyn objc2_metal::MTLComputePipelineState>,
+    >,
+    residual_add_pipeline: objc2::rc::Retained<
+        objc2::runtime::ProtocolObject<dyn objc2_metal::MTLComputePipelineState>,
+    >,
     ternary_buffers: std::cell::RefCell<TernaryBuffers>,
     fft_buffers: std::cell::RefCell<FftBuffers>,
     filter_fft_buffers: std::cell::RefCell<FftBuffers>,
@@ -431,6 +443,26 @@ pub struct MetalRuntime {
     implicit_filter_parameters: std::cell::RefCell<ImplicitFilterParameters>,
     gate_buffers: std::cell::RefCell<GateBuffers>,
     activations: std::cell::RefCell<ActivationBuffers>,
+}
+
+/// Which resident activation slot owns the current residual stream.  A block
+/// always writes the next stream to the other slot, preventing accidental
+/// in-place residual aliasing at the Rust API boundary.
+#[cfg(target_os = "macos")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ResidentActivationSlot {
+    First,
+    Second,
+}
+
+#[cfg(target_os = "macos")]
+impl ResidentActivationSlot {
+    pub const fn other(self) -> Self {
+        match self {
+            Self::First => Self::Second,
+            Self::Second => Self::First,
+        }
+    }
 }
 
 #[cfg(target_os = "macos")]
@@ -776,6 +808,20 @@ impl MetalRuntime {
             .map_err(|error| {
                 anyhow::anyhow!("Metal tanh-gate pipeline creation failed: {error}")
             })?;
+        let make_pipeline = |kernel_name: &str| -> Result<_> {
+            let name = NSString::from_str(kernel_name);
+            let function = library
+                .newFunctionWithName(&name)
+                .ok_or_else(|| anyhow::anyhow!("Metal function {kernel_name} is missing"))?;
+            device
+                .newComputePipelineStateWithFunction_error(&function)
+                .map_err(|error| {
+                    anyhow::anyhow!("Metal pipeline {kernel_name} creation failed: {error}")
+                })
+        };
+        let pack_strided_real_pipeline = make_pipeline(PACK_STRIDED_REAL_KERNEL_NAME)?;
+        let apply_gate_pipeline = make_pipeline(APPLY_GATE_KERNEL_NAME)?;
+        let residual_add_pipeline = make_pipeline(RESIDUAL_ADD_KERNEL_NAME)?;
         let queue = device
             .newCommandQueue()
             .ok_or_else(|| anyhow::anyhow!("Metal command queue is unavailable"))?;
@@ -790,6 +836,9 @@ impl MetalRuntime {
             fft_extract_pipeline,
             implicit_filter_pipeline,
             tanh_gate_pipeline,
+            pack_strided_real_pipeline,
+            apply_gate_pipeline,
+            residual_add_pipeline,
             ternary_buffers: std::cell::RefCell::new(TernaryBuffers::default()),
             fft_buffers: std::cell::RefCell::new(FftBuffers::default()),
             filter_fft_buffers: std::cell::RefCell::new(FftBuffers::default()),
@@ -811,6 +860,611 @@ impl MetalRuntime {
             .and_then(|n| n.checked_mul(size_of::<f32>()))
             .ok_or_else(|| anyhow::anyhow!("Metal activation size overflow"))?;
         self.activations.borrow_mut().ensure(&self.device, bytes)
+    }
+
+    /// Uploads the initial embedding stream once.  Subsequent resident blocks
+    /// exchange only GPU buffers; callers receive the slot token explicitly.
+    #[allow(unsafe_code)]
+    pub fn upload_resident_activations(
+        &self,
+        values: &[f32],
+        rows: usize,
+        width: usize,
+    ) -> Result<ResidentActivationSlot> {
+        use objc2_metal::MTLBuffer;
+        let elements = rows
+            .checked_mul(width)
+            .ok_or_else(|| anyhow::anyhow!("Metal resident activation shape overflow"))?;
+        if rows == 0 || width == 0 || values.len() != elements {
+            bail!("Metal resident activation shape mismatch");
+        }
+        self.reserve_activations(rows, width)?;
+        let activations = self.activations.borrow();
+        let first = activations
+            .first
+            .as_ref()
+            .expect("checked Metal activation buffer");
+        // SAFETY: `reserve_activations` admitted exactly this many FP32 values
+        // and no command can use the new input before this method returns.
+        unsafe {
+            first
+                .contents()
+                .cast::<f32>()
+                .as_ptr()
+                .copy_from_nonoverlapping(values.as_ptr(), elements);
+        }
+        Ok(ResidentActivationSlot::First)
+    }
+
+    /// Reads a resident hidden stream only after the complete model forward.
+    #[allow(unsafe_code)]
+    pub fn download_resident_activations(
+        &self,
+        slot: ResidentActivationSlot,
+        rows: usize,
+        width: usize,
+    ) -> Result<Vec<f32>> {
+        use objc2_metal::MTLBuffer;
+        let elements = rows
+            .checked_mul(width)
+            .ok_or_else(|| anyhow::anyhow!("Metal resident activation shape overflow"))?;
+        let activations = self.activations.borrow();
+        if activations.capacity
+            < elements
+                .checked_mul(size_of::<f32>())
+                .ok_or_else(|| anyhow::anyhow!("Metal resident activation size overflow"))?
+        {
+            bail!("Metal resident activations were not initialized");
+        }
+        let buffer = match slot {
+            ResidentActivationSlot::First => activations.first.as_ref(),
+            ResidentActivationSlot::Second => activations.second.as_ref(),
+        }
+        .expect("checked Metal activation buffer");
+        let mut result = vec![0.0; elements];
+        // SAFETY: resident commands synchronously complete before this public
+        // extraction point, and the selected shared buffer has checked size.
+        unsafe {
+            result
+                .as_mut_ptr()
+                .copy_from_nonoverlapping(buffer.contents().cast::<f32>().as_ptr(), elements);
+        }
+        Ok(result)
+    }
+
+    /// Second submission of a Hyena block: ternary output projection followed
+    /// by residual addition.  Both its input and result stay in the resident
+    /// ping-pong slots; only immutable packed weights are copied from host.
+    #[allow(unsafe_code)]
+    pub fn resident_output_projection(
+        &self,
+        residual_slot: ResidentActivationSlot,
+        rows: usize,
+        width: usize,
+        positive: &[u64],
+        negative: &[u64],
+        scales: &[f32],
+    ) -> Result<ResidentActivationSlot> {
+        use objc2_metal::{MTLBuffer, MTLCommandBuffer, MTLCommandEncoder, MTLCommandQueue};
+        let shape = TernaryLinearShape::new(rows, width, width)?;
+        let elements = rows
+            .checked_mul(width)
+            .ok_or_else(|| anyhow::anyhow!("Metal resident output shape overflow"))?;
+        if positive.len() != shape.packed_words()?
+            || negative.len() != positive.len()
+            || scales.len() != width
+        {
+            bail!("Metal resident output weight shape mismatch");
+        }
+        let bytes = elements
+            .checked_mul(size_of::<f32>())
+            .ok_or_else(|| anyhow::anyhow!("Metal resident output size overflow"))?;
+        let packed_bytes = positive
+            .len()
+            .checked_mul(size_of::<u64>())
+            .ok_or_else(|| anyhow::anyhow!("Metal resident packed size overflow"))?;
+        self.reserve_activations(rows, width)?;
+        let mut ternary = self.ternary_buffers.borrow_mut();
+        ternary.ensure(
+            &self.device,
+            bytes,
+            packed_bytes,
+            size_of_val(scales),
+            bytes,
+        )?;
+        let activations = self.activations.borrow();
+        let residual = match residual_slot {
+            ResidentActivationSlot::First => activations.first.as_ref(),
+            ResidentActivationSlot::Second => activations.second.as_ref(),
+        }
+        .expect("checked residual activation");
+        let next = match residual_slot.other() {
+            ResidentActivationSlot::First => activations.first.as_ref(),
+            ResidentActivationSlot::Second => activations.second.as_ref(),
+        }
+        .expect("checked next activation");
+        let positive_buffer = ternary.positive.as_ref().expect("checked positive weights");
+        let negative_buffer = ternary.negative.as_ref().expect("checked negative weights");
+        let scale_buffer = ternary.scales.as_ref().expect("checked scales");
+        let projected = ternary.output.as_ref().expect("checked ternary output");
+        // SAFETY: all shared buffers were grown to the checked dimensions.
+        unsafe {
+            positive_buffer
+                .contents()
+                .cast::<u64>()
+                .as_ptr()
+                .copy_from_nonoverlapping(positive.as_ptr(), positive.len());
+            negative_buffer
+                .contents()
+                .cast::<u64>()
+                .as_ptr()
+                .copy_from_nonoverlapping(negative.as_ptr(), negative.len());
+            scale_buffer
+                .contents()
+                .cast::<f32>()
+                .as_ptr()
+                .copy_from_nonoverlapping(scales.as_ptr(), scales.len());
+        }
+        let command = self
+            .queue
+            .commandBuffer()
+            .ok_or_else(|| anyhow::anyhow!("Metal command buffer allocation failed"))?;
+        let encoder = command
+            .computeCommandEncoder()
+            .ok_or_else(|| anyhow::anyhow!("Metal compute encoder allocation failed"))?;
+        self.encode_ternary(
+            encoder.as_ref(),
+            &self.ternary_pipeline,
+            next,
+            positive_buffer,
+            negative_buffer,
+            scale_buffer,
+            projected,
+            shape,
+            false,
+        )?;
+        self.encode_residual_add(
+            encoder.as_ref(),
+            residual,
+            projected,
+            next,
+            u32::try_from(elements)
+                .map_err(|_| anyhow::anyhow!("Metal resident elements exceed u32"))?,
+        )?;
+        encoder.endEncoding();
+        command.commit();
+        command.waitUntilCompleted();
+        if let Some(error) = command.error() {
+            bail!("Metal resident output command failed: {error}");
+        }
+        Ok(residual_slot.other())
+    }
+
+    /// Starts the first block submission with fused RMSNorm/ternary input
+    /// projection and the in-place Hyena gate.  The projection is retained in
+    /// `gate_buffers.output` for the following FFT mixer; no activation leaves
+    /// Metal at this boundary.
+    #[allow(unsafe_code)]
+    pub fn resident_input_projection(
+        &self,
+        slot: ResidentActivationSlot,
+        rows: usize,
+        width: usize,
+        positive: &[u64],
+        negative: &[u64],
+        scales: &[f32],
+    ) -> Result<()> {
+        use objc2_metal::{MTLBuffer, MTLCommandBuffer, MTLCommandEncoder, MTLCommandQueue};
+        let out_width = width
+            .checked_mul(2)
+            .ok_or_else(|| anyhow::anyhow!("Metal resident input width overflow"))?;
+        let shape = TernaryLinearShape::new(rows, width, out_width)?;
+        if positive.len() != shape.packed_words()?
+            || negative.len() != positive.len()
+            || scales.len() != out_width
+        {
+            bail!("Metal resident input weight shape mismatch");
+        }
+        let input_bytes = rows
+            .checked_mul(width)
+            .and_then(|n| n.checked_mul(size_of::<f32>()))
+            .ok_or_else(|| anyhow::anyhow!("Metal resident input size overflow"))?;
+        let output_bytes = rows
+            .checked_mul(out_width)
+            .and_then(|n| n.checked_mul(size_of::<f32>()))
+            .ok_or_else(|| anyhow::anyhow!("Metal resident projection size overflow"))?;
+        let packed_bytes = size_of_val(positive);
+        self.reserve_activations(rows, width)?;
+        self.ternary_buffers.borrow_mut().ensure(
+            &self.device,
+            input_bytes,
+            packed_bytes,
+            size_of_val(scales),
+            output_bytes,
+        )?;
+        self.gate_buffers
+            .borrow_mut()
+            .ensure(&self.device, output_bytes)?;
+        let activations = self.activations.borrow();
+        let ternary = self.ternary_buffers.borrow();
+        let gates = self.gate_buffers.borrow();
+        let input = match slot {
+            ResidentActivationSlot::First => activations.first.as_ref(),
+            ResidentActivationSlot::Second => activations.second.as_ref(),
+        }
+        .expect("checked resident input");
+        let positive_buffer = ternary.positive.as_ref().expect("checked positive weights");
+        let negative_buffer = ternary.negative.as_ref().expect("checked negative weights");
+        let scale_buffer = ternary.scales.as_ref().expect("checked scales");
+        let projected = ternary.output.as_ref().expect("checked projection output");
+        let gated = gates.output.as_ref().expect("checked gate output");
+        // SAFETY: immutable packed weights fit the persistent shared buffers.
+        unsafe {
+            positive_buffer
+                .contents()
+                .cast::<u64>()
+                .as_ptr()
+                .copy_from_nonoverlapping(positive.as_ptr(), positive.len());
+            negative_buffer
+                .contents()
+                .cast::<u64>()
+                .as_ptr()
+                .copy_from_nonoverlapping(negative.as_ptr(), negative.len());
+            scale_buffer
+                .contents()
+                .cast::<f32>()
+                .as_ptr()
+                .copy_from_nonoverlapping(scales.as_ptr(), scales.len());
+        }
+        let command = self
+            .queue
+            .commandBuffer()
+            .ok_or_else(|| anyhow::anyhow!("Metal command buffer allocation failed"))?;
+        let encoder = command
+            .computeCommandEncoder()
+            .ok_or_else(|| anyhow::anyhow!("Metal compute encoder allocation failed"))?;
+        self.encode_ternary(
+            encoder.as_ref(),
+            &self.fused_rms_norm_ternary_pipeline,
+            input,
+            positive_buffer,
+            negative_buffer,
+            scale_buffer,
+            projected,
+            shape,
+            true,
+        )?;
+        self.encode_tanh_gate(encoder.as_ref(), projected, gated, rows, width)?;
+        encoder.endEncoding();
+        command.commit();
+        command.waitUntilCompleted();
+        if let Some(error) = command.error() {
+            bail!("Metal resident input command failed: {error}");
+        }
+        Ok(())
+    }
+
+    /// Completes the resident Hyena mixer after `resident_input_projection`.
+    /// The gated `[B*T, 2D]` projection is packed directly into the signal
+    /// FFT buffer, convolved with an on-device implicit filter, and written
+    /// into the opposite activation slot. No `[B, T, D]` value is materialized
+    /// on the host along this path.
+    #[allow(unsafe_code)]
+    pub fn resident_hyena_mixer(
+        &self,
+        slot: ResidentActivationSlot,
+        batch: usize,
+        time: usize,
+        channels: usize,
+        filter: &crate::hyena::ImplicitFilter,
+    ) -> Result<()> {
+        use objc2_metal::{
+            MTLBuffer, MTLCommandBuffer, MTLCommandEncoder, MTLCommandQueue,
+            MTLComputePipelineState,
+        };
+
+        let shape = MetalDispatchShape::new(batch, time, channels)?;
+        let plan = HyenaFftPlan::new(time)?;
+        let transforms = batch
+            .checked_mul(channels)
+            .ok_or_else(|| anyhow::anyhow!("Metal resident transform shape overflow"))?;
+        let signal_elements = transforms
+            .checked_mul(plan.fft_len)
+            .ok_or_else(|| anyhow::anyhow!("Metal resident signal FFT shape overflow"))?;
+        let filter_elements = channels
+            .checked_mul(time)
+            .ok_or_else(|| anyhow::anyhow!("Metal resident filter shape overflow"))?;
+        let filter_fft_elements = channels
+            .checked_mul(plan.fft_len)
+            .ok_or_else(|| anyhow::anyhow!("Metal resident filter FFT shape overflow"))?;
+        let signal_bytes = signal_elements
+            .checked_mul(size_of::<Complex32>())
+            .ok_or_else(|| anyhow::anyhow!("Metal resident signal size overflow"))?;
+        let filter_bytes = filter_fft_elements
+            .checked_mul(size_of::<Complex32>())
+            .ok_or_else(|| anyhow::anyhow!("Metal resident filter size overflow"))?;
+        let output_bytes = shape
+            .elements()
+            .checked_mul(size_of::<f32>())
+            .ok_or_else(|| anyhow::anyhow!("Metal resident mixer output size overflow"))?;
+        let (freq, phase, decay, order) = filter.parameter_slices(channels)?;
+        let parameter_bytes = freq
+            .len()
+            .checked_mul(size_of::<f32>())
+            .ok_or_else(|| anyhow::anyhow!("Metal resident filter parameter size overflow"))?;
+        self.reserve_activations(batch * time, channels)?;
+        self.fft_buffers
+            .borrow_mut()
+            .ensure(&self.device, signal_bytes)?;
+        self.filter_fft_buffers
+            .borrow_mut()
+            .ensure(&self.device, filter_bytes)?;
+        self.hyena_output_buffer
+            .borrow_mut()
+            .ensure(&self.device, output_bytes)?;
+        self.implicit_filter_parameters
+            .borrow_mut()
+            .ensure(&self.device, parameter_bytes)?;
+
+        let fft_len = u32::try_from(plan.fft_len)
+            .map_err(|_| anyhow::anyhow!("Metal resident FFT length exceeds u32"))?;
+        let transforms_u32 = u32::try_from(transforms)
+            .map_err(|_| anyhow::anyhow!("Metal resident transform count exceeds u32"))?;
+        let channels_u32 = u32::try_from(channels)
+            .map_err(|_| anyhow::anyhow!("Metal resident channel count exceeds u32"))?;
+        let time_u32 =
+            u32::try_from(time).map_err(|_| anyhow::anyhow!("Metal resident time exceeds u32"))?;
+        let elements_u32 = u32::try_from(shape.elements())
+            .map_err(|_| anyhow::anyhow!("Metal resident element count exceeds u32"))?;
+        let order_u32 = u32::try_from(order)
+            .map_err(|_| anyhow::anyhow!("Metal resident filter order exceeds u32"))?;
+        let filter_elements_u32 = u32::try_from(filter_elements)
+            .map_err(|_| anyhow::anyhow!("Metal resident filter elements exceed u32"))?;
+
+        let activations = self.activations.borrow();
+        let gates = self.gate_buffers.borrow();
+        let signal_buffers = self.fft_buffers.borrow();
+        let filter_buffers = self.filter_fft_buffers.borrow();
+        let mixer_output = self.hyena_output_buffer.borrow();
+        let parameters = self.implicit_filter_parameters.borrow();
+        let gated = gates
+            .output
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("Metal resident gate is not initialized"))?;
+        let next = match slot.other() {
+            ResidentActivationSlot::First => activations.first.as_ref(),
+            ResidentActivationSlot::Second => activations.second.as_ref(),
+        }
+        .expect("checked next resident activation");
+        let signal_first = signal_buffers
+            .first
+            .as_ref()
+            .expect("checked resident signal buffer");
+        let signal_second = signal_buffers
+            .second
+            .as_ref()
+            .expect("checked resident signal scratch buffer");
+        let filter_first = filter_buffers
+            .first
+            .as_ref()
+            .expect("checked resident filter buffer");
+        let filter_second = filter_buffers
+            .second
+            .as_ref()
+            .expect("checked resident filter scratch buffer");
+        let mixed = mixer_output
+            .buffer
+            .as_ref()
+            .expect("checked resident mixer output");
+        let freq_buffer = parameters
+            .freq
+            .as_ref()
+            .expect("checked resident frequency buffer");
+        let phase_buffer = parameters
+            .phase
+            .as_ref()
+            .expect("checked resident phase buffer");
+        let decay_buffer = parameters
+            .decay
+            .as_ref()
+            .expect("checked resident decay buffer");
+        // SAFETY: the capacity checks above cover every copied parameter and
+        // complex padding lane. These buffers stay borrowed through completion.
+        unsafe {
+            signal_first
+                .contents()
+                .cast::<Complex32>()
+                .as_ptr()
+                .write_bytes(0, signal_elements);
+            filter_first
+                .contents()
+                .cast::<Complex32>()
+                .as_ptr()
+                .write_bytes(0, filter_fft_elements);
+            freq_buffer
+                .contents()
+                .cast::<f32>()
+                .as_ptr()
+                .copy_from_nonoverlapping(freq.as_ptr(), freq.len());
+            phase_buffer
+                .contents()
+                .cast::<f32>()
+                .as_ptr()
+                .copy_from_nonoverlapping(phase.as_ptr(), phase.len());
+            decay_buffer
+                .contents()
+                .cast::<f32>()
+                .as_ptr()
+                .copy_from_nonoverlapping(decay.as_ptr(), decay.len());
+        }
+        let command = self
+            .queue
+            .commandBuffer()
+            .ok_or_else(|| anyhow::anyhow!("Metal command buffer allocation failed"))?;
+        let encoder = command
+            .computeCommandEncoder()
+            .ok_or_else(|| anyhow::anyhow!("Metal compute encoder allocation failed"))?;
+        self.encode_pack_strided_real(
+            encoder.as_ref(),
+            gated,
+            signal_first,
+            time_u32,
+            channels_u32,
+            channels_u32
+                .checked_mul(2)
+                .ok_or_else(|| anyhow::anyhow!("Metal resident stride exceeds u32"))?,
+            0,
+            fft_len,
+            elements_u32,
+        )?;
+        self.encode_implicit_filter(
+            encoder.as_ref(),
+            freq_buffer,
+            phase_buffer,
+            decay_buffer,
+            filter_first,
+            time_u32,
+            order_u32,
+            fft_len,
+            filter_elements_u32,
+        )?;
+        let dispatch_two = |pipeline: &objc2::runtime::ProtocolObject<
+            dyn MTLComputePipelineState,
+        >,
+                            input,
+                            output,
+                            total,
+                            scalars: &[u32]| {
+            self.encode_fft_two_buffer(encoder.as_ref(), pipeline, input, output, total, scalars)
+        };
+        let run_fft = |first, second, transform_count, total, inverse| -> Result<bool> {
+            dispatch_two(
+                &self.fft_bitreverse_pipeline,
+                first,
+                second,
+                total,
+                &[fft_len, transform_count],
+            )?;
+            let mut source_is_first = false;
+            for stage in 1..=plan.stages {
+                let (source, destination) = if source_is_first {
+                    (first, second)
+                } else {
+                    (second, first)
+                };
+                dispatch_two(
+                    &self.fft_stage_pipeline,
+                    source,
+                    destination,
+                    total,
+                    &[fft_len, transform_count, stage, u32::from(inverse)],
+                )?;
+                source_is_first = !source_is_first;
+            }
+            Ok(source_is_first)
+        };
+        let signal_source_is_first = run_fft(
+            signal_first,
+            signal_second,
+            transforms_u32,
+            signal_elements,
+            false,
+        )?;
+        let filter_source_is_first = run_fft(
+            filter_first,
+            filter_second,
+            channels_u32,
+            filter_fft_elements,
+            false,
+        )?;
+        let signal_spectrum = if signal_source_is_first {
+            signal_first
+        } else {
+            signal_second
+        };
+        let filter_spectrum = if filter_source_is_first {
+            filter_first
+        } else {
+            filter_second
+        };
+        let product_is_first = !signal_source_is_first;
+        let product = if product_is_first {
+            signal_first
+        } else {
+            signal_second
+        };
+        self.encode_fft_multiply(
+            encoder.as_ref(),
+            signal_spectrum,
+            filter_spectrum,
+            product,
+            fft_len,
+            channels_u32,
+            transforms_u32,
+            signal_elements,
+        )?;
+        let inverse_bitreversed_is_first = !product_is_first;
+        let inverse_bitreversed = if inverse_bitreversed_is_first {
+            signal_first
+        } else {
+            signal_second
+        };
+        dispatch_two(
+            &self.fft_bitreverse_pipeline,
+            product,
+            inverse_bitreversed,
+            signal_elements,
+            &[fft_len, transforms_u32],
+        )?;
+        let mut inverse_source_is_first = inverse_bitreversed_is_first;
+        for stage in 1..=plan.stages {
+            let (source, destination) = if inverse_source_is_first {
+                (signal_first, signal_second)
+            } else {
+                (signal_second, signal_first)
+            };
+            dispatch_two(
+                &self.fft_stage_pipeline,
+                source,
+                destination,
+                signal_elements,
+                &[fft_len, transforms_u32, stage, 1],
+            )?;
+            inverse_source_is_first = !inverse_source_is_first;
+        }
+        let inverse = if inverse_source_is_first {
+            signal_first
+        } else {
+            signal_second
+        };
+        self.encode_causal_extract(
+            encoder.as_ref(),
+            inverse,
+            mixed,
+            time_u32,
+            channels_u32,
+            fft_len,
+            elements_u32,
+        )?;
+        self.encode_apply_gate(
+            encoder.as_ref(),
+            mixed,
+            gated,
+            next,
+            channels_u32,
+            channels_u32
+                .checked_mul(2)
+                .ok_or_else(|| anyhow::anyhow!("Metal resident stride exceeds u32"))?,
+            channels_u32,
+            elements_u32,
+        )?;
+        encoder.endEncoding();
+        command.commit();
+        command.waitUntilCompleted();
+        if let Some(error) = command.error() {
+            bail!("Metal resident Hyena mixer failed: {error}");
+        }
+        Ok(())
     }
 
     /// Runs a projection without recompiling MSL or reallocating buffers when
@@ -1183,6 +1837,262 @@ impl MetalRuntime {
             },
         );
         Ok(())
+    }
+
+    /// Encodes the three layout-only Hyena operations used by the resident
+    /// path.  Keeping them here makes their buffer-slot contracts auditable
+    /// and lets one command buffer chain them without a host readback.
+    #[allow(unsafe_code)]
+    fn encode_pack_strided_real(
+        &self,
+        encoder: &objc2::runtime::ProtocolObject<dyn objc2_metal::MTLComputeCommandEncoder>,
+        input: &objc2::runtime::ProtocolObject<dyn objc2_metal::MTLBuffer>,
+        output: &objc2::runtime::ProtocolObject<dyn objc2_metal::MTLBuffer>,
+        time: u32,
+        channels: u32,
+        stride: u32,
+        offset: u32,
+        fft_len: u32,
+        elements: u32,
+    ) -> Result<()> {
+        self.encode_elementwise_buffers(
+            encoder,
+            &self.pack_strided_real_pipeline,
+            &[input, output],
+            &[time, channels, stride, offset, fft_len, elements],
+            elements as usize,
+        )
+    }
+
+    #[allow(unsafe_code)]
+    fn encode_apply_gate(
+        &self,
+        encoder: &objc2::runtime::ProtocolObject<dyn objc2_metal::MTLComputeCommandEncoder>,
+        mixed: &objc2::runtime::ProtocolObject<dyn objc2_metal::MTLBuffer>,
+        projection: &objc2::runtime::ProtocolObject<dyn objc2_metal::MTLBuffer>,
+        output: &objc2::runtime::ProtocolObject<dyn objc2_metal::MTLBuffer>,
+        channels: u32,
+        stride: u32,
+        gate_offset: u32,
+        elements: u32,
+    ) -> Result<()> {
+        self.encode_elementwise_buffers(
+            encoder,
+            &self.apply_gate_pipeline,
+            &[mixed, projection, output],
+            &[channels, stride, gate_offset, elements],
+            elements as usize,
+        )
+    }
+
+    #[allow(unsafe_code)]
+    fn encode_residual_add(
+        &self,
+        encoder: &objc2::runtime::ProtocolObject<dyn objc2_metal::MTLComputeCommandEncoder>,
+        residual: &objc2::runtime::ProtocolObject<dyn objc2_metal::MTLBuffer>,
+        update: &objc2::runtime::ProtocolObject<dyn objc2_metal::MTLBuffer>,
+        output: &objc2::runtime::ProtocolObject<dyn objc2_metal::MTLBuffer>,
+        elements: u32,
+    ) -> Result<()> {
+        self.encode_elementwise_buffers(
+            encoder,
+            &self.residual_add_pipeline,
+            &[residual, update, output],
+            &[elements],
+            elements as usize,
+        )
+    }
+
+    #[allow(unsafe_code)]
+    fn encode_elementwise_buffers(
+        &self,
+        encoder: &objc2::runtime::ProtocolObject<dyn objc2_metal::MTLComputeCommandEncoder>,
+        pipeline: &objc2::runtime::ProtocolObject<dyn objc2_metal::MTLComputePipelineState>,
+        buffers: &[&objc2::runtime::ProtocolObject<dyn objc2_metal::MTLBuffer>],
+        scalars: &[u32],
+        elements: usize,
+    ) -> Result<()> {
+        use core::ffi::c_void;
+        use core::ptr::NonNull;
+        use objc2_metal::{MTLComputeCommandEncoder, MTLComputePipelineState, MTLSize};
+        if elements == 0 {
+            bail!("Metal elementwise dispatch cannot be empty");
+        }
+        encoder.setComputePipelineState(pipeline);
+        // SAFETY: callers pair buffer/scalar lists with the exact MSL ABI.
+        unsafe {
+            for (slot, buffer) in buffers.iter().enumerate() {
+                encoder.setBuffer_offset_atIndex(Some(*buffer), 0, slot);
+            }
+            for (offset, scalar) in scalars.iter().enumerate() {
+                encoder.setBytes_length_atIndex(
+                    NonNull::from(scalar).cast::<c_void>(),
+                    size_of::<u32>(),
+                    buffers.len() + offset,
+                );
+            }
+        }
+        let width = pipeline.maxTotalThreadsPerThreadgroup().min(elements);
+        if width == 0 {
+            bail!("Metal elementwise pipeline reported zero threads per threadgroup");
+        }
+        encoder.dispatchThreads_threadsPerThreadgroup(
+            MTLSize {
+                width: elements,
+                height: 1,
+                depth: 1,
+            },
+            MTLSize {
+                width,
+                height: 1,
+                depth: 1,
+            },
+        );
+        Ok(())
+    }
+
+    /// Executes the layout-only tail of a Hyena block in one submission.  It
+    /// is intentionally public as a small equivalence boundary while the
+    /// model-level resident API is wired: only the final residual stream is
+    /// read back, never the packed or gated intermediates.
+    #[allow(unsafe_code)]
+    pub fn resident_gate_residual_reference(
+        &self,
+        residual: &[f32],
+        mixed: &[f32],
+        projection: &[f32],
+        rows: usize,
+        channels: usize,
+    ) -> Result<Vec<f32>> {
+        use objc2_metal::{MTLBuffer, MTLCommandBuffer, MTLCommandEncoder, MTLCommandQueue};
+        let elements = rows
+            .checked_mul(channels)
+            .ok_or_else(|| anyhow::anyhow!("Metal resident element shape overflow"))?;
+        let projected = elements
+            .checked_mul(2)
+            .ok_or_else(|| anyhow::anyhow!("Metal resident projection shape overflow"))?;
+        if rows == 0
+            || channels == 0
+            || residual.len() != elements
+            || mixed.len() != elements
+            || projection.len() != projected
+        {
+            bail!("Metal resident gate/residual shape mismatch");
+        }
+        let activation_bytes = elements
+            .checked_mul(size_of::<f32>())
+            .ok_or_else(|| anyhow::anyhow!("Metal resident activation size overflow"))?;
+        let projection_bytes = projected
+            .checked_mul(size_of::<f32>())
+            .ok_or_else(|| anyhow::anyhow!("Metal resident projection size overflow"))?;
+        self.reserve_activations(rows, channels)?;
+        self.gate_buffers
+            .borrow_mut()
+            .ensure(&self.device, projection_bytes)?;
+        self.hyena_output_buffer
+            .borrow_mut()
+            .ensure(&self.device, activation_bytes)?;
+        let plan = HyenaFftPlan::new(rows)?;
+        let transform_elements = elements
+            .checked_mul(plan.fft_len)
+            .ok_or_else(|| anyhow::anyhow!("Metal resident FFT shape overflow"))?;
+        let transform_bytes = transform_elements
+            .checked_mul(size_of::<Complex32>())
+            .ok_or_else(|| anyhow::anyhow!("Metal resident FFT size overflow"))?;
+        self.fft_buffers
+            .borrow_mut()
+            .ensure(&self.device, transform_bytes)?;
+        let activations = self.activations.borrow();
+        let gates = self.gate_buffers.borrow();
+        let output = self.hyena_output_buffer.borrow();
+        let fft = self.fft_buffers.borrow();
+        let first = activations
+            .first
+            .as_ref()
+            .expect("checked Metal activation buffer");
+        let second = activations
+            .second
+            .as_ref()
+            .expect("checked Metal activation scratch");
+        let gate = gates.output.as_ref().expect("checked Metal gate buffer");
+        let mixed_buffer = output.buffer.as_ref().expect("checked Metal Hyena output");
+        let fft_first = fft.first.as_ref().expect("checked Metal FFT source buffer");
+        // SAFETY: each persistent shared allocation was checked above and no
+        // GPU command observes it until these complete host writes finish.
+        unsafe {
+            first
+                .contents()
+                .cast::<f32>()
+                .as_ptr()
+                .copy_from_nonoverlapping(residual.as_ptr(), elements);
+            mixed_buffer
+                .contents()
+                .cast::<f32>()
+                .as_ptr()
+                .copy_from_nonoverlapping(mixed.as_ptr(), elements);
+            gate.contents()
+                .cast::<f32>()
+                .as_ptr()
+                .copy_from_nonoverlapping(projection.as_ptr(), projected);
+            fft_first
+                .contents()
+                .cast::<Complex32>()
+                .as_ptr()
+                .write_bytes(0, transform_elements);
+        }
+        let channels_u32 =
+            u32::try_from(channels).map_err(|_| anyhow::anyhow!("Metal channels exceed u32"))?;
+        let projection_stride = channels_u32
+            .checked_mul(2)
+            .ok_or_else(|| anyhow::anyhow!("Metal projection stride overflow"))?;
+        let elements_u32 =
+            u32::try_from(elements).map_err(|_| anyhow::anyhow!("Metal elements exceed u32"))?;
+        let rows_u32 = u32::try_from(rows).map_err(|_| anyhow::anyhow!("Metal rows exceed u32"))?;
+        let fft_len_u32 = u32::try_from(plan.fft_len)
+            .map_err(|_| anyhow::anyhow!("Metal FFT length exceeds u32"))?;
+        let command = self
+            .queue
+            .commandBuffer()
+            .ok_or_else(|| anyhow::anyhow!("Metal command buffer allocation failed"))?;
+        let encoder = command
+            .computeCommandEncoder()
+            .ok_or_else(|| anyhow::anyhow!("Metal compute encoder allocation failed"))?;
+        self.encode_pack_strided_real(
+            encoder.as_ref(),
+            gate,
+            fft_first,
+            rows_u32,
+            channels_u32,
+            projection_stride,
+            0,
+            fft_len_u32,
+            elements_u32,
+        )?;
+        self.encode_apply_gate(
+            encoder.as_ref(),
+            mixed_buffer,
+            gate,
+            second,
+            channels_u32,
+            projection_stride,
+            channels_u32,
+            elements_u32,
+        )?;
+        self.encode_residual_add(encoder.as_ref(), first, second, second, elements_u32)?;
+        encoder.endEncoding();
+        command.commit();
+        command.waitUntilCompleted();
+        if let Some(error) = command.error() {
+            bail!("Metal resident gate/residual command failed: {error}");
+        }
+        let mut result = vec![0.0; elements];
+        // SAFETY: completion makes the shared final activation readable.
+        unsafe {
+            result
+                .as_mut_ptr()
+                .copy_from_nonoverlapping(second.contents().cast::<f32>().as_ptr(), elements);
+        }
+        Ok(result)
     }
 
     #[allow(unsafe_code)]
@@ -2340,6 +3250,41 @@ mod tests {
 
     #[test]
     #[cfg(target_os = "macos")]
+    fn resident_gate_and_residual_match_cpu_when_metal_is_available() {
+        let Ok(runtime) = MetalRuntime::new() else {
+            return;
+        };
+        let residual = [1.0, -2.0, 0.5, 3.0];
+        let mixed = [2.0, 4.0, -1.0, 0.25];
+        // Signal | gate for each row.
+        let projection = [9.0, 8.0, 0.5, -0.25, 7.0, 6.0, -0.75, 0.4];
+        let actual = runtime
+            .resident_gate_residual_reference(&residual, &mixed, &projection, 2, 2)
+            .unwrap();
+        let expected = [2.0, -3.0, 1.25, 3.1];
+        for (actual, expected) in actual.iter().zip(expected) {
+            assert!((actual - expected).abs() < 1e-6, "{actual} != {expected}");
+        }
+    }
+
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn resident_projection_ping_pongs_without_host_activation_copy() {
+        let Ok(runtime) = MetalRuntime::new() else {
+            return;
+        };
+        let source = [1.0, -2.0, 0.5, 3.0];
+        let slot = runtime.upload_resident_activations(&source, 2, 2).unwrap();
+        // Identity ternary matrix, encoded row-major by output feature.
+        let slot = runtime
+            .resident_output_projection(slot, 2, 2, &[0b1001], &[0], &[1.0, 1.0])
+            .unwrap();
+        let actual = runtime.download_resident_activations(slot, 2, 2).unwrap();
+        assert_eq!(actual, [2.0, -4.0, 1.0, 6.0]);
+    }
+
+    #[test]
+    #[cfg(target_os = "macos")]
     fn fft_stage_kernels_compile_on_the_local_metal_device() {
         let shape = MetalDispatchShape::new(1, 8, 1).unwrap();
         for kernel in [
@@ -2349,6 +3294,9 @@ mod tests {
             FFT_EXTRACT_CAUSAL_KERNEL_NAME,
             IMPLICIT_FILTER_KERNEL_NAME,
             TANH_GATE_KERNEL_NAME,
+            PACK_STRIDED_REAL_KERNEL_NAME,
+            APPLY_GATE_KERNEL_NAME,
+            RESIDUAL_ADD_KERNEL_NAME,
         ] {
             if let Ok(width) = validate_metal_kernel(kernel, shape) {
                 assert!(width > 0);
