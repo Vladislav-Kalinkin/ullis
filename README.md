@@ -42,11 +42,33 @@ milestones. Every GPU kernel must preserve this reference implementation's
 causal convolution semantics and tests.
 
 Metal now also owns a staged radix-2 complex FFT reference (`bit-reversal`
-plus ping-pong butterfly passes) with cached complex buffers. Its known
-spectrum and forward/inverse round-trip are verified on Apple GPU. The next
-Hyena milestone is to keep signal FFT, filter FFT, frequency multiply, and
-inverse FFT in one command buffer; until then the model sequence mixer remains
-on the CPU reference path.
+plus ping-pong butterfly passes) with cached complex buffers. For a dense
+materialized `[D,T]` filter, `MetalRuntime::causal_long_conv_forward` keeps
+signal FFT, filter FFT, frequency multiplication, inverse FFT, and causal
+extraction in one command buffer; only the final `[B,T,D]` result returns to
+the CPU. Its output is compared with the CPU causal-convolution reference on
+Apple GPU.
+
+This is deliberately not yet the model sequence-mixer path. The model uses an
+implicit, strided filter and currently avoids materializing `[D,T]` on the
+CPU. Moving it to Metal requires generating that filter directly into the
+cached GPU buffer; routing it through the dense reference now would add a
+large host allocation and violate the RAM budget. The dense reference itself
+does not create host-side padded FFT staging arrays: it fills its shared Metal
+buffers directly. Configuration admission separately reserves its cached
+signal/filter/output buffers, so a future switch cannot silently push unified
+memory into swap.
+
+The compact implicit-filter generator is now also a Metal kernel and is
+verified against the CPU equation. Its output is written directly in the
+zero-imaginary `float2` layout consumed by the filter FFT, followed by all FFT
+passes and causal extraction in the same command buffer. The model still uses
+its authoritative CPU path by default. `hidden_metal_reference` verifies the
+complete block equation on GPU — ternary projection, gate, implicit mixer,
+output projection, and residual — against that CPU path. It is intentionally
+not selected for training or fast inference yet: its inter-stage `Vec`
+readbacks are a correctness baseline, while the next optimisation retains the
+same tensors across blocks in GPU buffers.
 
 `TrainConfig` validates an explicit 1 GiB default process budget before model
 allocation. Materialising `[B,T,V]` MTP logits is intentionally rejected when

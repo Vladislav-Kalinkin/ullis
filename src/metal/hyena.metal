@@ -178,6 +178,47 @@ kernel void ullis_fft_complex_multiply(
     output[index] = float2(a.x * b.x - a.y * b.y, a.x * b.y + a.y * b.x);
 }
 
+// Generates the compact implicit filter directly as zero-imaginary float2
+// values, ready for the filter FFT buffer. One thread owns one [channel,time]
+// entry; padding remains zero because the host clears the reusable buffer.
+kernel void ullis_generate_implicit_filter(
+    device const float *freq [[buffer(0)]],
+    device const float *phase [[buffer(1)]],
+    device const float *decay [[buffer(2)]],
+    device float2 *output [[buffer(3)]],
+    constant uint &time [[buffer(4)]],
+    constant uint &order [[buffer(5)]],
+    constant uint &fft_len [[buffer(6)]],
+    constant uint &elements [[buffer(7)]],
+    uint index [[thread_position_in_grid]]) {
+    if (index >= elements) return;
+    const uint channel = index / time;
+    const uint position = index - channel * time;
+    const float normalized_position = float(position) / float(time);
+    float sum = 0.0f;
+    const uint base = channel * order;
+    for (uint k = 0; k < order; ++k) {
+        const uint parameter = base + k;
+        sum += exp(-decay[parameter] * float(position))
+            * cos(freq[parameter] * normalized_position + phase[parameter]);
+    }
+    output[channel * fft_len + position] = float2(sum / float(order), 0.0f);
+}
+
+// Keeps the signal half unchanged and applies tanh only to the gate half of
+// each `[rows, 2 * channels]` projection. The next resident-forward step can
+// consume this layout directly without a separate gate tensor.
+kernel void ullis_tanh_gate_in_place(
+    device const float *input [[buffer(0)]],
+    device float *output [[buffer(1)]],
+    constant uint &elements [[buffer(2)]],
+    constant uint &channels [[buffer(3)]],
+    uint index [[thread_position_in_grid]]) {
+    if (index >= elements) return;
+    const uint feature = index % (2u * channels);
+    output[index] = feature < channels ? input[index] : tanh(input[index]);
+}
+
 kernel void ullis_fft_extract_causal(
     device const float2 *input [[buffer(0)]],
     device float *output [[buffer(1)]],

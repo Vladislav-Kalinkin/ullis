@@ -305,6 +305,45 @@ impl HyenaBlock {
         let update = self.output.forward(&mixed, batch * time)?;
         Ok(x.iter().zip(update).map(|(a, b)| a + b).collect())
     }
+
+    #[cfg(target_os = "macos")]
+    fn forward_metal_reference(
+        &self,
+        runtime: &crate::metal::MetalRuntime,
+        x: &[f32],
+        batch: usize,
+        time: usize,
+    ) -> Result<Vec<f32>> {
+        let rows = batch
+            .checked_mul(time)
+            .ok_or_else(|| anyhow::anyhow!("Metal Hyena block row overflow"))?;
+        let projected = self
+            .input
+            .forward_rms_norm_with_metal_runtime(runtime, x, rows)?;
+        let gated = runtime.tanh_gate_forward(&projected, rows, self.d_model)?;
+        let mut mixed = runtime.causal_long_conv_implicit_strided_forward(
+            &gated,
+            &self.filter,
+            batch,
+            time,
+            self.d_model,
+            2 * self.d_model,
+            0,
+        )?;
+        for row in 0..rows {
+            for channel in 0..self.d_model {
+                mixed[row * self.d_model + channel] *=
+                    gated[row * 2 * self.d_model + self.d_model + channel];
+            }
+        }
+        let update = self
+            .output
+            .forward_with_metal_runtime(runtime, &mixed, rows)?;
+        Ok(x.iter()
+            .zip(update)
+            .map(|(left, right)| left + right)
+            .collect())
+    }
 }
 
 /// Inference core. `mtp_logits` exposes separate t+1 and t+2 pretraining heads.
@@ -371,6 +410,48 @@ impl UllisHyena {
         }
         for block in &self.blocks {
             x = block.forward(&x, batch, time)?;
+        }
+        Ok(x)
+    }
+
+    /// Complete Metal numerical-reference forward. It deliberately exposes a
+    /// distinct API until residual and projection buffers remain resident
+    /// across blocks; callers never silently receive a mixed CPU/GPU path.
+    #[cfg(target_os = "macos")]
+    pub fn hidden_metal_reference(
+        &self,
+        runtime: &crate::metal::MetalRuntime,
+        ids: &[u32],
+        batch: usize,
+        time: usize,
+    ) -> Result<Vec<f32>> {
+        let rows = batch
+            .checked_mul(time)
+            .ok_or_else(|| anyhow::anyhow!("token shape overflow"))?;
+        if batch == 0
+            || batch > self.cfg.batch_size
+            || ids.len() != rows
+            || time == 0
+            || time > self.cfg.context_len
+        {
+            bail!("token shape or context length is invalid");
+        }
+        let mut x = vec![
+            0.0;
+            rows.checked_mul(self.cfg.d_model)
+                .ok_or_else(|| anyhow::anyhow!("hidden-state shape overflow"))?
+        ];
+        for (row, &id) in ids.iter().enumerate() {
+            let id = id as usize;
+            if id >= self.cfg.vocab_size {
+                bail!("token id {id} out of vocabulary");
+            }
+            x[row * self.cfg.d_model..(row + 1) * self.cfg.d_model].copy_from_slice(
+                &self.embedding[id * self.cfg.d_model..(id + 1) * self.cfg.d_model],
+            );
+        }
+        for block in &self.blocks {
+            x = block.forward_metal_reference(runtime, &x, batch, time)?;
         }
         Ok(x)
     }
@@ -566,6 +647,28 @@ mod tests {
                 .unwrap();
             for (actual, expected) in actual.iter().zip(expected) {
                 assert!((actual - expected).abs() < 1e-5);
+            }
+        }
+    }
+
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn complete_metal_forward_matches_cpu_when_available() {
+        let cfg = TrainConfig {
+            d_model: 4,
+            n_layers: 1,
+            vocab_size: 320,
+            context_len: 4,
+            batch_size: 1,
+            ..Default::default()
+        };
+        let model = UllisHyena::new(cfg).unwrap();
+        let ids = [1, 2, 3, 4];
+        let expected = model.hidden(&ids, 1, 4).unwrap();
+        if let Ok(runtime) = crate::metal::MetalRuntime::new() {
+            let actual = model.hidden_metal_reference(&runtime, &ids, 1, 4).unwrap();
+            for (actual, expected) in actual.iter().zip(expected) {
+                assert!((actual - expected).abs() < 1e-4, "{actual} != {expected}");
             }
         }
     }

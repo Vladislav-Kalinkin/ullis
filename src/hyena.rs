@@ -117,6 +117,21 @@ impl ImplicitFilter {
         }
         Ok(())
     }
+
+    /// Validated compact parameters for a backend that generates the filter
+    /// directly into its own workspace.
+    pub(crate) fn parameter_slices(
+        &self,
+        channels: usize,
+    ) -> Result<(&[f32], &[f32], &[f32], usize)> {
+        self.validate_channels(channels)?;
+        Ok((
+            &self.freq,
+            &self.phase,
+            &self.decay,
+            self.freq.len() / channels,
+        ))
+    }
 }
 
 /// Per-channel causal long convolution using zero-padded radix-2 FFT.

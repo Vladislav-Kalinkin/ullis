@@ -20,6 +20,10 @@ pub struct MemoryEstimate {
     pub forward_working_set: usize,
     /// Reused real filter and two complex FFT work buffers for one channel.
     pub hyena_workspace: usize,
+    /// Cached shared Metal buffers for one dense Hyena convolution. This
+    /// includes two signal FFT buffers, two filter FFT buffers, and both the
+    /// shared and returned causal output, but not a host staging spectrum.
+    pub metal_hyena_workspace: usize,
     pub materialized_mtp_logits: usize,
 }
 
@@ -29,7 +33,9 @@ impl MemoryEstimate {
             .checked_add(self.ternary_codes)
             .and_then(|total| total.checked_add(self.ternary_scales))
             .and_then(|total| total.checked_add(self.forward_working_set))
-            .and_then(|total| total.checked_add(self.hyena_workspace))
+            .and_then(|total| {
+                total.checked_add(self.hyena_workspace.max(self.metal_hyena_workspace))
+            })
     }
 
     pub fn training_peak(self) -> Option<usize> {
@@ -41,7 +47,9 @@ impl MemoryEstimate {
             .and_then(|weights| weights.checked_add(self.ternary_codes))
             .and_then(|total| total.checked_add(self.ternary_scales))
             .and_then(|total| total.checked_add(self.forward_working_set))
-            .and_then(|total| total.checked_add(self.hyena_workspace))
+            .and_then(|total| {
+                total.checked_add(self.hyena_workspace.max(self.metal_hyena_workspace))
+            })
     }
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -67,7 +75,10 @@ impl Default for TrainConfig {
             d_model: 256,
             n_layers: 6,
             vocab_size: 8192,
-            context_len: MAX_CONTEXT_LEN,
+            // 32k remains supported with an explicitly larger unified-memory
+            // budget; 8k is the safe out-of-the-box setting under 1 GiB once
+            // resident Metal FFT and gate buffers are reserved.
+            context_len: 8_192,
             batch_size: 1,
             filter_order: 8,
             ternary_delta: 0.7,
@@ -154,6 +165,21 @@ impl TrainConfig {
             .ok_or_else(|| anyhow::anyhow!("FFT workspace size overflow"))?;
         let complex_work = mul(2, mul(fft_len, 2 * size_of::<f32>())?)?;
         let hyena_workspace = add(complex_work, mul(self.context_len, size_of::<f32>())?)?;
+        let signal_transforms = mul(self.batch_size, self.d_model)?;
+        let signal_fft = mul(signal_transforms, mul(fft_len, 2 * size_of::<f32>())?)?;
+        let filter_fft = mul(self.d_model, mul(fft_len, 2 * size_of::<f32>())?)?;
+        let metal_fft_workspace = add(
+            add(mul(2, signal_fft)?, mul(2, filter_fft)?)?,
+            // The final shared output and its CPU return value coexist until
+            // the caller takes ownership of the Vec.
+            mul(2, mul(activations, size_of::<f32>())?)?,
+        )?;
+        // A resident block also keeps its input, `[B,T,2D]` projection, and
+        // two `[B,T,2D]` gate buffers alive while the mixer runs. Reserving
+        // these now prevents a later readback-free forward path from making a
+        // previously accepted 32k configuration enter swap.
+        let metal_projection_gate = mul(7, mul(activations, size_of::<f32>())?)?;
+        let metal_hyena_workspace = add(metal_fft_workspace, metal_projection_gate)?;
         let materialized_mtp_logits = mul(mul(rows, self.vocab_size)?, 2 * size_of::<f32>())?;
         Ok(MemoryEstimate {
             parameters,
@@ -161,6 +187,7 @@ impl TrainConfig {
             ternary_scales,
             forward_working_set,
             hyena_workspace,
+            metal_hyena_workspace,
             materialized_mtp_logits,
         })
     }
@@ -232,6 +259,19 @@ mod tests {
         // FFT length is 64. Two complex FP32 buffers use 1024 bytes; the
         // real filter channel uses another 128 bytes.
         assert_eq!(cfg.memory_estimate().unwrap().hyena_workspace, 1_152);
+    }
+
+    #[test]
+    fn estimate_reserves_cached_metal_hyena_buffers_without_host_staging() {
+        let cfg = TrainConfig {
+            d_model: 2,
+            batch_size: 1,
+            context_len: 4,
+            ..Default::default()
+        };
+        // FFT buffers and outputs consume 576 bytes. Resident input,
+        // projection, and two gate buffers add seven [B,T,D] FP32 tensors.
+        assert_eq!(cfg.memory_estimate().unwrap().metal_hyena_workspace, 800);
     }
 
     #[test]

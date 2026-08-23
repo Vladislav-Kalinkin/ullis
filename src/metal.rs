@@ -5,7 +5,10 @@
 //! a small, audited follow-up boundary rather than weakening the safe CPU model
 //! API throughout the crate.
 
-use anyhow::{Result, bail};
+use anyhow::{bail, Result};
+
+#[cfg(target_os = "macos")]
+use crate::hyena::HyenaFftPlan;
 
 /// A validated one-dimensional dispatch.
 ///
@@ -54,6 +57,8 @@ pub const FFT_BITREVERSE_KERNEL_NAME: &str = "ullis_fft_bitreverse";
 pub const FFT_STAGE_KERNEL_NAME: &str = "ullis_fft_stage";
 pub const FFT_COMPLEX_MULTIPLY_KERNEL_NAME: &str = "ullis_fft_complex_multiply";
 pub const FFT_EXTRACT_CAUSAL_KERNEL_NAME: &str = "ullis_fft_extract_causal";
+pub const IMPLICIT_FILTER_KERNEL_NAME: &str = "ullis_generate_implicit_filter";
+pub const TANH_GATE_KERNEL_NAME: &str = "ullis_tanh_gate_in_place";
 pub const HYENA_METAL_SOURCE: &str = include_str!("metal/hyena.metal");
 
 /// Checked dimensions for one packed-ternary projection.
@@ -407,8 +412,25 @@ pub struct MetalRuntime {
     fft_stage_pipeline: objc2::rc::Retained<
         objc2::runtime::ProtocolObject<dyn objc2_metal::MTLComputePipelineState>,
     >,
+    fft_multiply_pipeline: objc2::rc::Retained<
+        objc2::runtime::ProtocolObject<dyn objc2_metal::MTLComputePipelineState>,
+    >,
+    fft_extract_pipeline: objc2::rc::Retained<
+        objc2::runtime::ProtocolObject<dyn objc2_metal::MTLComputePipelineState>,
+    >,
+    implicit_filter_pipeline: objc2::rc::Retained<
+        objc2::runtime::ProtocolObject<dyn objc2_metal::MTLComputePipelineState>,
+    >,
+    tanh_gate_pipeline: objc2::rc::Retained<
+        objc2::runtime::ProtocolObject<dyn objc2_metal::MTLComputePipelineState>,
+    >,
     ternary_buffers: std::cell::RefCell<TernaryBuffers>,
     fft_buffers: std::cell::RefCell<FftBuffers>,
+    filter_fft_buffers: std::cell::RefCell<FftBuffers>,
+    hyena_output_buffer: std::cell::RefCell<OutputBuffer>,
+    implicit_filter_parameters: std::cell::RefCell<ImplicitFilterParameters>,
+    gate_buffers: std::cell::RefCell<GateBuffers>,
+    activations: std::cell::RefCell<ActivationBuffers>,
 }
 
 #[cfg(target_os = "macos")]
@@ -436,6 +458,52 @@ struct FftBuffers {
 }
 
 #[cfg(target_os = "macos")]
+#[derive(Default)]
+struct OutputBuffer {
+    buffer: Option<objc2::rc::Retained<objc2::runtime::ProtocolObject<dyn objc2_metal::MTLBuffer>>>,
+    capacity: usize,
+}
+
+#[cfg(target_os = "macos")]
+#[derive(Default)]
+struct ImplicitFilterParameters {
+    freq: Option<objc2::rc::Retained<objc2::runtime::ProtocolObject<dyn objc2_metal::MTLBuffer>>>,
+    phase: Option<objc2::rc::Retained<objc2::runtime::ProtocolObject<dyn objc2_metal::MTLBuffer>>>,
+    decay: Option<objc2::rc::Retained<objc2::runtime::ProtocolObject<dyn objc2_metal::MTLBuffer>>>,
+    capacity: usize,
+}
+
+#[cfg(target_os = "macos")]
+#[derive(Default)]
+struct GateBuffers {
+    input: Option<objc2::rc::Retained<objc2::runtime::ProtocolObject<dyn objc2_metal::MTLBuffer>>>,
+    output: Option<objc2::rc::Retained<objc2::runtime::ProtocolObject<dyn objc2_metal::MTLBuffer>>>,
+    capacity: usize,
+}
+
+#[cfg(target_os = "macos")]
+#[derive(Default)]
+struct ActivationBuffers {
+    first: Option<objc2::rc::Retained<objc2::runtime::ProtocolObject<dyn objc2_metal::MTLBuffer>>>,
+    second: Option<objc2::rc::Retained<objc2::runtime::ProtocolObject<dyn objc2_metal::MTLBuffer>>>,
+    capacity: usize,
+}
+
+#[cfg(target_os = "macos")]
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+struct Complex32 {
+    real: f32,
+    imaginary: f32,
+}
+
+#[cfg(target_os = "macos")]
+enum HyenaFilterSource<'a> {
+    Dense(&'a [f32]),
+    Implicit(&'a crate::hyena::ImplicitFilter),
+}
+
+#[cfg(target_os = "macos")]
 impl FftBuffers {
     fn ensure(
         &mut self,
@@ -455,6 +523,116 @@ impl FftBuffers {
                 device
                     .newBufferWithLength_options(bytes, shared)
                     .ok_or_else(|| anyhow::anyhow!("Metal FFT scratch allocation failed"))?,
+            );
+            self.capacity = bytes;
+        }
+        Ok(())
+    }
+}
+
+#[cfg(target_os = "macos")]
+impl OutputBuffer {
+    fn ensure(
+        &mut self,
+        device: &objc2::runtime::ProtocolObject<dyn objc2_metal::MTLDevice>,
+        bytes: usize,
+    ) -> Result<()> {
+        use objc2_metal::{MTLDevice, MTLResourceOptions};
+
+        if self.capacity < bytes {
+            self.buffer = Some(
+                device
+                    .newBufferWithLength_options(bytes, MTLResourceOptions::StorageModeShared)
+                    .ok_or_else(|| anyhow::anyhow!("Metal Hyena output allocation failed"))?,
+            );
+            self.capacity = bytes;
+        }
+        Ok(())
+    }
+}
+
+#[cfg(target_os = "macos")]
+impl ImplicitFilterParameters {
+    fn ensure(
+        &mut self,
+        device: &objc2::runtime::ProtocolObject<dyn objc2_metal::MTLDevice>,
+        bytes: usize,
+    ) -> Result<()> {
+        use objc2_metal::{MTLDevice, MTLResourceOptions};
+        if self.capacity < bytes {
+            let options = MTLResourceOptions::StorageModeShared;
+            self.freq = Some(
+                device
+                    .newBufferWithLength_options(bytes, options)
+                    .ok_or_else(|| {
+                        anyhow::anyhow!("Metal implicit-filter frequency allocation failed")
+                    })?,
+            );
+            self.phase = Some(
+                device
+                    .newBufferWithLength_options(bytes, options)
+                    .ok_or_else(|| {
+                        anyhow::anyhow!("Metal implicit-filter phase allocation failed")
+                    })?,
+            );
+            self.decay = Some(
+                device
+                    .newBufferWithLength_options(bytes, options)
+                    .ok_or_else(|| {
+                        anyhow::anyhow!("Metal implicit-filter decay allocation failed")
+                    })?,
+            );
+            self.capacity = bytes;
+        }
+        Ok(())
+    }
+}
+
+#[cfg(target_os = "macos")]
+impl GateBuffers {
+    fn ensure(
+        &mut self,
+        device: &objc2::runtime::ProtocolObject<dyn objc2_metal::MTLDevice>,
+        bytes: usize,
+    ) -> Result<()> {
+        use objc2_metal::{MTLDevice, MTLResourceOptions};
+        if self.capacity < bytes {
+            let options = MTLResourceOptions::StorageModeShared;
+            self.input = Some(
+                device
+                    .newBufferWithLength_options(bytes, options)
+                    .ok_or_else(|| anyhow::anyhow!("Metal gate input allocation failed"))?,
+            );
+            self.output = Some(
+                device
+                    .newBufferWithLength_options(bytes, options)
+                    .ok_or_else(|| anyhow::anyhow!("Metal gate output allocation failed"))?,
+            );
+            self.capacity = bytes;
+        }
+        Ok(())
+    }
+}
+
+#[cfg(target_os = "macos")]
+impl ActivationBuffers {
+    fn ensure(
+        &mut self,
+        device: &objc2::runtime::ProtocolObject<dyn objc2_metal::MTLDevice>,
+        bytes: usize,
+    ) -> Result<()> {
+        use objc2_metal::{MTLDevice, MTLResourceOptions};
+        if self.capacity < bytes {
+            let options = MTLResourceOptions::StorageModeShared;
+            self.first = Some(
+                device
+                    .newBufferWithLength_options(bytes, options)
+                    .ok_or_else(|| anyhow::anyhow!("Metal activation buffer allocation failed"))?,
+            );
+            self.second = Some(
+                device
+                    .newBufferWithLength_options(bytes, options)
+                    .ok_or_else(|| anyhow::anyhow!("Metal activation scratch allocation failed"))?,
             );
             self.capacity = bytes;
         }
@@ -562,6 +740,42 @@ impl MetalRuntime {
             .map_err(|error| {
                 anyhow::anyhow!("Metal FFT stage pipeline creation failed: {error}")
             })?;
+        let multiply_name = NSString::from_str(FFT_COMPLEX_MULTIPLY_KERNEL_NAME);
+        let multiply_function = library
+            .newFunctionWithName(&multiply_name)
+            .ok_or_else(|| anyhow::anyhow!("Metal FFT multiply function is missing"))?;
+        let fft_multiply_pipeline = device
+            .newComputePipelineStateWithFunction_error(&multiply_function)
+            .map_err(|error| {
+                anyhow::anyhow!("Metal FFT multiply pipeline creation failed: {error}")
+            })?;
+        let extract_name = NSString::from_str(FFT_EXTRACT_CAUSAL_KERNEL_NAME);
+        let extract_function = library
+            .newFunctionWithName(&extract_name)
+            .ok_or_else(|| anyhow::anyhow!("Metal FFT extract function is missing"))?;
+        let fft_extract_pipeline = device
+            .newComputePipelineStateWithFunction_error(&extract_function)
+            .map_err(|error| {
+                anyhow::anyhow!("Metal FFT extract pipeline creation failed: {error}")
+            })?;
+        let implicit_name = NSString::from_str(IMPLICIT_FILTER_KERNEL_NAME);
+        let implicit_function = library
+            .newFunctionWithName(&implicit_name)
+            .ok_or_else(|| anyhow::anyhow!("Metal implicit-filter function is missing"))?;
+        let implicit_filter_pipeline = device
+            .newComputePipelineStateWithFunction_error(&implicit_function)
+            .map_err(|error| {
+                anyhow::anyhow!("Metal implicit-filter pipeline creation failed: {error}")
+            })?;
+        let gate_name = NSString::from_str(TANH_GATE_KERNEL_NAME);
+        let gate_function = library
+            .newFunctionWithName(&gate_name)
+            .ok_or_else(|| anyhow::anyhow!("Metal tanh-gate function is missing"))?;
+        let tanh_gate_pipeline = device
+            .newComputePipelineStateWithFunction_error(&gate_function)
+            .map_err(|error| {
+                anyhow::anyhow!("Metal tanh-gate pipeline creation failed: {error}")
+            })?;
         let queue = device
             .newCommandQueue()
             .ok_or_else(|| anyhow::anyhow!("Metal command queue is unavailable"))?;
@@ -572,9 +786,31 @@ impl MetalRuntime {
             fused_rms_norm_ternary_pipeline,
             fft_bitreverse_pipeline,
             fft_stage_pipeline,
+            fft_multiply_pipeline,
+            fft_extract_pipeline,
+            implicit_filter_pipeline,
+            tanh_gate_pipeline,
             ternary_buffers: std::cell::RefCell::new(TernaryBuffers::default()),
             fft_buffers: std::cell::RefCell::new(FftBuffers::default()),
+            filter_fft_buffers: std::cell::RefCell::new(FftBuffers::default()),
+            hyena_output_buffer: std::cell::RefCell::new(OutputBuffer::default()),
+            implicit_filter_parameters: std::cell::RefCell::new(ImplicitFilterParameters::default()),
+            gate_buffers: std::cell::RefCell::new(GateBuffers::default()),
+            activations: std::cell::RefCell::new(ActivationBuffers::default()),
         })
+    }
+
+    /// Reserves the two resident activation slots used to ping-pong residual
+    /// state between Hyena blocks. Allocation is grow-only and checked.
+    pub fn reserve_activations(&self, rows: usize, width: usize) -> Result<()> {
+        if rows == 0 || width == 0 {
+            bail!("Metal activation dimensions must be non-zero");
+        }
+        let bytes = rows
+            .checked_mul(width)
+            .and_then(|n| n.checked_mul(size_of::<f32>()))
+            .ok_or_else(|| anyhow::anyhow!("Metal activation size overflow"))?;
+        self.activations.borrow_mut().ensure(&self.device, bytes)
     }
 
     /// Runs a projection without recompiling MSL or reallocating buffers when
@@ -590,12 +826,7 @@ impl MetalRuntime {
         pipeline: &objc2::runtime::ProtocolObject<dyn objc2_metal::MTLComputePipelineState>,
         fused_rms_norm: bool,
     ) -> Result<Vec<f32>> {
-        use core::ffi::c_void;
-        use core::ptr::NonNull;
-        use objc2_metal::{
-            MTLBuffer, MTLCommandBuffer, MTLCommandEncoder, MTLCommandQueue,
-            MTLComputeCommandEncoder, MTLComputePipelineState, MTLSize,
-        };
+        use objc2_metal::{MTLBuffer, MTLCommandBuffer, MTLCommandEncoder, MTLCommandQueue};
 
         let input_len = shape
             .rows
@@ -626,12 +857,6 @@ impl MetalRuntime {
         let output_bytes = output_len
             .checked_mul(size_of::<f32>())
             .ok_or_else(|| anyhow::anyhow!("Metal output buffer byte size overflow"))?;
-        let rows =
-            u32::try_from(shape.rows).map_err(|_| anyhow::anyhow!("Metal rows exceed u32"))?;
-        let in_features = u32::try_from(shape.in_features)
-            .map_err(|_| anyhow::anyhow!("Metal input width exceeds u32"))?;
-        let out_features = u32::try_from(shape.out_features)
-            .map_err(|_| anyhow::anyhow!("Metal output width exceeds u32"))?;
         let mut buffers = self.ternary_buffers.borrow_mut();
         buffers.ensure(
             &self.device,
@@ -685,34 +910,83 @@ impl MetalRuntime {
         let encoder = command
             .computeCommandEncoder()
             .ok_or_else(|| anyhow::anyhow!("Metal compute encoder allocation failed"))?;
-        encoder.setComputePipelineState(pipeline);
-        // SAFETY: Buffer and scalar slots exactly match the MSL declaration.
+        self.encode_ternary(
+            encoder.as_ref(),
+            pipeline,
+            input_buffer,
+            positive_buffer,
+            negative_buffer,
+            scale_buffer,
+            output_buffer,
+            shape,
+            fused_rms_norm,
+        )?;
+        encoder.endEncoding();
+        command.commit();
+        command.waitUntilCompleted();
+        if let Some(error) = command.error() {
+            bail!("Metal ternary command failed: {error}");
+        }
+        let mut output = vec![0.0; output_len];
+        // SAFETY: Command completion makes the output shared buffer readable;
+        // its initialized elements exactly match the destination allocation.
         unsafe {
-            encoder.setBuffer_offset_atIndex(Some(input_buffer), 0, 0);
-            encoder.setBuffer_offset_atIndex(Some(positive_buffer), 0, 1);
-            encoder.setBuffer_offset_atIndex(Some(negative_buffer), 0, 2);
-            encoder.setBuffer_offset_atIndex(Some(scale_buffer), 0, 3);
-            encoder.setBuffer_offset_atIndex(Some(output_buffer), 0, 4);
-            encoder.setBytes_length_atIndex(
-                NonNull::from(&rows).cast::<c_void>(),
-                size_of::<u32>(),
-                5,
+            output.as_mut_ptr().copy_from_nonoverlapping(
+                output_buffer.contents().cast::<f32>().as_ptr(),
+                output_len,
             );
-            encoder.setBytes_length_atIndex(
-                NonNull::from(&in_features).cast::<c_void>(),
-                size_of::<u32>(),
-                6,
-            );
-            encoder.setBytes_length_atIndex(
-                NonNull::from(&out_features).cast::<c_void>(),
-                size_of::<u32>(),
-                7,
-            );
+        }
+        Ok(output)
+    }
+
+    #[allow(unsafe_code)]
+    fn encode_ternary(
+        &self,
+        encoder: &objc2::runtime::ProtocolObject<dyn objc2_metal::MTLComputeCommandEncoder>,
+        pipeline: &objc2::runtime::ProtocolObject<dyn objc2_metal::MTLComputePipelineState>,
+        input: &objc2::runtime::ProtocolObject<dyn objc2_metal::MTLBuffer>,
+        positive: &objc2::runtime::ProtocolObject<dyn objc2_metal::MTLBuffer>,
+        negative: &objc2::runtime::ProtocolObject<dyn objc2_metal::MTLBuffer>,
+        scales: &objc2::runtime::ProtocolObject<dyn objc2_metal::MTLBuffer>,
+        output: &objc2::runtime::ProtocolObject<dyn objc2_metal::MTLBuffer>,
+        shape: TernaryLinearShape,
+        fused_rms_norm: bool,
+    ) -> Result<()> {
+        use core::ffi::c_void;
+        use core::ptr::NonNull;
+        use objc2_metal::{MTLComputeCommandEncoder, MTLComputePipelineState, MTLSize};
+        let rows =
+            u32::try_from(shape.rows).map_err(|_| anyhow::anyhow!("Metal rows exceed u32"))?;
+        let input_width = u32::try_from(shape.in_features)
+            .map_err(|_| anyhow::anyhow!("Metal input width exceeds u32"))?;
+        let output_width = u32::try_from(shape.out_features)
+            .map_err(|_| anyhow::anyhow!("Metal output width exceeds u32"))?;
+        let output_elements = shape
+            .rows
+            .checked_mul(shape.out_features)
+            .ok_or_else(|| anyhow::anyhow!("Metal ternary output shape overflow"))?;
+        encoder.setComputePipelineState(pipeline);
+        // SAFETY: slots and scalar offsets exactly match both ternary MSL declarations.
+        unsafe {
+            encoder.setBuffer_offset_atIndex(Some(input), 0, 0);
+            encoder.setBuffer_offset_atIndex(Some(positive), 0, 1);
+            encoder.setBuffer_offset_atIndex(Some(negative), 0, 2);
+            encoder.setBuffer_offset_atIndex(Some(scales), 0, 3);
+            encoder.setBuffer_offset_atIndex(Some(output), 0, 4);
+            for (slot, scalar) in [rows, input_width, output_width].iter().enumerate() {
+                encoder.setBytes_length_atIndex(
+                    NonNull::from(scalar).cast::<c_void>(),
+                    size_of::<u32>(),
+                    slot + 5,
+                );
+            }
         }
         let width = if fused_rms_norm {
             pipeline.maxTotalThreadsPerThreadgroup().min(256)
         } else {
-            pipeline.maxTotalThreadsPerThreadgroup().min(output_len)
+            pipeline
+                .maxTotalThreadsPerThreadgroup()
+                .min(output_elements)
         };
         if width == 0 {
             bail!("Metal ternary pipeline reported zero threads per threadgroup");
@@ -733,7 +1007,7 @@ impl MetalRuntime {
         } else {
             encoder.dispatchThreads_threadsPerThreadgroup(
                 MTLSize {
-                    width: output_len,
+                    width: output_elements,
                     height: 1,
                     depth: 1,
                 },
@@ -744,22 +1018,7 @@ impl MetalRuntime {
                 },
             );
         }
-        encoder.endEncoding();
-        command.commit();
-        command.waitUntilCompleted();
-        if let Some(error) = command.error() {
-            bail!("Metal ternary command failed: {error}");
-        }
-        let mut output = vec![0.0; output_len];
-        // SAFETY: Command completion makes the output shared buffer readable;
-        // its initialized elements exactly match the destination allocation.
-        unsafe {
-            output.as_mut_ptr().copy_from_nonoverlapping(
-                output_buffer.contents().cast::<f32>().as_ptr(),
-                output_len,
-            );
-        }
-        Ok(output)
+        Ok(())
     }
 
     /// Runs the unfused packed ternary projection through cached Metal state.
@@ -803,6 +1062,325 @@ impl MetalRuntime {
             &self.fused_rms_norm_ternary_pipeline,
             true,
         )
+    }
+
+    /// GPU reference for the in-place gate layout used by a Hyena input
+    /// projection: `[rows, 2 * channels] -> [rows, 2 * channels]`.
+    #[allow(unsafe_code)]
+    pub fn tanh_gate_forward(
+        &self,
+        input: &[f32],
+        rows: usize,
+        channels: usize,
+    ) -> Result<Vec<f32>> {
+        use objc2_metal::{MTLBuffer, MTLCommandBuffer, MTLCommandEncoder, MTLCommandQueue};
+        let elements = rows
+            .checked_mul(channels)
+            .and_then(|n| n.checked_mul(2))
+            .ok_or_else(|| anyhow::anyhow!("Metal gate shape overflow"))?;
+        if rows == 0 || channels == 0 || input.len() != elements {
+            bail!("Metal gate shape mismatch");
+        }
+        let bytes = elements
+            .checked_mul(size_of::<f32>())
+            .ok_or_else(|| anyhow::anyhow!("Metal gate size overflow"))?;
+        let mut buffers = self.gate_buffers.borrow_mut();
+        buffers.ensure(&self.device, bytes)?;
+        let source = buffers
+            .input
+            .as_ref()
+            .expect("checked Metal gate input buffer");
+        let output = buffers
+            .output
+            .as_ref()
+            .expect("checked Metal gate output buffer");
+        // SAFETY: the shared input buffer has the checked capacity and remains borrowed until completion.
+        unsafe {
+            source
+                .contents()
+                .cast::<f32>()
+                .as_ptr()
+                .copy_from_nonoverlapping(input.as_ptr(), elements);
+        }
+        let command = self
+            .queue
+            .commandBuffer()
+            .ok_or_else(|| anyhow::anyhow!("Metal command buffer allocation failed"))?;
+        let encoder = command
+            .computeCommandEncoder()
+            .ok_or_else(|| anyhow::anyhow!("Metal compute encoder allocation failed"))?;
+        self.encode_tanh_gate(encoder.as_ref(), source, output, rows, channels)?;
+        encoder.endEncoding();
+        command.commit();
+        command.waitUntilCompleted();
+        if let Some(error) = command.error() {
+            bail!("Metal gate command failed: {error}");
+        }
+        let mut result = vec![0.0; elements];
+        // SAFETY: completion makes every output element readable from the shared buffer.
+        unsafe {
+            result
+                .as_mut_ptr()
+                .copy_from_nonoverlapping(output.contents().cast::<f32>().as_ptr(), elements);
+        }
+        Ok(result)
+    }
+
+    #[allow(unsafe_code)]
+    fn encode_tanh_gate(
+        &self,
+        encoder: &objc2::runtime::ProtocolObject<dyn objc2_metal::MTLComputeCommandEncoder>,
+        input: &objc2::runtime::ProtocolObject<dyn objc2_metal::MTLBuffer>,
+        output: &objc2::runtime::ProtocolObject<dyn objc2_metal::MTLBuffer>,
+        rows: usize,
+        channels: usize,
+    ) -> Result<()> {
+        use core::ffi::c_void;
+        use core::ptr::NonNull;
+        use objc2_metal::{MTLComputeCommandEncoder, MTLComputePipelineState, MTLSize};
+        let elements = rows
+            .checked_mul(channels)
+            .and_then(|n| n.checked_mul(2))
+            .ok_or_else(|| anyhow::anyhow!("Metal gate shape overflow"))?;
+        let elements_u32 = u32::try_from(elements)
+            .map_err(|_| anyhow::anyhow!("Metal gate elements exceed u32"))?;
+        let channels_u32 = u32::try_from(channels)
+            .map_err(|_| anyhow::anyhow!("Metal gate channels exceed u32"))?;
+        self.tanh_gate_pipeline.maxTotalThreadsPerThreadgroup();
+        encoder.setComputePipelineState(&self.tanh_gate_pipeline);
+        // SAFETY: slots 0..3 exactly match ullis_tanh_gate_in_place.
+        unsafe {
+            encoder.setBuffer_offset_atIndex(Some(input), 0, 0);
+            encoder.setBuffer_offset_atIndex(Some(output), 0, 1);
+            encoder.setBytes_length_atIndex(
+                NonNull::from(&elements_u32).cast::<c_void>(),
+                size_of::<u32>(),
+                2,
+            );
+            encoder.setBytes_length_atIndex(
+                NonNull::from(&channels_u32).cast::<c_void>(),
+                size_of::<u32>(),
+                3,
+            );
+        }
+        let width = self
+            .tanh_gate_pipeline
+            .maxTotalThreadsPerThreadgroup()
+            .min(elements);
+        if width == 0 {
+            bail!("Metal gate pipeline reported zero threads per threadgroup");
+        }
+        encoder.dispatchThreads_threadsPerThreadgroup(
+            MTLSize {
+                width: elements,
+                height: 1,
+                depth: 1,
+            },
+            MTLSize {
+                width,
+                height: 1,
+                depth: 1,
+            },
+        );
+        Ok(())
+    }
+
+    #[allow(unsafe_code)]
+    fn encode_fft_two_buffer(
+        &self,
+        encoder: &objc2::runtime::ProtocolObject<dyn objc2_metal::MTLComputeCommandEncoder>,
+        pipeline: &objc2::runtime::ProtocolObject<dyn objc2_metal::MTLComputePipelineState>,
+        input: &objc2::runtime::ProtocolObject<dyn objc2_metal::MTLBuffer>,
+        output: &objc2::runtime::ProtocolObject<dyn objc2_metal::MTLBuffer>,
+        total: usize,
+        scalars: &[u32],
+    ) -> Result<()> {
+        use core::ffi::c_void;
+        use core::ptr::NonNull;
+        use objc2_metal::{MTLComputeCommandEncoder, MTLComputePipelineState, MTLSize};
+        encoder.setComputePipelineState(pipeline);
+        // SAFETY: slots 0/1 and scalar slots from 2 match the FFT MSL kernels.
+        unsafe {
+            encoder.setBuffer_offset_atIndex(Some(input), 0, 0);
+            encoder.setBuffer_offset_atIndex(Some(output), 0, 1);
+            for (offset, scalar) in scalars.iter().enumerate() {
+                encoder.setBytes_length_atIndex(
+                    NonNull::from(scalar).cast::<c_void>(),
+                    size_of::<u32>(),
+                    offset + 2,
+                );
+            }
+        }
+        let width = pipeline.maxTotalThreadsPerThreadgroup().min(total);
+        if width == 0 {
+            bail!("Metal FFT pipeline reported zero threads per threadgroup");
+        }
+        encoder.dispatchThreads_threadsPerThreadgroup(
+            MTLSize {
+                width: total,
+                height: 1,
+                depth: 1,
+            },
+            MTLSize {
+                width,
+                height: 1,
+                depth: 1,
+            },
+        );
+        Ok(())
+    }
+
+    #[allow(unsafe_code)]
+    fn encode_implicit_filter(
+        &self,
+        encoder: &objc2::runtime::ProtocolObject<dyn objc2_metal::MTLComputeCommandEncoder>,
+        freq: &objc2::runtime::ProtocolObject<dyn objc2_metal::MTLBuffer>,
+        phase: &objc2::runtime::ProtocolObject<dyn objc2_metal::MTLBuffer>,
+        decay: &objc2::runtime::ProtocolObject<dyn objc2_metal::MTLBuffer>,
+        output: &objc2::runtime::ProtocolObject<dyn objc2_metal::MTLBuffer>,
+        time: u32,
+        order: u32,
+        fft_len: u32,
+        elements: u32,
+    ) -> Result<()> {
+        use core::ffi::c_void;
+        use core::ptr::NonNull;
+        use objc2_metal::{MTLComputeCommandEncoder, MTLComputePipelineState, MTLSize};
+        encoder.setComputePipelineState(&self.implicit_filter_pipeline);
+        // SAFETY: slots 0..7 exactly match ullis_generate_implicit_filter.
+        unsafe {
+            encoder.setBuffer_offset_atIndex(Some(freq), 0, 0);
+            encoder.setBuffer_offset_atIndex(Some(phase), 0, 1);
+            encoder.setBuffer_offset_atIndex(Some(decay), 0, 2);
+            encoder.setBuffer_offset_atIndex(Some(output), 0, 3);
+            for (slot, scalar) in [time, order, fft_len, elements].iter().enumerate() {
+                encoder.setBytes_length_atIndex(
+                    NonNull::from(scalar).cast::<c_void>(),
+                    size_of::<u32>(),
+                    slot + 4,
+                );
+            }
+        }
+        let width = self
+            .implicit_filter_pipeline
+            .maxTotalThreadsPerThreadgroup()
+            .min(elements as usize);
+        if width == 0 {
+            bail!("Metal implicit-filter pipeline reported zero threads per threadgroup");
+        }
+        encoder.dispatchThreads_threadsPerThreadgroup(
+            MTLSize {
+                width: elements as usize,
+                height: 1,
+                depth: 1,
+            },
+            MTLSize {
+                width,
+                height: 1,
+                depth: 1,
+            },
+        );
+        Ok(())
+    }
+
+    #[allow(unsafe_code)]
+    fn encode_fft_multiply(
+        &self,
+        encoder: &objc2::runtime::ProtocolObject<dyn objc2_metal::MTLComputeCommandEncoder>,
+        signal: &objc2::runtime::ProtocolObject<dyn objc2_metal::MTLBuffer>,
+        filter: &objc2::runtime::ProtocolObject<dyn objc2_metal::MTLBuffer>,
+        output: &objc2::runtime::ProtocolObject<dyn objc2_metal::MTLBuffer>,
+        fft_len: u32,
+        channels: u32,
+        transforms: u32,
+        total: usize,
+    ) -> Result<()> {
+        use core::ffi::c_void;
+        use core::ptr::NonNull;
+        use objc2_metal::{MTLComputeCommandEncoder, MTLComputePipelineState, MTLSize};
+        encoder.setComputePipelineState(&self.fft_multiply_pipeline);
+        // SAFETY: slots 0..5 exactly match ullis_fft_complex_multiply.
+        unsafe {
+            encoder.setBuffer_offset_atIndex(Some(signal), 0, 0);
+            encoder.setBuffer_offset_atIndex(Some(filter), 0, 1);
+            encoder.setBuffer_offset_atIndex(Some(output), 0, 2);
+            for (slot, scalar) in [fft_len, channels, transforms].iter().enumerate() {
+                encoder.setBytes_length_atIndex(
+                    NonNull::from(scalar).cast::<c_void>(),
+                    size_of::<u32>(),
+                    slot + 3,
+                );
+            }
+        }
+        let width = self
+            .fft_multiply_pipeline
+            .maxTotalThreadsPerThreadgroup()
+            .min(total);
+        if width == 0 {
+            bail!("Metal FFT multiply pipeline reported zero threads per threadgroup");
+        }
+        encoder.dispatchThreads_threadsPerThreadgroup(
+            MTLSize {
+                width: total,
+                height: 1,
+                depth: 1,
+            },
+            MTLSize {
+                width,
+                height: 1,
+                depth: 1,
+            },
+        );
+        Ok(())
+    }
+
+    #[allow(unsafe_code)]
+    fn encode_causal_extract(
+        &self,
+        encoder: &objc2::runtime::ProtocolObject<dyn objc2_metal::MTLComputeCommandEncoder>,
+        input: &objc2::runtime::ProtocolObject<dyn objc2_metal::MTLBuffer>,
+        output: &objc2::runtime::ProtocolObject<dyn objc2_metal::MTLBuffer>,
+        time: u32,
+        channels: u32,
+        fft_len: u32,
+        elements: u32,
+    ) -> Result<()> {
+        use core::ffi::c_void;
+        use core::ptr::NonNull;
+        use objc2_metal::{MTLComputeCommandEncoder, MTLComputePipelineState, MTLSize};
+        encoder.setComputePipelineState(&self.fft_extract_pipeline);
+        // SAFETY: slots 0..5 exactly match ullis_fft_extract_causal.
+        unsafe {
+            encoder.setBuffer_offset_atIndex(Some(input), 0, 0);
+            encoder.setBuffer_offset_atIndex(Some(output), 0, 1);
+            for (slot, scalar) in [time, channels, fft_len, elements].iter().enumerate() {
+                encoder.setBytes_length_atIndex(
+                    NonNull::from(scalar).cast::<c_void>(),
+                    size_of::<u32>(),
+                    slot + 2,
+                );
+            }
+        }
+        let width = self
+            .fft_extract_pipeline
+            .maxTotalThreadsPerThreadgroup()
+            .min(elements as usize);
+        if width == 0 {
+            bail!("Metal FFT extract pipeline reported zero threads per threadgroup");
+        }
+        encoder.dispatchThreads_threadsPerThreadgroup(
+            MTLSize {
+                width: elements as usize,
+                height: 1,
+                depth: 1,
+            },
+            MTLSize {
+                width,
+                height: 1,
+                depth: 1,
+            },
+        );
+        Ok(())
     }
 
     /// Runs batched complex radix-2 FFTs through cached ping-pong buffers.
@@ -948,6 +1526,563 @@ impl MetalRuntime {
             }
         }
         Ok(output)
+    }
+
+    /// Generates an implicit filter on Metal into the cached FFT filter buffer.
+    /// The returned Vec exists only for numerical verification; the following
+    /// integration step will consume that buffer directly in the FFT chain.
+    #[allow(unsafe_code)]
+    pub fn implicit_filter_forward(
+        &self,
+        filter: &crate::hyena::ImplicitFilter,
+        channels: usize,
+        time: usize,
+    ) -> Result<Vec<f32>> {
+        use core::ffi::c_void;
+        use core::ptr::NonNull;
+        use objc2_metal::{
+            MTLBuffer, MTLCommandBuffer, MTLCommandEncoder, MTLCommandQueue,
+            MTLComputeCommandEncoder, MTLComputePipelineState, MTLSize,
+        };
+
+        let (freq, phase, decay, order) = filter.parameter_slices(channels)?;
+        let plan = HyenaFftPlan::new(time)?;
+        let elements = channels
+            .checked_mul(time)
+            .ok_or_else(|| anyhow::anyhow!("Metal implicit-filter shape overflow"))?;
+        let fft_elements = channels
+            .checked_mul(plan.fft_len)
+            .ok_or_else(|| anyhow::anyhow!("Metal implicit-filter FFT shape overflow"))?;
+        let parameter_bytes = freq
+            .len()
+            .checked_mul(size_of::<f32>())
+            .ok_or_else(|| anyhow::anyhow!("Metal implicit-filter parameter size overflow"))?;
+        let fft_bytes = fft_elements
+            .checked_mul(size_of::<Complex32>())
+            .ok_or_else(|| anyhow::anyhow!("Metal implicit-filter output size overflow"))?;
+        let time_u32 = u32::try_from(time)
+            .map_err(|_| anyhow::anyhow!("Metal implicit-filter time exceeds u32"))?;
+        let order_u32 = u32::try_from(order)
+            .map_err(|_| anyhow::anyhow!("Metal implicit-filter order exceeds u32"))?;
+        let fft_len_u32 = u32::try_from(plan.fft_len)
+            .map_err(|_| anyhow::anyhow!("Metal implicit-filter FFT length exceeds u32"))?;
+        let elements_u32 = u32::try_from(elements)
+            .map_err(|_| anyhow::anyhow!("Metal implicit-filter element count exceeds u32"))?;
+        let mut parameters = self.implicit_filter_parameters.borrow_mut();
+        let mut buffers = self.filter_fft_buffers.borrow_mut();
+        parameters.ensure(&self.device, parameter_bytes)?;
+        buffers.ensure(&self.device, fft_bytes)?;
+        let freq_buffer = parameters
+            .freq
+            .as_ref()
+            .expect("checked Metal implicit frequency buffer");
+        let phase_buffer = parameters
+            .phase
+            .as_ref()
+            .expect("checked Metal implicit phase buffer");
+        let decay_buffer = parameters
+            .decay
+            .as_ref()
+            .expect("checked Metal implicit decay buffer");
+        let output = buffers
+            .first
+            .as_ref()
+            .expect("checked Metal implicit output buffer");
+        // SAFETY: all shared buffers have checked capacities and stay borrowed until completion.
+        unsafe {
+            freq_buffer
+                .contents()
+                .cast::<f32>()
+                .as_ptr()
+                .copy_from_nonoverlapping(freq.as_ptr(), freq.len());
+            phase_buffer
+                .contents()
+                .cast::<f32>()
+                .as_ptr()
+                .copy_from_nonoverlapping(phase.as_ptr(), phase.len());
+            decay_buffer
+                .contents()
+                .cast::<f32>()
+                .as_ptr()
+                .copy_from_nonoverlapping(decay.as_ptr(), decay.len());
+            output
+                .contents()
+                .cast::<Complex32>()
+                .as_ptr()
+                .write_bytes(0, fft_elements);
+        }
+        let command = self
+            .queue
+            .commandBuffer()
+            .ok_or_else(|| anyhow::anyhow!("Metal command buffer allocation failed"))?;
+        let encoder = command
+            .computeCommandEncoder()
+            .ok_or_else(|| anyhow::anyhow!("Metal compute encoder allocation failed"))?;
+        encoder.setComputePipelineState(&self.implicit_filter_pipeline);
+        // SAFETY: slots 0..7 exactly match ullis_generate_implicit_filter.
+        unsafe {
+            encoder.setBuffer_offset_atIndex(Some(freq_buffer), 0, 0);
+            encoder.setBuffer_offset_atIndex(Some(phase_buffer), 0, 1);
+            encoder.setBuffer_offset_atIndex(Some(decay_buffer), 0, 2);
+            encoder.setBuffer_offset_atIndex(Some(output), 0, 3);
+            for (slot, scalar) in [time_u32, order_u32, fft_len_u32, elements_u32]
+                .iter()
+                .enumerate()
+            {
+                encoder.setBytes_length_atIndex(
+                    NonNull::from(scalar).cast::<c_void>(),
+                    size_of::<u32>(),
+                    slot + 4,
+                );
+            }
+        }
+        let width = self
+            .implicit_filter_pipeline
+            .maxTotalThreadsPerThreadgroup()
+            .min(elements);
+        if width == 0 {
+            bail!("Metal implicit-filter pipeline reported zero threads per threadgroup");
+        }
+        encoder.dispatchThreads_threadsPerThreadgroup(
+            MTLSize {
+                width: elements,
+                height: 1,
+                depth: 1,
+            },
+            MTLSize {
+                width,
+                height: 1,
+                depth: 1,
+            },
+        );
+        encoder.endEncoding();
+        command.commit();
+        command.waitUntilCompleted();
+        if let Some(error) = command.error() {
+            bail!("Metal implicit-filter command failed: {error}");
+        }
+        let mut result = vec![0.0; elements];
+        // SAFETY: command completion makes generated complex values readable; only real lanes are returned.
+        unsafe {
+            let generated = output.contents().cast::<Complex32>().as_ptr();
+            for channel in 0..channels {
+                for position in 0..time {
+                    result[channel * time + position] =
+                        (*generated.add(channel * plan.fft_len + position)).real;
+                }
+            }
+        }
+        Ok(result)
+    }
+
+    /// Executes dense causal Hyena convolution in one Metal command buffer.
+    ///
+    /// `input` has `[batch, time, channels]` layout and `filter` has
+    /// `[channels, time]` layout. This is intentionally a dense-filter
+    /// reference boundary: the production implicit/strided mixer remains on
+    /// the CPU until its filter generator can write directly into GPU storage.
+    /// No FFT spectrum crosses the CPU/GPU boundary.
+    #[allow(unsafe_code)]
+    pub fn causal_long_conv_forward(
+        &self,
+        input: &[f32],
+        filter: &[f32],
+        batch: usize,
+        time: usize,
+        channels: usize,
+    ) -> Result<Vec<f32>> {
+        self.causal_long_conv_with_filter(
+            input,
+            HyenaFilterSource::Dense(filter),
+            batch,
+            time,
+            channels,
+            channels,
+            0,
+        )
+    }
+
+    /// Runs the complete implicit-filter Hyena mixer in one command buffer.
+    /// It writes the compact filter directly to the FFT buffer before the
+    /// filter transform, so no `[channels, time]` host filter exists.
+    #[allow(unsafe_code)]
+    pub fn causal_long_conv_implicit_forward(
+        &self,
+        input: &[f32],
+        filter: &crate::hyena::ImplicitFilter,
+        batch: usize,
+        time: usize,
+        channels: usize,
+    ) -> Result<Vec<f32>> {
+        self.causal_long_conv_with_filter(
+            input,
+            HyenaFilterSource::Implicit(filter),
+            batch,
+            time,
+            channels,
+            channels,
+            0,
+        )
+    }
+
+    /// Strided variant for the signal half of a `[B,T,2D]` projection.
+    #[allow(unsafe_code)]
+    pub fn causal_long_conv_implicit_strided_forward(
+        &self,
+        input: &[f32],
+        filter: &crate::hyena::ImplicitFilter,
+        batch: usize,
+        time: usize,
+        channels: usize,
+        input_stride: usize,
+        input_offset: usize,
+    ) -> Result<Vec<f32>> {
+        self.causal_long_conv_with_filter(
+            input,
+            HyenaFilterSource::Implicit(filter),
+            batch,
+            time,
+            channels,
+            input_stride,
+            input_offset,
+        )
+    }
+
+    #[allow(unsafe_code)]
+    fn causal_long_conv_with_filter(
+        &self,
+        input: &[f32],
+        filter_source: HyenaFilterSource<'_>,
+        batch: usize,
+        time: usize,
+        channels: usize,
+        input_stride: usize,
+        input_offset: usize,
+    ) -> Result<Vec<f32>> {
+        use objc2_metal::{
+            MTLBuffer, MTLCommandBuffer, MTLCommandEncoder, MTLCommandQueue,
+            MTLComputePipelineState,
+        };
+
+        let shape = MetalDispatchShape::new(batch, time, channels)?;
+        let plan = HyenaFftPlan::new(time)?;
+        let transforms = batch
+            .checked_mul(channels)
+            .ok_or_else(|| anyhow::anyhow!("Metal Hyena transform shape overflow"))?;
+        let filter_elements = channels
+            .checked_mul(time)
+            .ok_or_else(|| anyhow::anyhow!("Metal Hyena filter shape overflow"))?;
+        let input_rows = batch
+            .checked_mul(time)
+            .ok_or_else(|| anyhow::anyhow!("Metal Hyena input shape overflow"))?;
+        let minimum_input = input_rows
+            .checked_sub(1)
+            .and_then(|row| row.checked_mul(input_stride))
+            .and_then(|start| start.checked_add(input_offset))
+            .and_then(|start| start.checked_add(channels))
+            .ok_or_else(|| anyhow::anyhow!("Metal Hyena input shape overflow"))?;
+        if input_stride < channels || input.len() < minimum_input {
+            bail!("Metal Hyena causal convolution shape mismatch");
+        }
+        let implicit_parameters = match &filter_source {
+            HyenaFilterSource::Dense(filter) => {
+                if filter.len() != filter_elements {
+                    bail!("Metal Hyena causal convolution shape mismatch");
+                }
+                None
+            }
+            HyenaFilterSource::Implicit(filter) => Some(filter.parameter_slices(channels)?),
+        };
+        let signal_elements = transforms
+            .checked_mul(plan.fft_len)
+            .ok_or_else(|| anyhow::anyhow!("Metal Hyena signal FFT shape overflow"))?;
+        let filter_fft_elements = channels
+            .checked_mul(plan.fft_len)
+            .ok_or_else(|| anyhow::anyhow!("Metal Hyena filter FFT shape overflow"))?;
+        let signal_bytes = signal_elements
+            .checked_mul(size_of::<Complex32>())
+            .ok_or_else(|| anyhow::anyhow!("Metal Hyena signal buffer size overflow"))?;
+        let filter_bytes = filter_fft_elements
+            .checked_mul(size_of::<Complex32>())
+            .ok_or_else(|| anyhow::anyhow!("Metal Hyena filter buffer size overflow"))?;
+        let output_bytes = shape
+            .elements()
+            .checked_mul(size_of::<f32>())
+            .ok_or_else(|| anyhow::anyhow!("Metal Hyena output buffer size overflow"))?;
+        let fft_len = u32::try_from(plan.fft_len)
+            .map_err(|_| anyhow::anyhow!("Metal Hyena FFT length exceeds u32"))?;
+        let transforms_u32 = u32::try_from(transforms)
+            .map_err(|_| anyhow::anyhow!("Metal Hyena transform count exceeds u32"))?;
+        let channels_u32 = u32::try_from(channels)
+            .map_err(|_| anyhow::anyhow!("Metal Hyena channel count exceeds u32"))?;
+        let time_u32 =
+            u32::try_from(time).map_err(|_| anyhow::anyhow!("Metal Hyena time exceeds u32"))?;
+        let elements_u32 = u32::try_from(shape.elements())
+            .map_err(|_| anyhow::anyhow!("Metal Hyena element count exceeds u32"))?;
+
+        let mut signal_buffers = self.fft_buffers.borrow_mut();
+        let mut filter_buffers = self.filter_fft_buffers.borrow_mut();
+        let mut output_buffer = self.hyena_output_buffer.borrow_mut();
+        let mut parameter_buffers = self.implicit_filter_parameters.borrow_mut();
+        signal_buffers.ensure(&self.device, signal_bytes)?;
+        filter_buffers.ensure(&self.device, filter_bytes)?;
+        output_buffer.ensure(&self.device, output_bytes)?;
+        if let Some((freq, _, _, _)) = implicit_parameters {
+            parameter_buffers.ensure(
+                &self.device,
+                freq.len().checked_mul(size_of::<f32>()).ok_or_else(|| {
+                    anyhow::anyhow!("Metal implicit-filter parameter size overflow")
+                })?,
+            )?;
+        }
+        let signal_first = signal_buffers
+            .first
+            .as_ref()
+            .expect("checked Metal Hyena signal buffer");
+        let signal_second = signal_buffers
+            .second
+            .as_ref()
+            .expect("checked Metal Hyena signal scratch buffer");
+        let filter_first = filter_buffers
+            .first
+            .as_ref()
+            .expect("checked Metal Hyena filter buffer");
+        let filter_second = filter_buffers
+            .second
+            .as_ref()
+            .expect("checked Metal Hyena filter scratch buffer");
+        let output = output_buffer
+            .buffer
+            .as_ref()
+            .expect("checked Metal Hyena output buffer");
+        // SAFETY: each persistent shared buffer was grown to the exact checked
+        // count. Zeroing its complex elements provides FFT padding without a
+        // host-sized staging Vec; every later indexed write is bounded by the
+        // validated tensor dimensions, and the borrows keep buffers exclusive
+        // until GPU completion.
+        unsafe {
+            let signal_ptr = signal_first.contents().cast::<Complex32>().as_ptr();
+            signal_ptr.write_bytes(0, signal_elements);
+            for sequence in 0..batch {
+                for position in 0..time {
+                    let source_offset = (sequence * time + position) * input_stride + input_offset;
+                    for channel in 0..channels {
+                        let destination = (sequence * channels + channel) * plan.fft_len + position;
+                        (*signal_ptr.add(destination)).real = input[source_offset + channel];
+                    }
+                }
+            }
+            let filter_ptr = filter_first.contents().cast::<Complex32>().as_ptr();
+            filter_ptr.write_bytes(0, filter_fft_elements);
+            if let HyenaFilterSource::Dense(filter) = &filter_source {
+                for channel in 0..channels {
+                    for position in 0..time {
+                        (*filter_ptr.add(channel * plan.fft_len + position)).real =
+                            filter[channel * time + position];
+                    }
+                }
+            }
+            if let Some((freq, phase, decay, _)) = implicit_parameters {
+                parameter_buffers
+                    .freq
+                    .as_ref()
+                    .expect("checked Metal implicit frequency buffer")
+                    .contents()
+                    .cast::<f32>()
+                    .as_ptr()
+                    .copy_from_nonoverlapping(freq.as_ptr(), freq.len());
+                parameter_buffers
+                    .phase
+                    .as_ref()
+                    .expect("checked Metal implicit phase buffer")
+                    .contents()
+                    .cast::<f32>()
+                    .as_ptr()
+                    .copy_from_nonoverlapping(phase.as_ptr(), phase.len());
+                parameter_buffers
+                    .decay
+                    .as_ref()
+                    .expect("checked Metal implicit decay buffer")
+                    .contents()
+                    .cast::<f32>()
+                    .as_ptr()
+                    .copy_from_nonoverlapping(decay.as_ptr(), decay.len());
+            }
+        }
+        let command = self
+            .queue
+            .commandBuffer()
+            .ok_or_else(|| anyhow::anyhow!("Metal command buffer allocation failed"))?;
+        let encoder = command
+            .computeCommandEncoder()
+            .ok_or_else(|| anyhow::anyhow!("Metal compute encoder allocation failed"))?;
+        if let Some((_, _, _, order)) = implicit_parameters {
+            let order_u32 = u32::try_from(order)
+                .map_err(|_| anyhow::anyhow!("Metal implicit-filter order exceeds u32"))?;
+            let filter_elements_u32 = u32::try_from(filter_elements)
+                .map_err(|_| anyhow::anyhow!("Metal implicit-filter element count exceeds u32"))?;
+            let freq = parameter_buffers
+                .freq
+                .as_ref()
+                .expect("checked Metal implicit frequency buffer");
+            let phase = parameter_buffers
+                .phase
+                .as_ref()
+                .expect("checked Metal implicit phase buffer");
+            let decay = parameter_buffers
+                .decay
+                .as_ref()
+                .expect("checked Metal implicit decay buffer");
+            self.encode_implicit_filter(
+                encoder.as_ref(),
+                freq,
+                phase,
+                decay,
+                filter_first,
+                time_u32,
+                order_u32,
+                fft_len,
+                filter_elements_u32,
+            )?;
+        }
+        let dispatch_two = |pipeline: &objc2::runtime::ProtocolObject<
+            dyn MTLComputePipelineState,
+        >,
+                            input: &objc2::runtime::ProtocolObject<dyn MTLBuffer>,
+                            output: &objc2::runtime::ProtocolObject<dyn MTLBuffer>,
+                            total: usize,
+                            scalars: &[u32]|
+         -> Result<()> {
+            self.encode_fft_two_buffer(encoder.as_ref(), pipeline, input, output, total, scalars)
+        };
+        let run_fft = |first: &objc2::runtime::ProtocolObject<dyn MTLBuffer>,
+                       second: &objc2::runtime::ProtocolObject<dyn MTLBuffer>,
+                       transforms: u32,
+                       total: usize,
+                       inverse: bool|
+         -> Result<bool> {
+            dispatch_two(
+                &self.fft_bitreverse_pipeline,
+                first,
+                second,
+                total,
+                &[fft_len, transforms],
+            )?;
+            let mut source_is_first = false;
+            for stage in 1..=plan.stages {
+                let (source, destination) = if source_is_first {
+                    (first, second)
+                } else {
+                    (second, first)
+                };
+                dispatch_two(
+                    &self.fft_stage_pipeline,
+                    source,
+                    destination,
+                    total,
+                    &[fft_len, transforms, stage, u32::from(inverse)],
+                )?;
+                source_is_first = !source_is_first;
+            }
+            Ok(source_is_first)
+        };
+        let signal_source_is_first = run_fft(
+            signal_first.as_ref(),
+            signal_second.as_ref(),
+            transforms_u32,
+            signal_elements,
+            false,
+        )?;
+        let filter_source_is_first = run_fft(
+            filter_first.as_ref(),
+            filter_second.as_ref(),
+            channels_u32,
+            filter_fft_elements,
+            false,
+        )?;
+        let signal_spectrum = if signal_source_is_first {
+            signal_first.as_ref()
+        } else {
+            signal_second.as_ref()
+        };
+        let filter_spectrum = if filter_source_is_first {
+            filter_first.as_ref()
+        } else {
+            filter_second.as_ref()
+        };
+        let multiply_output_is_first = !signal_source_is_first;
+        let product = if multiply_output_is_first {
+            signal_first.as_ref()
+        } else {
+            signal_second.as_ref()
+        };
+        self.encode_fft_multiply(
+            encoder.as_ref(),
+            signal_spectrum,
+            filter_spectrum,
+            product,
+            fft_len,
+            channels_u32,
+            transforms_u32,
+            signal_elements,
+        )?;
+        let inverse_bitreversed_is_first = !multiply_output_is_first;
+        let inverse_bitreversed = if inverse_bitreversed_is_first {
+            signal_first.as_ref()
+        } else {
+            signal_second.as_ref()
+        };
+        dispatch_two(
+            &self.fft_bitreverse_pipeline,
+            product,
+            inverse_bitreversed,
+            signal_elements,
+            &[fft_len, transforms_u32],
+        )?;
+        let mut inverse_source_is_first = inverse_bitreversed_is_first;
+        for stage in 1..=plan.stages {
+            let (source, destination) = if inverse_source_is_first {
+                (signal_first.as_ref(), signal_second.as_ref())
+            } else {
+                (signal_second.as_ref(), signal_first.as_ref())
+            };
+            dispatch_two(
+                &self.fft_stage_pipeline,
+                source,
+                destination,
+                signal_elements,
+                &[fft_len, transforms_u32, stage, 1],
+            )?;
+            inverse_source_is_first = !inverse_source_is_first;
+        }
+        let inverse = if inverse_source_is_first {
+            signal_first.as_ref()
+        } else {
+            signal_second.as_ref()
+        };
+        self.encode_causal_extract(
+            encoder.as_ref(),
+            inverse,
+            output,
+            time_u32,
+            channels_u32,
+            fft_len,
+            elements_u32,
+        )?;
+        encoder.endEncoding();
+        command.commit();
+        command.waitUntilCompleted();
+        if let Some(error) = command.error() {
+            bail!("Metal Hyena causal convolution failed: {error}");
+        }
+        let mut result = vec![0.0; shape.elements()];
+        // SAFETY: completion makes every written output element readable from the shared buffer.
+        unsafe {
+            result
+                .as_mut_ptr()
+                .copy_from_nonoverlapping(output.contents().cast::<f32>().as_ptr(), result.len());
+        }
+        Ok(result)
     }
 }
 
@@ -1212,6 +2347,8 @@ mod tests {
             FFT_STAGE_KERNEL_NAME,
             FFT_COMPLEX_MULTIPLY_KERNEL_NAME,
             FFT_EXTRACT_CAUSAL_KERNEL_NAME,
+            IMPLICIT_FILTER_KERNEL_NAME,
+            TANH_GATE_KERNEL_NAME,
         ] {
             if let Ok(width) = validate_metal_kernel(kernel, shape) {
                 assert!(width > 0);
@@ -1359,6 +2496,67 @@ mod tests {
             for (actual, expected) in actual.iter().zip(expected) {
                 assert!((actual.0 - expected.0).abs() < 1e-5);
                 assert!((actual.1 - expected.1).abs() < 1e-5);
+            }
+        }
+    }
+
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn causal_hyena_chain_matches_cpu_reference_when_metal_is_available() {
+        let input = [0.5, -1.0, 1.5, 2.0, -0.5, 3.0, 4.0, -2.0];
+        let filter = [0.5, 0.25, -0.5, 0.0, 1.0, -1.0, 0.5, 0.0];
+        let expected = crate::hyena::causal_long_conv(&input, &filter, 1, 4, 2).unwrap();
+        if let Ok(runtime) = MetalRuntime::new() {
+            let actual = runtime
+                .causal_long_conv_forward(&input, &filter, 1, 4, 2)
+                .unwrap();
+            for (actual, expected) in actual.iter().zip(expected) {
+                assert!((actual - expected).abs() < 1e-4, "{actual} != {expected}");
+            }
+        }
+    }
+
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn implicit_filter_matches_cpu_reference_when_metal_is_available() {
+        let filter = crate::hyena::ImplicitFilter::new(2, 3, 7);
+        let expected = filter.generate(2, 4).unwrap();
+        if let Ok(runtime) = MetalRuntime::new() {
+            let actual = runtime.implicit_filter_forward(&filter, 2, 4).unwrap();
+            for (actual, expected) in actual.iter().zip(expected) {
+                assert!((actual - expected).abs() < 1e-5, "{actual} != {expected}");
+            }
+        }
+    }
+
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn implicit_hyena_chain_matches_cpu_reference_when_metal_is_available() {
+        let filter = crate::hyena::ImplicitFilter::new(2, 3, 7);
+        let input = [0.5, -1.0, 1.5, 2.0, -0.5, 3.0, 4.0, -2.0];
+        let expected = crate::hyena::causal_long_conv_implicit(&input, &filter, 1, 4, 2).unwrap();
+        if let Ok(runtime) = MetalRuntime::new() {
+            let actual = runtime
+                .causal_long_conv_implicit_forward(&input, &filter, 1, 4, 2)
+                .unwrap();
+            for (actual, expected) in actual.iter().zip(expected) {
+                assert!((actual - expected).abs() < 1e-4, "{actual} != {expected}");
+            }
+        }
+    }
+
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn tanh_gate_keeps_signal_and_transforms_gate_when_metal_is_available() {
+        let input = [1.0, -2.0, 0.0, 1.0, 3.0, -0.5, -1.0, 2.0];
+        if let Ok(runtime) = MetalRuntime::new() {
+            let actual = runtime.tanh_gate_forward(&input, 2, 2).unwrap();
+            for row in 0..2 {
+                assert_eq!(&actual[row * 4..row * 4 + 2], &input[row * 4..row * 4 + 2]);
+                for column in 0..2 {
+                    let index = row * 4 + 2 + column;
+                    assert!((actual[index] - input[index].tanh()).abs() < 1e-6);
+                }
             }
         }
     }
