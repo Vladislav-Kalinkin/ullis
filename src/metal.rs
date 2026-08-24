@@ -52,6 +52,8 @@ impl MetalDispatchShape {
 pub const IDENTITY_KERNEL_NAME: &str = "ullis_identity";
 pub const CLIPPED_SGD_FP16_KERNEL_NAME: &str = "ullis_clipped_sgd_fp16";
 pub const STREAMED_CROSS_ENTROPY_FP16_KERNEL_NAME: &str = "ullis_streamed_cross_entropy_fp16";
+pub const TIED_LOGITS_FP16_KERNEL_NAME: &str = "ullis_tied_logits_fp16";
+pub const CROSS_ENTROPY_LOGITS_FP16_KERNEL_NAME: &str = "ullis_cross_entropy_logits_fp16";
 pub const TERNARY_ROW_SCALES_FP16_KERNEL_NAME: &str = "ullis_ternary_row_scales_fp16";
 pub const REFRESH_TERNARY_CODES_FP16_KERNEL_NAME: &str = "ullis_refresh_ternary_codes_fp16";
 pub const RMS_NORM_KERNEL_NAME: &str = "ullis_rms_norm";
@@ -512,6 +514,12 @@ pub struct MetalRuntime {
     streamed_cross_entropy_fp16_pipeline: objc2::rc::Retained<
         objc2::runtime::ProtocolObject<dyn objc2_metal::MTLComputePipelineState>,
     >,
+    tied_logits_fp16_pipeline: objc2::rc::Retained<
+        objc2::runtime::ProtocolObject<dyn objc2_metal::MTLComputePipelineState>,
+    >,
+    cross_entropy_logits_fp16_pipeline: objc2::rc::Retained<
+        objc2::runtime::ProtocolObject<dyn objc2_metal::MTLComputePipelineState>,
+    >,
     ternary_row_scales_fp16_pipeline: objc2::rc::Retained<
         objc2::runtime::ProtocolObject<dyn objc2_metal::MTLComputePipelineState>,
     >,
@@ -829,10 +837,12 @@ struct StreamedCrossEntropyBuffers {
     gradient:
         Option<objc2::rc::Retained<objc2::runtime::ProtocolObject<dyn objc2_metal::MTLBuffer>>>,
     loss: Option<objc2::rc::Retained<objc2::runtime::ProtocolObject<dyn objc2_metal::MTLBuffer>>>,
+    logits: Option<objc2::rc::Retained<objc2::runtime::ProtocolObject<dyn objc2_metal::MTLBuffer>>>,
     head_capacity: usize,
     tokens_capacity: usize,
     gradient_capacity: usize,
     loss_capacity: usize,
+    logits_capacity: usize,
 }
 
 /// Five independent, grow-only FP32 buffers shared by the local backward
@@ -1082,6 +1092,7 @@ impl StreamedCrossEntropyBuffers {
         token_bytes: usize,
         gradient_bytes: usize,
         loss_bytes: usize,
+        logits_bytes: usize,
     ) -> Result<()> {
         use objc2_metal::{MTLDevice, MTLResourceOptions};
         let shared = MTLResourceOptions::StorageModeShared;
@@ -1111,7 +1122,13 @@ impl StreamedCrossEntropyBuffers {
             gradient_bytes,
             "gradient",
         )?;
-        grow(&mut self.loss, &mut self.loss_capacity, loss_bytes, "loss")
+        grow(&mut self.loss, &mut self.loss_capacity, loss_bytes, "loss")?;
+        grow(
+            &mut self.logits,
+            &mut self.logits_capacity,
+            logits_bytes,
+            "logits",
+        )
     }
 }
 
@@ -1327,6 +1344,22 @@ impl MetalRuntime {
             .map_err(|error| {
                 anyhow::anyhow!("Metal streamed cross-entropy pipeline failed: {error}")
             })?;
+        let tied_logits_name = NSString::from_str(TIED_LOGITS_FP16_KERNEL_NAME);
+        let tied_logits_function = library
+            .newFunctionWithName(&tied_logits_name)
+            .ok_or_else(|| anyhow::anyhow!("Metal tied-logits function is missing"))?;
+        let tied_logits_fp16_pipeline = device
+            .newComputePipelineStateWithFunction_error(&tied_logits_function)
+            .map_err(|error| anyhow::anyhow!("Metal tied-logits pipeline failed: {error}"))?;
+        let cross_entropy_logits_name = NSString::from_str(CROSS_ENTROPY_LOGITS_FP16_KERNEL_NAME);
+        let cross_entropy_logits_function = library
+            .newFunctionWithName(&cross_entropy_logits_name)
+            .ok_or_else(|| anyhow::anyhow!("Metal logits cross-entropy function is missing"))?;
+        let cross_entropy_logits_fp16_pipeline = device
+            .newComputePipelineStateWithFunction_error(&cross_entropy_logits_function)
+            .map_err(|error| {
+                anyhow::anyhow!("Metal logits cross-entropy pipeline failed: {error}")
+            })?;
         let rms_name = NSString::from_str(RMS_NORM_KERNEL_NAME);
         let rms_function = library
             .newFunctionWithName(&rms_name)
@@ -1529,6 +1562,8 @@ impl MetalRuntime {
             identity_pipeline,
             clipped_sgd_fp16_pipeline,
             streamed_cross_entropy_fp16_pipeline,
+            tied_logits_fp16_pipeline,
+            cross_entropy_logits_fp16_pipeline,
             ternary_row_scales_fp16_pipeline,
             refresh_ternary_codes_fp16_pipeline,
             rms_norm_pipeline,
@@ -4956,6 +4991,7 @@ impl MetalRuntime {
             token_bytes,
             head_bytes,
             loss_bytes,
+            0,
         )?;
         let head_buffer = buffers
             .head
@@ -5113,6 +5149,10 @@ impl MetalRuntime {
         let loss_bytes = rows
             .checked_mul(size_of::<f32>())
             .ok_or_else(|| anyhow::anyhow!("Metal resident cross-entropy loss size overflow"))?;
+        let logits_bytes = rows
+            .checked_mul(vocab)
+            .and_then(|count| count.checked_mul(size_of::<f32>()))
+            .ok_or_else(|| anyhow::anyhow!("Metal resident cross-entropy logits size overflow"))?;
         self.reserve_activations(rows, channels)?;
         self.reserve_gradients(rows, channels)?;
         let mut ce_buffers = self.streamed_cross_entropy.borrow_mut();
@@ -5122,9 +5162,14 @@ impl MetalRuntime {
             token_bytes,
             activation_bytes,
             loss_bytes,
+            logits_bytes,
         )?;
         let tokens_buffer = ce_buffers.tokens.as_ref().expect("checked CE token buffer");
         let loss_buffer = ce_buffers.loss.as_ref().expect("checked CE loss buffer");
+        let logits_buffer = ce_buffers
+            .logits
+            .as_ref()
+            .expect("checked CE logits buffer");
         unsafe {
             tokens_buffer
                 .contents()
@@ -5159,9 +5204,38 @@ impl MetalRuntime {
         let encoder = command.computeCommandEncoder().ok_or_else(|| {
             anyhow::anyhow!("Metal resident streamed cross-entropy encoder allocation failed")
         })?;
-        encoder.setComputePipelineState(&self.streamed_cross_entropy_fp16_pipeline);
+        encoder.setComputePipelineState(&self.tied_logits_fp16_pipeline);
         unsafe {
             encoder.setBuffer_offset_atIndex(Some(head), 0, 0);
+            encoder.setBuffer_offset_atIndex(Some(embedding.parameters.as_ref()), 0, 1);
+            encoder.setBuffer_offset_atIndex(Some(logits_buffer), 0, 2);
+            for (slot, scalar) in [scalars[0], scalars[2], scalars[3]].iter().enumerate() {
+                encoder.setBytes_length_atIndex(
+                    NonNull::from(scalar).cast::<c_void>(),
+                    size_of::<u32>(),
+                    slot + 3,
+                );
+            }
+        }
+        encoder.dispatchThreadgroups_threadsPerThreadgroup(
+            MTLSize {
+                width: vocab.div_ceil(16),
+                height: rows.div_ceil(16),
+                depth: 1,
+            },
+            MTLSize {
+                width: 16,
+                height: 16,
+                depth: 1,
+            },
+        );
+        encoder.endEncoding();
+        let encoder = command.computeCommandEncoder().ok_or_else(|| {
+            anyhow::anyhow!("Metal resident logits cross-entropy encoder allocation failed")
+        })?;
+        encoder.setComputePipelineState(&self.cross_entropy_logits_fp16_pipeline);
+        unsafe {
+            encoder.setBuffer_offset_atIndex(Some(logits_buffer), 0, 0);
             encoder.setBuffer_offset_atIndex(Some(embedding.parameters.as_ref()), 0, 1);
             encoder.setBuffer_offset_atIndex(Some(tokens_buffer), 0, 2);
             encoder.setBuffer_offset_atIndex(Some(gradient), 0, 3);

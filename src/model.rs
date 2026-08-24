@@ -9,6 +9,8 @@ use crate::optimizer::Lion;
 use crate::precision::Fp16Storage;
 use anyhow::{Result, bail};
 use serde::{Deserialize, Serialize};
+#[cfg(target_os = "macos")]
+use std::time::Instant;
 
 /// Cross-entropy statistics for the two MTP horizons. Values are means over
 /// valid positions; no `[batch, time, vocab]` logits tensor is retained.
@@ -1648,6 +1650,7 @@ impl UllisHyena {
         let rows = batch
             .checked_mul(time)
             .ok_or_else(|| anyhow::anyhow!("Metal resident MTP rows overflow"))?;
+        let forward_started = Instant::now();
         let (hidden_slot, caches) = self.forward_metal_resident_training_cached(
             runtime,
             state,
@@ -1656,6 +1659,8 @@ impl UllisHyena {
             time,
             !train_filters,
         )?;
+        let forward_millis = forward_started.elapsed().as_secs_f64() * 1_000.0;
+        let heads_started = Instant::now();
         let first_head = runtime.resident_ternary_head_forward_trainable(
             hidden_slot,
             rows,
@@ -1708,6 +1713,8 @@ impl UllisHyena {
             learning_rate,
             true,
         )?;
+        let heads_millis = heads_started.elapsed().as_secs_f64() * 1_000.0;
+        let backward_started = Instant::now();
         self.hidden_metal_backward_update_from_resident_gradient(
             runtime,
             state,
@@ -1718,6 +1725,10 @@ impl UllisHyena {
             learning_rate,
             train_filters,
         )?;
+        let backward_millis = backward_started.elapsed().as_secs_f64() * 1_000.0;
+        eprintln!(
+            "metal phases | hyena-forward {forward_millis:.1} ms | mtp+ce {heads_millis:.1} ms | hyena-backward {backward_millis:.1} ms"
+        );
         Ok(MtpLoss {
             next_token: first_loss.loss_sum / first_loss.token_count as f32,
             second_token: second_loss.loss_sum / second_loss.token_count as f32,

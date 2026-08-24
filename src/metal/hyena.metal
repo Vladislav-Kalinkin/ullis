@@ -129,6 +129,102 @@ kernel void ullis_streamed_cross_entropy_fp16(
     }
 }
 
+// Materialize tied logits once. The resident CE kernel below then performs
+// reductions without repeating the D-wide dot product.
+kernel void ullis_tied_logits_fp16(
+    device const float *head [[buffer(0)]],
+    device const half *embedding [[buffer(1)]],
+    device float *logits [[buffer(2)]],
+    constant uint &rows [[buffer(3)]],
+    constant uint &channels [[buffer(4)]],
+    constant uint &vocab [[buffer(5)]],
+    uint2 threadgroup_id [[threadgroup_position_in_grid]],
+    uint2 local_id [[thread_position_in_threadgroup]]) {
+    constexpr uint tile = 16u;
+    const uint row = threadgroup_id.y * tile + local_id.y;
+    const uint token = threadgroup_id.x * tile + local_id.x;
+    threadgroup float head_tile[tile][tile];
+    threadgroup float embedding_tile[tile][tile];
+    float logit = 0.0f;
+    for (uint base = 0; base < channels; base += tile) {
+        const uint head_channel = base + local_id.x;
+        const uint embedding_channel = base + local_id.y;
+        head_tile[local_id.y][local_id.x] = (row < rows && head_channel < channels)
+            ? head[row * channels + head_channel] : 0.0f;
+        embedding_tile[local_id.x][local_id.y] = (token < vocab && embedding_channel < channels)
+            ? float(embedding[token * channels + embedding_channel]) : 0.0f;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (row < rows && token < vocab) {
+            for (uint channel = 0; channel < tile && base + channel < channels; ++channel) {
+                logit += head_tile[local_id.y][channel] * embedding_tile[local_id.x][channel];
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    if (row < rows && token < vocab) logits[row * vocab + token] = logit;
+}
+
+kernel void ullis_cross_entropy_logits_fp16(
+    device const float *logits [[buffer(0)]],
+    device const half *embedding [[buffer(1)]],
+    device const uint *tokens [[buffer(2)]],
+    device float *head_gradient [[buffer(3)]],
+    device float *row_loss [[buffer(4)]],
+    constant uint &rows [[buffer(5)]],
+    constant uint &time [[buffer(6)]],
+    constant uint &channels [[buffer(7)]],
+    constant uint &vocab [[buffer(8)]],
+    constant uint &horizon [[buffer(9)]],
+    constant float &gradient_scale [[buffer(10)]],
+    uint lane [[thread_index_in_threadgroup]],
+    uint row [[threadgroup_position_in_grid]]) {
+    threadgroup float reduction[ULLIS_CE_LANES];
+    threadgroup float partial_expectation[ULLIS_CE_LANES * ULLIS_CE_MAX_CHANNELS];
+    if (row >= rows || channels > ULLIS_CE_MAX_CHANNELS) return;
+    const uint position = row % time;
+    if (position + horizon >= time) {
+        if (lane == 0) row_loss[row] = 0.0f;
+        for (uint channel = lane; channel < channels; channel += ULLIS_CE_LANES) head_gradient[row * channels + channel] = 0.0f;
+        return;
+    }
+    const uint target = tokens[row + horizon];
+    const device float *row_logits = logits + row * vocab;
+    float maximum = -INFINITY;
+    float target_logit = -INFINITY;
+    for (uint token = lane; token < vocab; token += ULLIS_CE_LANES) {
+        const float logit = row_logits[token];
+        maximum = max(maximum, logit);
+        if (token == target) target_logit = logit;
+    }
+    reduction[lane] = maximum;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint stride = ULLIS_CE_LANES / 2u; stride > 0u; stride /= 2u) { if (lane < stride) reduction[lane] = max(reduction[lane], reduction[lane + stride]); threadgroup_barrier(mem_flags::mem_threadgroup); }
+    maximum = reduction[0];
+    reduction[lane] = target_logit;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint stride = ULLIS_CE_LANES / 2u; stride > 0u; stride /= 2u) { if (lane < stride) reduction[lane] = max(reduction[lane], reduction[lane + stride]); threadgroup_barrier(mem_flags::mem_threadgroup); }
+    target_logit = reduction[0];
+    threadgroup float *local_expectation = partial_expectation + lane * ULLIS_CE_MAX_CHANNELS;
+    for (uint channel = 0; channel < channels; ++channel) local_expectation[channel] = 0.0f;
+    float exp_sum = 0.0f;
+    for (uint token = lane; token < vocab; token += ULLIS_CE_LANES) {
+        const float weight = exp(row_logits[token] - maximum);
+        exp_sum += weight;
+        const device half *row_embedding = embedding + token * channels;
+        for (uint channel = 0; channel < channels; ++channel) local_expectation[channel] += weight * float(row_embedding[channel]);
+    }
+    reduction[lane] = exp_sum;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint stride = ULLIS_CE_LANES / 2u; stride > 0u; stride /= 2u) { if (lane < stride) reduction[lane] += reduction[lane + stride]; threadgroup_barrier(mem_flags::mem_threadgroup); }
+    exp_sum = reduction[0];
+    if (lane == 0) row_loss[row] = maximum + log(exp_sum) - target_logit;
+    for (uint channel = lane; channel < channels; channel += ULLIS_CE_LANES) {
+        float expectation = 0.0f;
+        for (uint worker = 0; worker < ULLIS_CE_LANES; ++worker) expectation += partial_expectation[worker * ULLIS_CE_MAX_CHANNELS + channel];
+        head_gradient[row * channels + channel] = gradient_scale * (expectation / exp_sum - float(embedding[target * channels + channel]));
+    }
+}
+
 // Rebuild the per-output ternary scale after an FP16 master update. A single
 // thread owns a row so there are no reductions through global memory.
 kernel void ullis_ternary_row_scales_fp16(

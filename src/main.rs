@@ -353,8 +353,15 @@ fn train(
             .ok_or_else(|| anyhow::anyhow!("frozen filter spectrum memory estimate overflows"))?
     };
     let frozen_filter_spectrum_mib = frozen_filter_spectrum_bytes as f64 / 1024.0 / 1024.0;
+    let ce_logits_bytes = cfg
+        .context_len
+        .checked_mul(cfg.batch_size)
+        .and_then(|value| value.checked_mul(cfg.vocab_size))
+        .and_then(|value| value.checked_mul(size_of::<f32>()))
+        .ok_or_else(|| anyhow::anyhow!("cross-entropy logits memory estimate overflows"))?;
+    let ce_logits_mib = ce_logits_bytes as f64 / 1024.0 / 1024.0;
     println!(
-        "train | backend {backend:?} | d {} | layers {} | context {} | kernel {} | chunk {} | batch {} | vocab {} | corpus {} tok | planned resident peak {:.1} MiB (base {planned_peak_mib:.1} + frozen-filter FFT {frozen_filter_spectrum_mib:.1}) / {} MiB | ingest {json_seconds:.1}s | bpe {bpe_seconds:.1}s | tokenize {tokenize_seconds:.1}s",
+        "train | backend {backend:?} | d {} | layers {} | context {} | kernel {} | chunk {} | batch {} | vocab {} | corpus {} tok | planned resident peak {:.1} MiB (base {planned_peak_mib:.1} + frozen-filter FFT {frozen_filter_spectrum_mib:.1} + CE logits {ce_logits_mib:.1}) / {} MiB | ingest {json_seconds:.1}s | bpe {bpe_seconds:.1}s | tokenize {tokenize_seconds:.1}s",
         cfg.d_model,
         cfg.n_layers,
         cfg.context_len,
@@ -363,7 +370,7 @@ fn train(
         cfg.batch_size,
         cfg.vocab_size,
         tokens.len(),
-        planned_peak_mib + frozen_filter_spectrum_mib,
+        planned_peak_mib + frozen_filter_spectrum_mib + ce_logits_mib,
         cfg.memory_budget_bytes / (1024 * 1024),
     );
     if cfg.hyena_kernel_len > cfg.hyena_chunk_len {
