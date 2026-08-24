@@ -5,7 +5,7 @@
 //! tensors whose size grows with the longest document in a batch.
 
 use crate::config::TrainConfig;
-use anyhow::{bail, Result};
+use anyhow::{Result, bail};
 
 /// One contiguous `[batch, time]` token view.
 #[derive(Clone, Copy, Debug)]

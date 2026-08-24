@@ -1,9 +1,10 @@
 //! Dense ternary Hyena model and multi-token prediction heads.
 use crate::batch::MtpBatch;
 use crate::config::TrainConfig;
-use crate::hyena::{causal_long_conv_implicit_strided, ImplicitFilter};
+use crate::hyena::{HyenaChunkPlan, ImplicitFilter, causal_chunked_conv_implicit_strided};
 use crate::optimizer::Lion;
-use anyhow::{bail, Result};
+use crate::precision::Fp16Storage;
+use anyhow::{Result, bail};
 
 /// Cross-entropy statistics for the two MTP horizons. Values are means over
 /// valid positions; no `[batch, time, vocab]` logits tensor is retained.
@@ -72,7 +73,9 @@ impl PackedTernary {
 
 #[derive(Clone, Debug)]
 pub struct TernaryLinear {
-    master: Vec<f32>,
+    /// FP16 latent weights determine ternary thresholds. Forward uses only
+    /// packed codes and scales, so no FP32 master copy is resident.
+    master: Fp16Storage,
     codes: PackedTernary,
     row_scales: Vec<f32>,
     in_features: usize,
@@ -87,7 +90,7 @@ impl TernaryLinear {
         seed: u64,
     ) -> Self {
         let scale = (in_features as f32).sqrt().recip();
-        let master = seeded_values(in_features * out_features, scale, seed);
+        let master = Fp16Storage::from_f32(seeded_values(in_features * out_features, scale, seed));
         let mut result = Self {
             master,
             codes: PackedTernary::zeros(in_features * out_features),
@@ -102,17 +105,14 @@ impl TernaryLinear {
     pub fn refresh_codes(&mut self) {
         for row in 0..self.out_features {
             let start = row * self.in_features;
-            let mean = self.master[start..start + self.in_features]
-                .iter()
-                .map(|v| v.abs())
+            let mean = (start..start + self.in_features)
+                .map(|index| self.master.get(index).abs())
                 .sum::<f32>()
                 / self.in_features as f32;
             let threshold = self.threshold_ratio * mean;
             self.row_scales[row] = mean;
-            for (offset, &weight) in self.master[start..start + self.in_features]
-                .iter()
-                .enumerate()
-            {
+            for offset in 0..self.in_features {
+                let weight = self.master.get(start + offset);
                 let code = if weight > threshold {
                     1
                 } else if weight < -threshold {
@@ -135,8 +135,9 @@ impl TernaryLinear {
         {
             bail!("invalid ternary STE gradient or learning rate");
         }
-        for (weight, &gradient) in self.master.iter_mut().zip(gradient) {
-            *weight -= learning_rate * gradient.clamp(-1.0, 1.0);
+        for (index, &gradient) in gradient.iter().enumerate() {
+            let weight = self.master.get(index) - learning_rate * gradient.clamp(-1.0, 1.0);
+            self.master.set(index, weight);
         }
         self.refresh_codes();
         Ok(())
@@ -145,7 +146,13 @@ impl TernaryLinear {
     /// Applies Lion to master weights, then refreshes the packed ternary plane.
     /// The optimiser owns exactly one FP32 momentum value per master weight.
     pub fn apply_lion_gradient(&mut self, optimizer: &mut Lion, gradient: &[f32]) -> Result<()> {
-        optimizer.step(&mut self.master, gradient)?;
+        let mut parameters: Vec<f32> = (0..self.master.len())
+            .map(|index| self.master.get(index))
+            .collect();
+        optimizer.step(&mut parameters, gradient)?;
+        for (index, value) in parameters.into_iter().enumerate() {
+            self.master.set(index, value);
+        }
         self.refresh_codes();
         Ok(())
     }
@@ -181,6 +188,27 @@ impl TernaryLinear {
             &self.row_scales,
             crate::metal::TernaryLinearShape::new(rows, self.in_features, self.out_features)?,
         )
+    }
+
+    /// Low-memory Metal projection. Input, scales, and output are FP16 in
+    /// shared buffers; the shader widens each dot product to FP32 locally.
+    #[cfg(target_os = "macos")]
+    pub fn forward_metal_fp16_reference(
+        &self,
+        runtime: &crate::metal::MetalRuntime,
+        x: &[f32],
+        rows: usize,
+    ) -> Result<Vec<f32>> {
+        let input = Fp16Storage::from_f32(x.iter().copied());
+        let scales = Fp16Storage::from_f32(self.row_scales.iter().copied());
+        let output = runtime.ternary_linear_forward_fp16(
+            &input,
+            &self.codes.positive,
+            &self.codes.negative,
+            &scales,
+            crate::metal::TernaryLinearShape::new(rows, self.in_features, self.out_features)?,
+        )?;
+        Ok((0..output.len()).map(|index| output.get(index)).collect())
     }
 
     /// Dispatches through a caller-owned Metal runtime, retaining pipelines
@@ -269,6 +297,7 @@ struct HyenaBlock {
     input: TernaryLinear,
     output: TernaryLinear,
     filter: ImplicitFilter,
+    chunk_plan: HyenaChunkPlan,
     d_model: usize,
 }
 impl HyenaBlock {
@@ -282,6 +311,8 @@ impl HyenaBlock {
                 seed ^ 0xa5a5,
             ),
             filter: ImplicitFilter::new(cfg.d_model, cfg.filter_order, seed ^ 0x5a5a),
+            chunk_plan: HyenaChunkPlan::new(cfg.hyena_chunk_len, cfg.hyena_kernel_len)
+                .expect("TrainConfig validates the Hyena chunk plan"),
             d_model: cfg.d_model,
         }
     }
@@ -293,7 +324,7 @@ impl HyenaBlock {
                 projected[gate_index] = projected[gate_index].tanh();
             }
         }
-        let mut mixed = causal_long_conv_implicit_strided(
+        let mut mixed = causal_chunked_conv_implicit_strided(
             &projected,
             &self.filter,
             batch,
@@ -301,6 +332,7 @@ impl HyenaBlock {
             self.d_model,
             2 * self.d_model,
             0,
+            self.chunk_plan,
         )?;
         for n in 0..batch * time {
             for c in 0..self.d_model {
@@ -326,7 +358,7 @@ impl HyenaBlock {
             .input
             .forward_rms_norm_with_metal_runtime(runtime, x, rows)?;
         let gated = runtime.tanh_gate_forward(&projected, rows, self.d_model)?;
-        let mut mixed = runtime.causal_long_conv_implicit_strided_forward(
+        let mut mixed = runtime.causal_chunked_conv_implicit_strided_forward(
             &gated,
             &self.filter,
             batch,
@@ -334,6 +366,7 @@ impl HyenaBlock {
             self.d_model,
             2 * self.d_model,
             0,
+            self.chunk_plan,
         )?;
         for row in 0..rows {
             for channel in 0..self.d_model {
@@ -360,12 +393,24 @@ impl HyenaBlock {
         batch: usize,
         time: usize,
     ) -> Result<crate::metal::ResidentActivationSlot> {
+        if self.chunk_plan.for_sequence(time)?.kernel_len != time {
+            bail!(
+                "resident Metal long-convolution reference does not yet implement the configured bounded Hyena receptive field"
+            );
+        }
         let rows = batch
             .checked_mul(time)
             .ok_or_else(|| anyhow::anyhow!("Metal Hyena block row overflow"))?;
         let (positive, negative, scales) = self.input.metal_parts();
         runtime.resident_input_projection(slot, rows, self.d_model, positive, negative, scales)?;
-        runtime.resident_hyena_mixer(slot, batch, time, self.d_model, &self.filter)?;
+        runtime.resident_hyena_mixer(
+            slot,
+            batch,
+            time,
+            self.d_model,
+            &self.filter,
+            self.chunk_plan,
+        )?;
         let (positive, negative, scales) = self.output.metal_parts();
         runtime.resident_output_projection(slot, rows, self.d_model, positive, negative, scales)
     }
@@ -375,7 +420,9 @@ impl HyenaBlock {
 #[derive(Clone, Debug)]
 pub struct UllisHyena {
     pub cfg: TrainConfig,
-    embedding: Vec<f32>,
+    /// Tied input/output table is stored in FP16; dot products still widen to
+    /// FP32 in the numerical reference and future Metal reduction kernels.
+    embedding: Fp16Storage,
     blocks: Vec<HyenaBlock>,
     mtp_one: TernaryLinear,
     mtp_two: TernaryLinear,
@@ -383,11 +430,11 @@ pub struct UllisHyena {
 impl UllisHyena {
     pub fn new(cfg: TrainConfig) -> Result<Self> {
         cfg.validate()?;
-        let embedding = seeded_values(
+        let embedding = Fp16Storage::from_f32(seeded_values(
             cfg.vocab_size * cfg.d_model,
             (cfg.d_model as f32).sqrt().recip(),
             cfg.seed,
-        );
+        ));
         let blocks = (0..cfg.n_layers)
             .map(|i| HyenaBlock::seeded(&cfg, cfg.seed.wrapping_add(i as u64 + 1)))
             .collect();
@@ -431,7 +478,9 @@ impl UllisHyena {
             if id >= self.cfg.vocab_size {
                 bail!("token id {id} out of vocabulary");
             }
-            x[row * d..(row + 1) * d].copy_from_slice(&self.embedding[id * d..(id + 1) * d]);
+            for channel in 0..d {
+                x[row * d + channel] = self.embedding.get(id * d + channel);
+            }
         }
         for block in &self.blocks {
             x = block.forward(&x, batch, time)?;
@@ -471,9 +520,10 @@ impl UllisHyena {
             if id >= self.cfg.vocab_size {
                 bail!("token id {id} out of vocabulary");
             }
-            x[row * self.cfg.d_model..(row + 1) * self.cfg.d_model].copy_from_slice(
-                &self.embedding[id * self.cfg.d_model..(id + 1) * self.cfg.d_model],
-            );
+            for channel in 0..self.cfg.d_model {
+                x[row * self.cfg.d_model + channel] =
+                    self.embedding.get(id * self.cfg.d_model + channel);
+            }
         }
         for block in &self.blocks {
             x = block.forward_metal_reference(runtime, &x, batch, time)?;
@@ -515,8 +565,9 @@ impl UllisHyena {
             if id >= self.cfg.vocab_size {
                 bail!("token id {id} out of vocabulary");
             }
-            embedding_stream[row * d..(row + 1) * d]
-                .copy_from_slice(&self.embedding[id * d..(id + 1) * d]);
+            for channel in 0..d {
+                embedding_stream[row * d + channel] = self.embedding.get(id * d + channel);
+            }
         }
         let mut slot = runtime.upload_resident_activations(&embedding_stream, rows, d)?;
         for block in &self.blocks {
@@ -576,8 +627,8 @@ impl UllisHyena {
                 logits[r * self.cfg.vocab_size + v] = hidden
                     [r * self.cfg.d_model..(r + 1) * self.cfg.d_model]
                     .iter()
-                    .zip(&self.embedding[v * self.cfg.d_model..(v + 1) * self.cfg.d_model])
-                    .map(|(a, b)| a * b)
+                    .enumerate()
+                    .map(|(channel, a)| a * self.embedding.get(v * self.cfg.d_model + channel))
                     .sum();
             }
         }
@@ -591,10 +642,7 @@ impl UllisHyena {
         let mut max_logit = f32::NEG_INFINITY;
         let mut target_logit = 0.0;
         for token in 0..self.cfg.vocab_size {
-            let logit = dot(
-                state,
-                &self.embedding[token * self.cfg.d_model..(token + 1) * self.cfg.d_model],
-            );
+            let logit = self.dot_embedding(state, token);
             max_logit = max_logit.max(logit);
             if token == target {
                 target_logit = logit;
@@ -602,11 +650,7 @@ impl UllisHyena {
         }
         let mut exp_sum = 0.0;
         for token in 0..self.cfg.vocab_size {
-            exp_sum += (dot(
-                state,
-                &self.embedding[token * self.cfg.d_model..(token + 1) * self.cfg.d_model],
-            ) - max_logit)
-                .exp();
+            exp_sum += (self.dot_embedding(state, token) - max_logit).exp();
         }
         max_logit + exp_sum.ln() - target_logit
     }
@@ -631,10 +675,14 @@ impl UllisHyena {
         }
         (sum, count)
     }
-}
 
-fn dot(a: &[f32], b: &[f32]) -> f32 {
-    a.iter().zip(b).map(|(x, y)| x * y).sum()
+    fn dot_embedding(&self, state: &[f32], token: usize) -> f32 {
+        state
+            .iter()
+            .enumerate()
+            .map(|(channel, value)| value * self.embedding.get(token * self.cfg.d_model + channel))
+            .sum()
+    }
 }
 
 #[cfg(test)]
@@ -651,18 +699,22 @@ mod tests {
     #[test]
     fn embedding_initializer_is_deterministic_and_width_scaled() {
         assert_eq!(seeded_values(4, 0.25, 7), seeded_values(4, 0.25, 7));
-        assert!(seeded_values(64, 0.25, 7)
-            .iter()
-            .all(|value| value.abs() <= 0.25));
+        assert!(
+            seeded_values(64, 0.25, 7)
+                .iter()
+                .all(|value| value.abs() <= 0.25)
+        );
     }
 
     #[test]
     fn ste_update_is_clipped_and_rejects_invalid_gradients() {
         let mut layer = TernaryLinear::seeded(2, 1, 0.7, 7);
-        let before = layer.master.clone();
+        let before = (0..layer.master.len())
+            .map(|index| layer.master.get(index))
+            .collect::<Vec<_>>();
         layer.apply_ste_gradient(&[100.0, -100.0], 0.5).unwrap();
-        assert_eq!(layer.master[0], before[0] - 0.5);
-        assert_eq!(layer.master[1], before[1] + 0.5);
+        assert_eq!(layer.master.get(0), before[0] - 0.5);
+        assert_eq!(layer.master.get(1), before[1] + 0.5);
         assert!(layer.apply_ste_gradient(&[f32::NAN, 0.0], 0.1).is_err());
     }
 
@@ -702,6 +754,64 @@ mod tests {
                 assert!((actual - expected).abs() < 1e-5);
             }
         }
+    }
+
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn fp16_ternary_layer_matches_quantized_cpu_contract_when_available() {
+        let layer = TernaryLinear::seeded(5, 3, 0.7, 42);
+        let input = [0.25, -1.0, 2.5, 0.0, 1.0, -0.75, 0.5, 1.5, -2.0, 0.25];
+        let Ok(runtime) = crate::metal::MetalRuntime::new() else {
+            return;
+        };
+        let actual = layer
+            .forward_metal_fp16_reference(&runtime, &input, 2)
+            .unwrap();
+        let quantized_input = Fp16Storage::from_f32(input);
+        let quantized_scales = Fp16Storage::from_f32(layer.row_scales.iter().copied());
+        let weights = runtime
+            .upload_fp16_ternary_weights(
+                &layer.codes.positive,
+                &layer.codes.negative,
+                &quantized_scales,
+                crate::metal::TernaryLinearShape::new(2, 5, 3).unwrap(),
+            )
+            .unwrap();
+        let resident = runtime
+            .ternary_linear_forward_fp16_resident(&quantized_input, &weights)
+            .unwrap();
+        let resident = (0..resident.len())
+            .map(|index| resident.get(index))
+            .collect::<Vec<_>>();
+        runtime.reserve_fp16_activations(2, 5).unwrap();
+        let slot = runtime
+            .upload_resident_fp16_activations(&quantized_input, 2, 5)
+            .unwrap();
+        let slot = runtime
+            .resident_ternary_linear_fp16(slot, &weights)
+            .unwrap();
+        let activation_resident = runtime
+            .download_resident_fp16_activations(slot, 2, 3)
+            .unwrap();
+        let activation_resident = (0..activation_resident.len())
+            .map(|index| activation_resident.get(index))
+            .collect::<Vec<_>>();
+        let mut expected = vec![0.0; 6];
+        for row in 0..2 {
+            for output in 0..3 {
+                let sum = (0..5)
+                    .map(|channel| {
+                        quantized_input.get(row * 5 + channel)
+                            * layer.codes.get(output * 5 + channel)
+                    })
+                    .sum::<f32>();
+                expected[row * 3 + output] =
+                    crate::precision::Fp16::from_f32(sum * quantized_scales.get(output)).to_f32();
+            }
+        }
+        assert_eq!(actual, expected);
+        assert_eq!(resident, expected);
+        assert_eq!(activation_resident, expected);
     }
 
     #[test]

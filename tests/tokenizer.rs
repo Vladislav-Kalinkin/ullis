@@ -1,4 +1,4 @@
-use ullis::tokenizer::{train_bpe, train_bpe_from_reader, StreamDecoder};
+use ullis::tokenizer::{StreamDecoder, train_bpe, train_bpe_from_reader};
 
 fn fixture_texts() -> Vec<String> {
     vec![

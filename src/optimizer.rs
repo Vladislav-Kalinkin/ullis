@@ -3,8 +3,48 @@
 //! Lion keeps one momentum vector per parameter. Unlike AdamW it does not
 //! allocate a second variance vector, which is material on unified memory.
 
-use anyhow::{bail, Result};
+use anyhow::{Result, bail};
 use serde::{Deserialize, Serialize};
+
+/// Optimizer choices supported by Ullis's memory contract.
+///
+/// Only the FP32 Lion reference is executable today. The remaining choices
+/// define the state layout that the Metal trainer must implement, so a config
+/// cannot silently budget one optimizer and instantiate another.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OptimizerKind {
+    /// One FP16 momentum value per ternary latent weight.
+    #[default]
+    LionFp16,
+    /// One signed byte per latent weight plus an FP16 scale per 256 values.
+    LionInt8Blockwise,
+    /// Fused clipped SGD update; no persistent optimizer allocation.
+    StatelessSgd,
+}
+
+impl OptimizerKind {
+    pub(crate) fn state_bytes(
+        self,
+        parameter_count: usize,
+        latent_weight_bytes: usize,
+    ) -> Result<usize> {
+        match self {
+            Self::LionFp16 => parameter_count
+                .checked_mul(latent_weight_bytes)
+                .ok_or_else(|| anyhow::anyhow!("Lion FP16 state size overflow")),
+            Self::LionInt8Blockwise => parameter_count
+                .checked_add(
+                    parameter_count
+                        .div_ceil(256)
+                        .checked_mul(latent_weight_bytes)
+                        .ok_or_else(|| anyhow::anyhow!("Lion int8 scale size overflow"))?,
+                )
+                .ok_or_else(|| anyhow::anyhow!("Lion int8 state size overflow")),
+            Self::StatelessSgd => Ok(0),
+        }
+    }
+}
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize)]
 pub struct LionConfig {
@@ -109,5 +149,20 @@ mod tests {
         lion.step(&mut parameters, &[2.0, -3.0]).unwrap();
         assert_eq!(parameters, [0.9, -0.9]);
         assert!(lion.step(&mut parameters, &[f32::NAN, 0.0]).is_err());
+    }
+
+    #[test]
+    fn planned_optimizer_state_is_explicit_about_its_memory_tradeoff() {
+        assert_eq!(OptimizerKind::LionFp16.state_bytes(256, 2).unwrap(), 512);
+        assert_eq!(
+            OptimizerKind::LionInt8Blockwise
+                .state_bytes(257, 2)
+                .unwrap(),
+            257 + 2 * 2
+        );
+        assert_eq!(
+            OptimizerKind::StatelessSgd.state_bytes(1_000, 2).unwrap(),
+            0
+        );
     }
 }

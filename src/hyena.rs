@@ -4,7 +4,7 @@
 //! reference implementation for the Metal kernel; keeping one definition of
 //! causal convolution prevents the usual CPU/GPU padding drift.
 
-use anyhow::{bail, Result};
+use anyhow::{Result, bail};
 
 /// Validated zero-padded radix-2 FFT geometry for causal convolution.
 ///
@@ -35,6 +35,52 @@ impl HyenaFftPlan {
             fft_len,
             stages: fft_len.ilog2(),
         })
+    }
+}
+
+/// Bounded-workspace overlap-save geometry for a causal Hyena mixer.
+///
+/// The receptive field is intentionally explicit: an exact convolution with a
+/// `T`-tap filter needs `O(T)` spectral workspace, regardless of how input is
+/// chunked.  This plan instead makes the model use a `kernel_len`-tap causal
+/// filter and evaluates it in `chunk_len`-token blocks.  It is exact for that
+/// bounded filter while its reusable FFT workspace is independent of sequence
+/// length.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct HyenaChunkPlan {
+    pub chunk_len: usize,
+    pub kernel_len: usize,
+    pub fft_len: usize,
+    pub stages: u32,
+}
+
+impl HyenaChunkPlan {
+    pub fn new(chunk_len: usize, kernel_len: usize) -> Result<Self> {
+        if chunk_len == 0 || kernel_len == 0 || kernel_len > chunk_len {
+            bail!("Hyena chunk plan requires 0 < kernel_len <= chunk_len");
+        }
+        let convolution_len = chunk_len
+            .checked_add(kernel_len)
+            .and_then(|n| n.checked_sub(1))
+            .ok_or_else(|| anyhow::anyhow!("Hyena chunk FFT length overflow"))?;
+        let fft_len = convolution_len
+            .checked_next_power_of_two()
+            .ok_or_else(|| anyhow::anyhow!("Hyena chunk FFT length overflow"))?;
+        Ok(Self {
+            chunk_len,
+            kernel_len,
+            fft_len,
+            stages: fft_len.ilog2(),
+        })
+    }
+
+    /// Adapts a configured plan to a shorter sequence without changing its
+    /// causal semantics or allocating a needlessly large scratch buffer.
+    pub fn for_sequence(self, time: usize) -> Result<Self> {
+        if time == 0 {
+            bail!("Hyena chunk sequence length must be non-zero");
+        }
+        Self::new(self.chunk_len.min(time), self.kernel_len.min(time))
     }
 }
 
@@ -78,14 +124,25 @@ impl ImplicitFilter {
 
     /// Generates one channel directly into caller-owned workspace.
     pub fn generate_channel(&self, channel: usize, out: &mut [f32]) -> Result<()> {
+        self.generate_channel_prefix(channel, out, out.len())
+    }
+
+    /// Generates a filter prefix while retaining positions relative to the
+    /// full sequence.  This is what makes a bounded receptive field exactly
+    /// equal to truncating the ordinary implicit filter at `out.len()`.
+    pub fn generate_channel_prefix(
+        &self,
+        channel: usize,
+        out: &mut [f32],
+        sequence_len: usize,
+    ) -> Result<()> {
         let channels = self.channels()?;
-        if channel >= channels || out.is_empty() {
+        if channel >= channels || out.is_empty() || sequence_len == 0 {
             bail!("invalid implicit-filter channel or output shape");
         }
         let order = self.freq.len() / channels;
-        let len = out.len() as f32;
         for (time, value) in out.iter_mut().enumerate() {
-            let pos = time as f32 / len;
+            let pos = time as f32 / sequence_len as f32;
             let mut sum = 0.0;
             for k in 0..order {
                 let index = channel * order + k;
@@ -134,45 +191,48 @@ impl ImplicitFilter {
     }
 }
 
-/// Per-channel causal long convolution using zero-padded radix-2 FFT.
-/// `x` and `filter` are `[batch, time, channels]` and `[channels, time]`.
-pub fn causal_long_conv(
+/// Exact overlap-save causal convolution for an explicit bounded filter.
+///
+/// `filter` is `[channels, plan.kernel_len]`, while `x` remains
+/// `[batch, time, channels]`.  The returned values are identical to direct
+/// causal convolution with that finite filter, but scratch space is
+/// `O(plan.fft_len)` rather than `O(time)`.
+pub fn causal_chunked_conv(
     x: &[f32],
     filter: &[f32],
     batch: usize,
     time: usize,
     channels: usize,
+    plan: HyenaChunkPlan,
 ) -> Result<Vec<f32>> {
-    let filter_len = channels
-        .checked_mul(time)
-        .ok_or_else(|| anyhow::anyhow!("causal_long_conv filter shape overflow"))?;
-    if filter.len() != filter_len {
-        bail!("causal_long_conv shape mismatch");
+    let plan = plan.for_sequence(time)?;
+    let filter_values = channels
+        .checked_mul(plan.kernel_len)
+        .ok_or_else(|| anyhow::anyhow!("causal_chunked_conv filter shape overflow"))?;
+    if filter.len() != filter_values {
+        bail!("causal_chunked_conv filter shape mismatch");
     }
-    causal_long_conv_with(x, batch, time, channels, channels, 0, |channel, kernel| {
-        kernel.copy_from_slice(&filter[channel * time..(channel + 1) * time]);
-        Ok(())
-    })
+    causal_chunked_conv_with(
+        x,
+        batch,
+        time,
+        channels,
+        channels,
+        0,
+        plan,
+        |channel, kernel| {
+            kernel.copy_from_slice(
+                &filter[channel * plan.kernel_len..(channel + 1) * plan.kernel_len],
+            );
+            Ok(())
+        },
+    )
 }
 
-/// Causal long convolution that generates one implicit-filter channel at a
-/// time. This avoids materialising a `[channels, time]` FP32 filter tensor.
-pub fn causal_long_conv_implicit(
-    x: &[f32],
-    filter: &ImplicitFilter,
-    batch: usize,
-    time: usize,
-    channels: usize,
-) -> Result<Vec<f32>> {
-    filter.validate_channels(channels)?;
-    causal_long_conv_with(x, batch, time, channels, channels, 0, |channel, kernel| {
-        filter.generate_channel(channel, kernel)
-    })
-}
-
-/// Implicit causal convolution over a channel range inside a wider row layout.
-/// `row_width` and `channel_offset` let callers reuse projection storage.
-pub fn causal_long_conv_implicit_strided(
+/// Bounded-receptive-field implicit convolution over a channel range inside a
+/// wider row layout.  It never materialises `[channels, time]` filters or a
+/// full-context FFT workspace.
+pub fn causal_chunked_conv_implicit_strided(
     x: &[f32],
     filter: &ImplicitFilter,
     batch: usize,
@@ -180,36 +240,40 @@ pub fn causal_long_conv_implicit_strided(
     channels: usize,
     row_width: usize,
     channel_offset: usize,
+    plan: HyenaChunkPlan,
 ) -> Result<Vec<f32>> {
     filter.validate_channels(channels)?;
-    causal_long_conv_with(
+    let plan = plan.for_sequence(time)?;
+    causal_chunked_conv_with(
         x,
         batch,
         time,
         channels,
         row_width,
         channel_offset,
-        |channel, kernel| filter.generate_channel(channel, kernel),
+        plan,
+        |channel, kernel| filter.generate_channel_prefix(channel, kernel, time),
     )
 }
 
-fn causal_long_conv_with(
+fn causal_chunked_conv_with(
     x: &[f32],
     batch: usize,
     time: usize,
     channels: usize,
     input_width: usize,
     input_offset: usize,
+    plan: HyenaChunkPlan,
     mut generate_kernel: impl FnMut(usize, &mut [f32]) -> Result<()>,
 ) -> Result<Vec<f32>> {
     let values = batch
         .checked_mul(time)
         .and_then(|rows| rows.checked_mul(channels))
-        .ok_or_else(|| anyhow::anyhow!("causal_long_conv shape overflow"))?;
+        .ok_or_else(|| anyhow::anyhow!("causal_chunked_conv shape overflow"))?;
     let input_values = batch
         .checked_mul(time)
         .and_then(|rows| rows.checked_mul(input_width))
-        .ok_or_else(|| anyhow::anyhow!("causal_long_conv input shape overflow"))?;
+        .ok_or_else(|| anyhow::anyhow!("causal_chunked_conv input shape overflow"))?;
     if batch == 0
         || time == 0
         || channels == 0
@@ -217,13 +281,12 @@ fn causal_long_conv_with(
         || input_offset > input_width - channels
         || x.len() != input_values
     {
-        bail!("causal_long_conv shape mismatch");
+        bail!("causal_chunked_conv shape mismatch");
     }
-    let fft_len = HyenaFftPlan::new(time)?.fft_len;
     let mut out = vec![0.0; values];
-    let mut kernel_values = vec![0.0; time];
-    let mut signal = vec![(0.0, 0.0); fft_len];
-    let mut kernel = vec![(0.0, 0.0); fft_len];
+    let mut kernel_values = vec![0.0; plan.kernel_len];
+    let mut signal = vec![(0.0, 0.0); plan.fft_len];
+    let mut kernel = vec![(0.0, 0.0); plan.fft_len];
     for channel in 0..channels {
         generate_kernel(channel, &mut kernel_values)?;
         kernel.fill((0.0, 0.0));
@@ -232,18 +295,27 @@ fn causal_long_conv_with(
         }
         fft(&mut kernel, false);
         for sequence in 0..batch {
-            signal.fill((0.0, 0.0));
-            for time_index in 0..time {
-                signal[time_index].0 =
-                    x[(sequence * time + time_index) * input_width + input_offset + channel];
-            }
-            fft(&mut signal, false);
-            for (value, kernel_value) in signal.iter_mut().zip(&kernel) {
-                *value = complex_mul(*value, *kernel_value);
-            }
-            fft(&mut signal, true);
-            for time_index in 0..time {
-                out[(sequence * time + time_index) * channels + channel] = signal[time_index].0;
+            for start in (0..time).step_by(plan.chunk_len) {
+                let count = (time - start).min(plan.chunk_len);
+                signal.fill((0.0, 0.0));
+                let history = plan.kernel_len - 1;
+                for slot in 0..history + count {
+                    let source_time = start as isize + slot as isize - history as isize;
+                    if source_time >= 0 {
+                        signal[slot].0 = x[(sequence * time + source_time as usize) * input_width
+                            + input_offset
+                            + channel];
+                    }
+                }
+                fft(&mut signal, false);
+                for (value, kernel_value) in signal.iter_mut().zip(&kernel) {
+                    *value = complex_mul(*value, *kernel_value);
+                }
+                fft(&mut signal, true);
+                for offset in 0..count {
+                    out[(sequence * time + start + offset) * channels + channel] =
+                        signal[history + offset].0;
+                }
             }
         }
     }
@@ -302,7 +374,7 @@ mod tests {
     fn convolution_is_causal_and_matches_direct_form() {
         let x = [1.0, 2.0, 3.0, 4.0];
         let h = [0.5, 0.25, -0.5, 0.0];
-        let y = causal_long_conv(&x, &h, 1, 4, 1).unwrap();
+        let y = causal_chunked_conv(&x, &h, 1, 4, 1, HyenaChunkPlan::new(4, 4).unwrap()).unwrap();
         let expected = [0.5, 1.25, 1.5, 1.75];
         for (actual, want) in y.iter().zip(expected) {
             assert!((actual - want).abs() < 1e-5, "{actual} != {want}");
@@ -314,8 +386,10 @@ mod tests {
         let filter = ImplicitFilter::new(2, 3, 7);
         let x = [0.5, 1.0, 1.5, 2.0, 2.5, 3.0, 3.5, 4.0];
         let materialized = filter.generate(2, 4).unwrap();
-        let expected = causal_long_conv(&x, &materialized, 1, 4, 2).unwrap();
-        let actual = causal_long_conv_implicit(&x, &filter, 1, 4, 2).unwrap();
+        let plan = HyenaChunkPlan::new(4, 4).unwrap();
+        let expected = causal_chunked_conv(&x, &materialized, 1, 4, 2, plan).unwrap();
+        let actual =
+            causal_chunked_conv_implicit_strided(&x, &filter, 1, 4, 2, 2, 0, plan).unwrap();
         for (actual, expected) in actual.iter().zip(expected) {
             assert!((actual - expected).abs() < 1e-5, "{actual} != {expected}");
         }
@@ -330,16 +404,83 @@ mod tests {
             interleaved.extend_from_slice(row);
             interleaved.extend_from_slice(&[9.0, 9.0]);
         }
-        let expected = causal_long_conv_implicit(&dense, &filter, 1, 4, 2).unwrap();
+        let plan = HyenaChunkPlan::new(4, 4).unwrap();
+        let expected =
+            causal_chunked_conv_implicit_strided(&dense, &filter, 1, 4, 2, 2, 0, plan).unwrap();
         let actual =
-            causal_long_conv_implicit_strided(&interleaved, &filter, 1, 4, 2, 4, 0).unwrap();
+            causal_chunked_conv_implicit_strided(&interleaved, &filter, 1, 4, 2, 4, 0, plan)
+                .unwrap();
         assert_eq!(actual, expected);
     }
 
     #[test]
     fn filter_rejects_channel_counts_that_would_drop_parameters() {
         let filter = ImplicitFilter::new(4, 3, 7);
-        assert!(causal_long_conv_implicit(&[0.0; 4], &filter, 1, 2, 2).is_err());
+        assert!(
+            causal_chunked_conv_implicit_strided(
+                &[0.0; 4],
+                &filter,
+                1,
+                2,
+                2,
+                2,
+                0,
+                HyenaChunkPlan::new(2, 2).unwrap()
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn chunked_overlap_save_matches_direct_bounded_convolution_across_chunks() {
+        let x = [
+            1.0, 10.0, 2.0, 20.0, 3.0, 30.0, 4.0, 40.0, 5.0, 50.0, 6.0, 60.0, 7.0, 70.0,
+        ];
+        let filter = [0.5, -0.25, 0.125, 1.0, 0.0, -0.5];
+        let plan = HyenaChunkPlan::new(4, 3).unwrap();
+        let actual = causal_chunked_conv(&x, &filter, 1, 7, 2, plan).unwrap();
+        let mut expected = vec![0.0; x.len()];
+        for time in 0..7 {
+            for channel in 0..2 {
+                for tap in 0..3 {
+                    if tap <= time {
+                        expected[time * 2 + channel] +=
+                            x[(time - tap) * 2 + channel] * filter[channel * 3 + tap];
+                    }
+                }
+            }
+        }
+        for (actual, expected) in actual.iter().zip(expected) {
+            assert!((actual - expected).abs() < 1e-5, "{actual} != {expected}");
+        }
+    }
+
+    #[test]
+    fn implicit_chunked_path_is_exact_for_the_full_sequence_filter_prefix() {
+        let filter = ImplicitFilter::new(2, 3, 7);
+        let plan = HyenaChunkPlan::new(4, 3).unwrap();
+        let x = [
+            0.5, 1.0, 1.5, 2.0, 2.5, 3.0, 3.5, 4.0, 4.5, 5.0, 5.5, 6.0, 6.5, 7.0,
+        ];
+        let mut prefix = vec![0.0; 2 * 3];
+        for channel in 0..2 {
+            filter
+                .generate_channel_prefix(channel, &mut prefix[channel * 3..(channel + 1) * 3], 7)
+                .unwrap();
+        }
+        let expected = causal_chunked_conv(&x, &prefix, 1, 7, 2, plan).unwrap();
+        let actual =
+            causal_chunked_conv_implicit_strided(&x, &filter, 1, 7, 2, 2, 0, plan).unwrap();
+        for (actual, expected) in actual.iter().zip(expected) {
+            assert!((actual - expected).abs() < 1e-5, "{actual} != {expected}");
+        }
+    }
+
+    #[test]
+    fn chunk_plan_rejects_an_unbounded_or_inverted_window() {
+        assert!(HyenaChunkPlan::new(0, 1).is_err());
+        assert!(HyenaChunkPlan::new(2, 3).is_err());
+        assert_eq!(HyenaChunkPlan::new(4, 3).unwrap().fft_len, 8);
     }
 
     #[test]

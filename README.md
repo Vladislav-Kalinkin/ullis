@@ -5,29 +5,36 @@ Ullis is a dense ternary Hyena language-model core for Apple Silicon.
 The project has one architecture only: token embeddings, stacked causal Hyena
 long-convolution blocks, tied output projection, and two Multi-Token
 Prediction heads (`t+1`, `t+2`). Every learned projection is represented by
-ternary codes `{-1, 0, +1}` derived from FP32 master weights.
+ternary codes `{-1, 0, +1}` derived from FP16 latent weights.
 
 Ternary projections keep their inference codes in two packed bitplanes
-(`positive` and `negative`): two bits per weight. FP32 master weights remain
-only for training and are updated through a clipped STE interface. Each output
-row has a compact FP32 dequantisation scale, preventing ternary sums from
-growing with model width.
+(`positive` and `negative`): two bits per weight. Latent weights, tied
+embeddings, scales, and resident activations have an FP16 storage contract;
+individual arithmetic kernels widen only at their calculation boundary. Each
+output row has a compact scale, preventing ternary sums from growing with
+model width.
 
-Training uses Lion rather than AdamW: Lion retains one FP32 momentum value per
-master weight and no variance state. The admission estimate therefore reserves
-master weights, gradients, and one momentum vector (12 bytes per FP32
-parameter), plus packed ternary codes and activations.
+The optimiser is selected explicitly. `LionFp16` is retained as the reference,
+`LionInt8Blockwise` budgets one byte per latent weight plus one FP16 scale per
+256-weight block, and `StatelessSgd` has no persistent optimiser state. The
+last is the RAM floor, not a claim of equivalent convergence. The low-memory
+ledger keeps one reusable FP16 gradient workspace rather than a full-model
+gradient tensor.
 
 ## Current refactor boundary
 
-The CPU radix-2 FFT implementation is the tested semantic reference for a
-future Metal kernel. It performs causal zero-padded long convolutions in
-`O(T log T)` and deliberately contains no recurrent state, attention matrix,
+The CPU radix-2 FFT implementation is the tested semantic reference for the
+Metal kernel. It deliberately contains no recurrent state, attention matrix,
 router, expert stack, spline grid, or slot/BPTT tape.
 
-Its reference path generates the implicit filter one channel at a time and
-reuses FFT workspace, so it does not allocate a full `[D,T]` filter tensor.
-The memory admission estimate includes that reusable workspace explicitly.
+The model sequence mixer uses bounded-receptive-field overlap-save convolution.
+`hyena_kernel_len` is the causal filter length and `hyena_chunk_len` is the
+FFT block length (default: 1024 and 2048). This is exact for that bounded
+filter, including at chunk boundaries, while reusable CPU FFT scratch is
+`O(next_power_of_two(chunk + kernel - 1))`, independent of `context_len`.
+It does not claim to reproduce an unbounded `T`-tap convolution: that would
+still require `O(T)` filter/spectral state. The implicit filter is generated
+one channel at a time and never materialised as `[D,T]`.
 
 The Metal backend now executes shared-buffer FP32 identity and RMSNorm
 references plus the packed two-bitplane ternary projection on Apple Silicon.
@@ -49,26 +56,24 @@ extraction in one command buffer; only the final `[B,T,D]` result returns to
 the CPU. Its output is compared with the CPU causal-convolution reference on
 Apple GPU.
 
-This is deliberately not yet the model sequence-mixer path. The model uses an
-implicit, strided filter and currently avoids materializing `[D,T]` on the
-CPU. Moving it to Metal requires generating that filter directly into the
-cached GPU buffer; routing it through the dense reference now would add a
-large host allocation and violate the RAM budget. The dense reference itself
-does not create host-side padded FFT staging arrays: it fills its shared Metal
-buffers directly. Configuration admission separately reserves its cached
-signal/filter/output buffers, so a future switch cannot silently push unified
-memory into swap.
+Metal now executes the same bounded overlap-save geometry: it generates only
+the filter prefix on-device, packs each causal history window directly from
+resident projection storage, performs the FFT chain, and extracts valid output
+positions. GPU-vs-CPU tests cover a sequence spanning several chunks. The
+resident FP32 reference mixer uses this same plan, so its FFT buffers scale
+with `chunks × fft_len`, not the full context.
 
-The compact implicit-filter generator is now also a Metal kernel and is
-verified against the CPU equation. Its output is written directly in the
-zero-imaginary `float2` layout consumed by the filter FFT, followed by all FFT
-passes and causal extraction in the same command buffer. The model still uses
-its authoritative CPU path by default. `hidden_metal_reference` verifies the
-complete block equation on GPU — ternary projection, gate, implicit mixer,
-output projection, and residual — against that CPU path. It is intentionally
-not selected for training or fast inference yet: its inter-stage `Vec`
-readbacks are a correctness baseline, while the next optimisation retains the
-same tensors across blocks in GPU buffers.
+The compact implicit-filter generator is also a Metal kernel and is verified
+against the CPU equation. Its output is written directly in the zero-imaginary
+`float2` layout consumed by the filter FFT. The model uses the authoritative
+CPU bounded path by default. `hidden_metal_reference` remains available only
+where the bounded plan collapses to the full sequence, preserving an honest
+CPU/GPU comparison.
+
+FP16 Metal kernels already cover packed ternary projection, tanh gate,
+mixed×gate, and residual add with three reusable resident activation slots.
+They are tested against the quantised CPU contract; the missing component is
+the FP16 overlap-save FFT mixer, not a host-side activation round trip.
 
 `TrainConfig` validates an explicit 1 GiB default process budget before model
 allocation. Materialising `[B,T,V]` MTP logits is intentionally rejected when

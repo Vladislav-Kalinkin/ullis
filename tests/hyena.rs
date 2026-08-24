@@ -25,10 +25,12 @@ fn model_rejects_context_beyond_budget() {
         context_len: 2,
         ..Default::default()
     };
-    assert!(UllisHyena::new(cfg)
-        .unwrap()
-        .hidden(&[4, 5, 6], 1, 3)
-        .is_err());
+    assert!(
+        UllisHyena::new(cfg)
+            .unwrap()
+            .hidden(&[4, 5, 6], 1, 3)
+            .is_err()
+    );
 }
 
 #[test]
