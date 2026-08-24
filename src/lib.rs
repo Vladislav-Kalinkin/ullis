@@ -12,8 +12,21 @@ pub use batch::{MtpBatch, MtpBatcher};
 pub use config::{
     LowMemoryTrainingEstimate, LowMemoryTrainingProfile, MemoryEstimate, TrainConfig,
 };
-pub use hyena::HyenaChunkPlan;
-pub use model::{MtpLoss, UllisHyena};
+pub use hyena::{CausalConvBackward, HyenaChunkPlan, ImplicitFilterBackward};
+#[cfg(target_os = "macos")]
+pub use metal::{
+    MetalHyenaBlockUpdatedBackward, MetalResidentCrossEntropy, MetalStreamedCrossEntropy,
+    ResidentFp16Parameters, ResidentGradientSlot, ResidentImplicitFilterParameters,
+    ResidentTrainableFp16TernaryWeights,
+};
+pub use model::{
+    HyenaGateBackward, ModelCheckpoint, MtpHeadBackward, MtpLoss, MtpProjectionBackward,
+    TernaryLinearBackward, UllisHyena, hyena_gate_backward,
+};
+#[cfg(target_os = "macos")]
+pub use model::{
+    MetalHyenaStackBackward, MetalResidentHyenaProjectionStep, MetalResidentHyenaTrainingState,
+};
 pub use optimizer::{Lion, LionConfig, OptimizerKind};
 pub use precision::{Fp16, Fp16Storage};
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");

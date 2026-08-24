@@ -1,0 +1,58 @@
+ULLIS(1)                         User Commands                        ULLIS(1)
+
+NAME
+       ullis - train compact ternary Hyena language models on Apple Silicon
+
+SYNOPSIS
+       ullis train --data DATASET --run DIRECTORY [OPTIONS]
+       ullis tokenize --data INPUT --output OUTPUT
+       ullis inspect --run DIRECTORY
+       ullis generate --checkpoint CHECKPOINT --prompt TEXT [--max-tokens N]
+       ullis chat --checkpoint CHECKPOINT [--session FILE] [--thinking LEVEL]
+
+DESCRIPTION
+       Metal is the default and intended Ullis training backend. It requires macOS on Apple Silicon. CPU is available only with --backend cpu and is for numerical checks.
+
+       A training directory contains config.json (effective configuration), tokenizer.json (BPE trained from the input corpus), metrics.jsonl (append-only progress), and checkpoint.json (FP16-bit-exact model snapshot). Progress reports raw window loss and an EMA; use the EMA to judge a trend across different windows.
+
+TRAIN
+       ullis train --data dataset.jsonl --run runs/first --steps 1000
+
+       --config FILE             Optional JSON TrainConfig.
+       --resume CHECKPOINT       Restore checkpoint.json and matching tokenizer.
+       --steps N                 New optimization steps. Default: 1.
+       --learning-rate RATE      Positive stateless-SGD rate. Default: 1e-3.
+       --checkpoint-every N      Save every N steps and at completion. Default: 100.
+       --backend metal|cpu       Default: metal. CPU is a reference fallback.
+
+TOKENIZE
+       ullis tokenize --data raw.jsonl --output normalized.jsonl
+
+       Validates and rewrites normalized JSONL before a long run.
+
+INSPECT
+       ullis inspect --run runs/first
+
+GENERATE
+       ullis generate --checkpoint runs/first/checkpoint.json --prompt 'Hello' --max-tokens 64
+
+       Loads tokenizer.json next to the checkpoint and performs greedy t+1 decoding. It is a correctness-oriented decoder, not a sampling server.
+
+CHAT
+       ullis chat --checkpoint runs/first/checkpoint.json --session sessions/first.jsonl --thinking high
+
+       Starts a line-oriented interactive loop. Commands: /think low|medium|high|xhigh|off, /save, /quit. User and assistant records are written as JSONL. Thinking level is prompt policy metadata; it does not yet impose a separate inference-time compute budget.
+
+DATA FORMAT
+       One JSON object per line:
+
+       {"id":"demo-1","messages":[{"role":"system","content":"Be concise."},{"role":"user","content":"What is 2+2?"},{"role":"assistant","thinking":"Use arithmetic.","content":"4"}],"metadata":{"split":"train"}}
+
+       Allowed roles: system, user, assistant, tool. Every assistant message requires a non-empty thinking field. Tool messages require tool_call_id. Optional assistant tool_calls have {id, name, arguments}; this reserves the future agent-trace schema but does not execute tools.
+
+FILES
+       examples/first-train.jsonl  Minimal wiring dataset, not a useful corpus.
+
+EXIT STATUS
+       0      Command completed successfully.
+       non-0  Invalid dataset/configuration, unavailable Metal device, or I/O failure.

@@ -54,6 +54,24 @@ pub struct HyenaChunkPlan {
     pub stages: u32,
 }
 
+/// Exact derivatives of a bounded causal convolution.  The reference uses
+/// direct accumulation deliberately: training can validate FFT backward
+/// kernels against it without retaining an FFT tape.
+#[derive(Clone, Debug, PartialEq)]
+pub struct CausalConvBackward {
+    pub input_gradient: Vec<f32>,
+    pub filter_gradient: Vec<f32>,
+}
+
+/// Gradients for the compact implicit-filter parameters. The vectors retain
+/// the same `[channels, order]` layout as [`ImplicitFilter`].
+#[derive(Clone, Debug, PartialEq)]
+pub struct ImplicitFilterBackward {
+    pub freq_gradient: Vec<f32>,
+    pub phase_gradient: Vec<f32>,
+    pub decay_gradient: Vec<f32>,
+}
+
 impl HyenaChunkPlan {
     pub fn new(chunk_len: usize, kernel_len: usize) -> Result<Self> {
         if chunk_len == 0 || kernel_len == 0 || kernel_len > chunk_len {
@@ -156,6 +174,86 @@ impl ImplicitFilter {
         Ok(())
     }
 
+    /// Backpropagates a gradient from a bounded filter prefix into its compact
+    /// positional parameters. `filter_gradient` is `[channels, kernel_len]`;
+    /// positions are normalized by the original `sequence_len`, matching the
+    /// forward overlap-save path exactly.
+    pub fn backward_prefix(
+        &self,
+        channels: usize,
+        filter_gradient: &[f32],
+        kernel_len: usize,
+        sequence_len: usize,
+    ) -> Result<ImplicitFilterBackward> {
+        self.validate_channels(channels)?;
+        if kernel_len == 0
+            || sequence_len == 0
+            || filter_gradient.len() != channels.saturating_mul(kernel_len)
+            || filter_gradient.iter().any(|value| !value.is_finite())
+        {
+            bail!("implicit-filter backward shape/value mismatch");
+        }
+        let order = self.freq.len() / channels;
+        let mut freq_gradient = vec![0.0; self.freq.len()];
+        let mut phase_gradient = vec![0.0; self.phase.len()];
+        let mut decay_gradient = vec![0.0; self.decay.len()];
+        for channel in 0..channels {
+            for time in 0..kernel_len {
+                let upstream = filter_gradient[channel * kernel_len + time] / order as f32;
+                let time_f = time as f32;
+                let position = time_f / sequence_len as f32;
+                for term in 0..order {
+                    let parameter = channel * order + term;
+                    let envelope = (-self.decay[parameter] * time_f).exp();
+                    let angle = self.freq[parameter] * position + self.phase[parameter];
+                    let cosine = angle.cos();
+                    let sine = angle.sin();
+                    freq_gradient[parameter] -= upstream * envelope * sine * position;
+                    phase_gradient[parameter] -= upstream * envelope * sine;
+                    decay_gradient[parameter] -= upstream * envelope * cosine * time_f;
+                }
+            }
+        }
+        Ok(ImplicitFilterBackward {
+            freq_gradient,
+            phase_gradient,
+            decay_gradient,
+        })
+    }
+
+    /// Applies a clipped stateless-SGD update to the compact filter state.
+    /// This has no optimizer buffers: persistent state remains `O(D*order)`.
+    pub fn apply_stateless_gradient(
+        &mut self,
+        gradient: &ImplicitFilterBackward,
+        learning_rate: f32,
+    ) -> Result<()> {
+        if !learning_rate.is_finite()
+            || learning_rate <= 0.0
+            || gradient.freq_gradient.len() != self.freq.len()
+            || gradient.phase_gradient.len() != self.phase.len()
+            || gradient.decay_gradient.len() != self.decay.len()
+            || gradient
+                .freq_gradient
+                .iter()
+                .chain(&gradient.phase_gradient)
+                .chain(&gradient.decay_gradient)
+                .any(|value| !value.is_finite())
+        {
+            bail!("invalid implicit-filter gradient or learning rate");
+        }
+        for (parameter, gradient) in self.freq.iter_mut().zip(&gradient.freq_gradient) {
+            *parameter -= learning_rate * gradient.clamp(-1.0, 1.0);
+        }
+        for (parameter, gradient) in self.phase.iter_mut().zip(&gradient.phase_gradient) {
+            *parameter -= learning_rate * gradient.clamp(-1.0, 1.0);
+        }
+        for (parameter, gradient) in self.decay.iter_mut().zip(&gradient.decay_gradient) {
+            *parameter -= learning_rate * gradient.clamp(-1.0, 1.0);
+        }
+        Ok(())
+    }
+
     fn channels(&self) -> Result<usize> {
         if self.channels == 0
             || self.freq.is_empty()
@@ -227,6 +325,60 @@ pub fn causal_chunked_conv(
             Ok(())
         },
     )
+}
+
+/// Computes exact gradients of [`causal_chunked_conv`] for its explicit
+/// bounded filter. This reference is `O(B*T*D*K)` in arithmetic and `O(B*T*D
+/// + D*K)` in memory; it intentionally does not allocate a full FFT tape.
+pub fn causal_chunked_conv_backward(
+    input: &[f32],
+    filter: &[f32],
+    output_gradient: &[f32],
+    batch: usize,
+    time: usize,
+    channels: usize,
+    plan: HyenaChunkPlan,
+) -> Result<CausalConvBackward> {
+    let plan = plan.for_sequence(time)?;
+    let values = batch
+        .checked_mul(time)
+        .and_then(|rows| rows.checked_mul(channels))
+        .ok_or_else(|| anyhow::anyhow!("causal convolution backward shape overflow"))?;
+    let filter_values = channels
+        .checked_mul(plan.kernel_len)
+        .ok_or_else(|| anyhow::anyhow!("causal convolution backward filter overflow"))?;
+    if batch == 0
+        || channels == 0
+        || input.len() != values
+        || output_gradient.len() != values
+        || filter.len() != filter_values
+        || input
+            .iter()
+            .chain(filter)
+            .chain(output_gradient)
+            .any(|value| !value.is_finite())
+    {
+        bail!("causal convolution backward shape/value mismatch");
+    }
+    let mut input_gradient = vec![0.0; values];
+    let mut filter_gradient = vec![0.0; filter_values];
+    for sequence in 0..batch {
+        for position in 0..time {
+            for channel in 0..channels {
+                let gradient = output_gradient[(sequence * time + position) * channels + channel];
+                for tap in 0..plan.kernel_len.min(position + 1) {
+                    let input_index = (sequence * time + position - tap) * channels + channel;
+                    let filter_index = channel * plan.kernel_len + tap;
+                    input_gradient[input_index] += gradient * filter[filter_index];
+                    filter_gradient[filter_index] += gradient * input[input_index];
+                }
+            }
+        }
+    }
+    Ok(CausalConvBackward {
+        input_gradient,
+        filter_gradient,
+    })
 }
 
 /// Bounded-receptive-field implicit convolution over a channel range inside a
@@ -481,6 +633,98 @@ mod tests {
         assert!(HyenaChunkPlan::new(0, 1).is_err());
         assert!(HyenaChunkPlan::new(2, 3).is_err());
         assert_eq!(HyenaChunkPlan::new(4, 3).unwrap().fft_len, 8);
+    }
+
+    #[test]
+    fn bounded_convolution_backward_matches_finite_differences() {
+        let plan = HyenaChunkPlan::new(4, 3).unwrap();
+        let input = [0.5, -1.0, 1.5, 2.0, -0.5, 3.0, 4.0, -2.0];
+        let filter = [0.5, -0.25, 0.125, 1.0, 0.0, -0.5];
+        let output_gradient = [0.25, -0.5, 1.0, 0.75, -1.5, 0.5, 0.25, -0.75];
+        let backward =
+            causal_chunked_conv_backward(&input, &filter, &output_gradient, 1, 4, 2, plan).unwrap();
+        let loss = |input: &[f32], filter: &[f32]| {
+            causal_chunked_conv(input, filter, 1, 4, 2, plan)
+                .unwrap()
+                .iter()
+                .zip(output_gradient)
+                .map(|(value, gradient)| value * gradient)
+                .sum::<f32>()
+        };
+        let epsilon = 1e-3;
+        for index in 0..input.len() {
+            let mut plus = input;
+            let mut minus = input;
+            plus[index] += epsilon;
+            minus[index] -= epsilon;
+            assert!(
+                (backward.input_gradient[index]
+                    - (loss(&plus, &filter) - loss(&minus, &filter)) / (2.0 * epsilon))
+                    .abs()
+                    < 1e-3
+            );
+        }
+        for index in 0..filter.len() {
+            let mut plus = filter;
+            let mut minus = filter;
+            plus[index] += epsilon;
+            minus[index] -= epsilon;
+            assert!(
+                (backward.filter_gradient[index]
+                    - (loss(&input, &plus) - loss(&input, &minus)) / (2.0 * epsilon))
+                    .abs()
+                    < 1e-3
+            );
+        }
+    }
+
+    #[test]
+    fn implicit_filter_backward_matches_finite_differences() {
+        let filter = ImplicitFilter::new(1, 2, 13);
+        let upstream = [0.25, -0.5, 1.0];
+        let backward = filter.backward_prefix(1, &upstream, 3, 7).unwrap();
+        let loss = |filter: &ImplicitFilter| {
+            let mut values = [0.0; 3];
+            filter.generate_channel_prefix(0, &mut values, 7).unwrap();
+            values
+                .iter()
+                .zip(upstream)
+                .map(|(value, gradient)| value * gradient)
+                .sum::<f32>()
+        };
+        let epsilon = 1e-3;
+        for parameter in 0..2 {
+            let mut plus = filter.clone();
+            let mut minus = filter.clone();
+            plus.freq[parameter] += epsilon;
+            minus.freq[parameter] -= epsilon;
+            assert!(
+                (backward.freq_gradient[parameter]
+                    - (loss(&plus) - loss(&minus)) / (2.0 * epsilon))
+                    .abs()
+                    < 1e-3
+            );
+            let mut plus = filter.clone();
+            let mut minus = filter.clone();
+            plus.phase[parameter] += epsilon;
+            minus.phase[parameter] -= epsilon;
+            assert!(
+                (backward.phase_gradient[parameter]
+                    - (loss(&plus) - loss(&minus)) / (2.0 * epsilon))
+                    .abs()
+                    < 1e-3
+            );
+            let mut plus = filter.clone();
+            let mut minus = filter.clone();
+            plus.decay[parameter] += epsilon;
+            minus.decay[parameter] -= epsilon;
+            assert!(
+                (backward.decay_gradient[parameter]
+                    - (loss(&plus) - loss(&minus)) / (2.0 * epsilon))
+                    .abs()
+                    < 1e-3
+            );
+        }
     }
 
     #[test]

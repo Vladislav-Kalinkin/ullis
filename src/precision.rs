@@ -10,6 +10,10 @@
 pub struct Fp16(u16);
 
 impl Fp16 {
+    pub const fn from_bits(bits: u16) -> Self {
+        Self(bits)
+    }
+
     pub fn from_f32(value: f32) -> Self {
         let bits = value.to_bits();
         let sign = ((bits >> 16) & 0x8000) as u16;
@@ -73,6 +77,35 @@ pub struct Fp16Storage {
 }
 
 impl Fp16Storage {
+    /// Applies clipped SGD directly to the FP16 persistent value.
+    ///
+    /// A usual round-to-nearest update can silently become a no-op when a
+    /// normalized language-model gradient is smaller than one half ULP.  If a
+    /// meaningful fraction of the next FP16 step is present, this method
+    /// advances one representable value in the gradient direction.  It is a
+    /// deterministic, zero-state alternative to an FP32 residual accumulator.
+    pub fn apply_clipped_sgd(&mut self, index: usize, gradient: f32, learning_rate: f32) {
+        const MIN_ULP_FRACTION: f32 = 1.0 / 32.0;
+        let current = Fp16(self.values[index]);
+        let update = learning_rate * gradient.clamp(-1.0, 1.0);
+        let desired = current.to_f32() - update;
+        let rounded = Fp16::from_f32(desired);
+        if rounded.0 != current.0 || update == 0.0 {
+            self.values[index] = rounded.0;
+            return;
+        }
+        let neighbor = if update.is_sign_positive() {
+            current.next_down()
+        } else {
+            current.next_up()
+        };
+        let ulp = (neighbor.to_f32() - current.to_f32()).abs();
+        self.values[index] = if ulp.is_finite() && update.abs() >= ulp * MIN_ULP_FRACTION {
+            neighbor.0
+        } else {
+            current.0
+        };
+    }
     pub fn from_f32(values: impl IntoIterator<Item = f32>) -> Self {
         Self {
             values: values
@@ -118,6 +151,30 @@ impl Fp16Storage {
     }
 }
 
+impl Fp16 {
+    fn next_up(self) -> Self {
+        if self.0 == 0 || self.0 == 0x8000 {
+            return Self(1);
+        }
+        if self.0 & 0x8000 == 0 {
+            Self(self.0.saturating_add(1))
+        } else {
+            Self(self.0.saturating_sub(1))
+        }
+    }
+
+    fn next_down(self) -> Self {
+        if self.0 == 0 || self.0 == 0x8000 {
+            return Self(0x8001);
+        }
+        if self.0 & 0x8000 == 0 {
+            Self(self.0.saturating_sub(1))
+        } else {
+            Self(self.0.saturating_add(1))
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -138,5 +195,12 @@ mod tests {
         assert_eq!(storage.get(1), -1.5);
         storage.set(0, 0.75);
         assert_eq!(storage.get(0), 0.75);
+    }
+
+    #[test]
+    fn clipped_sgd_preserves_a_meaningful_sub_ulp_update_without_state() {
+        let mut storage = Fp16Storage::from_f32([0.25]);
+        storage.apply_clipped_sgd(0, 0.001, 0.01);
+        assert!(storage.get(0) < 0.25);
     }
 }
