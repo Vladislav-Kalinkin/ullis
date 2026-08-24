@@ -74,8 +74,8 @@ pub struct ImplicitFilterBackward {
 
 impl HyenaChunkPlan {
     pub fn new(chunk_len: usize, kernel_len: usize) -> Result<Self> {
-        if chunk_len == 0 || kernel_len == 0 || kernel_len > chunk_len {
-            bail!("Hyena chunk plan requires 0 < kernel_len <= chunk_len");
+        if chunk_len == 0 || kernel_len == 0 {
+            bail!("Hyena chunk plan requires non-zero chunk_len and kernel_len");
         }
         let convolution_len = chunk_len
             .checked_add(kernel_len)
@@ -631,7 +631,7 @@ mod tests {
     #[test]
     fn chunk_plan_rejects_an_unbounded_or_inverted_window() {
         assert!(HyenaChunkPlan::new(0, 1).is_err());
-        assert!(HyenaChunkPlan::new(2, 3).is_err());
+        assert!(HyenaChunkPlan::new(2, 3).is_ok());
         assert_eq!(HyenaChunkPlan::new(4, 3).unwrap().fft_len, 8);
     }
 

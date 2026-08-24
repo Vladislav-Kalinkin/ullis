@@ -201,13 +201,14 @@ impl TrainConfig {
         if self.context_len == 0 || self.context_len > MAX_CONTEXT_LEN {
             bail!("context_len must be in 1..={MAX_CONTEXT_LEN}");
         }
-        if self.filter_order == 0
-            || self.hyena_kernel_len == 0
-            || self.hyena_chunk_len < self.hyena_kernel_len
-            || !self.ternary_delta.is_finite()
-            || self.ternary_delta <= 0.0
-        {
-            bail!("filter_order and ternary_delta must be positive");
+        if self.filter_order == 0 {
+            bail!("filter_order must be positive");
+        }
+        if self.hyena_kernel_len == 0 || self.hyena_chunk_len == 0 {
+            bail!("hyena_kernel_len and hyena_chunk_len must be positive");
+        }
+        if !self.ternary_delta.is_finite() || self.ternary_delta <= 0.0 {
+            bail!("ternary_delta must be finite and positive");
         }
         self.lion.validate()?;
         self.low_memory.validate()?;

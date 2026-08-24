@@ -1,5 +1,5 @@
-# Runnable Apple-Silicon baseline. The current resident Metal backward path
-# requires the dispatched context to fit in one Hyena chunk.
+# Runnable Apple-Silicon baseline. Larger contexts may use a shorter
+# overlap-save chunk; e.g. context/kernel 8192 with chunk 2048.
 d_model = 256
 n_layers = 6
 vocab_size = 8192
