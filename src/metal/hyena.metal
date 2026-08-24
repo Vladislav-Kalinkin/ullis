@@ -321,6 +321,50 @@ kernel void ullis_ternary_linear_ste_weight_backward(
     latent_weight_gradient[index] = sum;
 }
 
+// Exact STE weight gradient as a tiled X^T * G matrix product. A 16x16
+// threadgroup reuses each loaded activation/gradient value for 16 weights.
+kernel void ullis_ternary_linear_ste_weight_backward_tiled(
+    device const float *input [[buffer(0)]],
+    device const float *output_gradient [[buffer(1)]],
+    device const float *scales [[buffer(2)]],
+    device float *latent_weight_gradient [[buffer(3)]],
+    constant uint &rows [[buffer(4)]],
+    constant uint &in_features [[buffer(5)]],
+    constant uint &out_features [[buffer(6)]],
+    uint2 threadgroup_id [[threadgroup_position_in_grid]],
+    uint2 local_id [[thread_position_in_threadgroup]]) {
+    constexpr uint tile = 16u;
+    constexpr uint row_tile = 32u;
+    const uint feature = threadgroup_id.x * tile + local_id.x;
+    const uint out = threadgroup_id.y * tile + local_id.y;
+    threadgroup float input_tile[row_tile][tile];
+    threadgroup float gradient_tile[row_tile][tile];
+    float sum = 0.0f;
+    for (uint base = 0; base < rows; base += row_tile) {
+        for (uint offset = local_id.y; offset < row_tile; offset += tile) {
+            const uint row = base + offset;
+            input_tile[offset][local_id.x] = (row < rows && feature < in_features)
+                ? input[row * in_features + feature] : 0.0f;
+        }
+        for (uint offset = local_id.x; offset < row_tile; offset += tile) {
+            const uint row = base + offset;
+            gradient_tile[offset][local_id.y] = (row < rows && out < out_features)
+                ? output_gradient[row * out_features + out] : 0.0f;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (feature < in_features && out < out_features) {
+            const float scale = scales[out];
+            for (uint offset = 0; offset < row_tile; ++offset) {
+                sum += gradient_tile[offset][local_id.y] * scale * input_tile[offset][local_id.x];
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    if (feature < in_features && out < out_features) {
+        latent_weight_gradient[out * in_features + feature] = sum;
+    }
+}
+
 // Exact bounded causal-convolution input derivative. One thread owns one
 // input position and traverses only future outputs in its causal receptive
 // field, so accumulation is deterministic and needs no atomics.

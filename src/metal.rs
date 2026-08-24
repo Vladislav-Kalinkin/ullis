@@ -59,8 +59,8 @@ pub const RMS_NORM_BACKWARD_KERNEL_NAME: &str = "ullis_rms_norm_backward";
 pub const TERNARY_LINEAR_KERNEL_NAME: &str = "ullis_ternary_linear";
 pub const TERNARY_LINEAR_FP16_KERNEL_NAME: &str = "ullis_ternary_linear_fp16";
 pub const TERNARY_INPUT_BACKWARD_KERNEL_NAME: &str = "ullis_ternary_linear_input_backward";
-pub const TERNARY_STE_WEIGHT_BACKWARD_KERNEL_NAME: &str =
-    "ullis_ternary_linear_ste_weight_backward";
+pub const TERNARY_STE_WEIGHT_BACKWARD_TILED_KERNEL_NAME: &str =
+    "ullis_ternary_linear_ste_weight_backward_tiled";
 pub const CAUSAL_CONV_INPUT_BACKWARD_KERNEL_NAME: &str = "ullis_causal_conv_input_backward";
 pub const CAUSAL_CONV_FILTER_BACKWARD_KERNEL_NAME: &str = "ullis_causal_conv_filter_backward";
 pub const EXTRACT_PROJECTION_SIGNAL_KERNEL_NAME: &str = "ullis_extract_projection_signal";
@@ -524,7 +524,7 @@ pub struct MetalRuntime {
     ternary_input_backward_pipeline: objc2::rc::Retained<
         objc2::runtime::ProtocolObject<dyn objc2_metal::MTLComputePipelineState>,
     >,
-    ternary_ste_weight_backward_pipeline: objc2::rc::Retained<
+    ternary_ste_weight_backward_tiled_pipeline: objc2::rc::Retained<
         objc2::runtime::ProtocolObject<dyn objc2_metal::MTLComputePipelineState>,
     >,
     causal_conv_input_backward_pipeline: objc2::rc::Retained<
@@ -1359,14 +1359,17 @@ impl MetalRuntime {
             .map_err(|error| {
                 anyhow::anyhow!("Metal ternary input-backward pipeline failed: {error}")
             })?;
-        let weight_backward_name = NSString::from_str(TERNARY_STE_WEIGHT_BACKWARD_KERNEL_NAME);
-        let weight_backward_function = library
-            .newFunctionWithName(&weight_backward_name)
-            .ok_or_else(|| anyhow::anyhow!("Metal ternary weight-backward function is missing"))?;
-        let ternary_ste_weight_backward_pipeline = device
-            .newComputePipelineStateWithFunction_error(&weight_backward_function)
+        let tiled_weight_backward_name =
+            NSString::from_str(TERNARY_STE_WEIGHT_BACKWARD_TILED_KERNEL_NAME);
+        let tiled_weight_backward_function = library
+            .newFunctionWithName(&tiled_weight_backward_name)
+            .ok_or_else(|| {
+                anyhow::anyhow!("Metal tiled ternary weight-backward function is missing")
+            })?;
+        let ternary_ste_weight_backward_tiled_pipeline = device
+            .newComputePipelineStateWithFunction_error(&tiled_weight_backward_function)
             .map_err(|error| {
-                anyhow::anyhow!("Metal ternary weight-backward pipeline failed: {error}")
+                anyhow::anyhow!("Metal tiled ternary weight-backward pipeline failed: {error}")
             })?;
         let causal_input_backward_name = NSString::from_str(CAUSAL_CONV_INPUT_BACKWARD_KERNEL_NAME);
         let causal_input_backward_function = library
@@ -1532,7 +1535,7 @@ impl MetalRuntime {
             ternary_pipeline,
             ternary_fp16_pipeline,
             ternary_input_backward_pipeline,
-            ternary_ste_weight_backward_pipeline,
+            ternary_ste_weight_backward_tiled_pipeline,
             causal_conv_input_backward_pipeline,
             causal_conv_filter_backward_pipeline,
             extract_projection_signal_pipeline,
@@ -1796,6 +1799,7 @@ impl MetalRuntime {
             None,
             true,
             true,
+            None,
         )? {
             CachedBlockBackwardResult::Reference(result) => Ok(result),
             CachedBlockBackwardResult::Updated(_) => {
@@ -1851,6 +1855,50 @@ impl MetalRuntime {
             }),
             compute_filter_gradient,
             readback,
+            None,
+        )? {
+            CachedBlockBackwardResult::Updated(result) => Ok(result),
+            CachedBlockBackwardResult::Reference(_) => unreachable!("resident update requested"),
+        }
+    }
+
+    /// Frozen-filter variant which reuses the resident adjoint spectrum.
+    #[allow(unsafe_code)]
+    pub fn hyena_block_backward_cached_and_update_resident_frozen(
+        &self,
+        cache: &ResidentHyenaBlockCache,
+        upstream_slot: ResidentGradientSlot,
+        destination_slot: ResidentGradientSlot,
+        input_weights: &ResidentTrainableFp16TernaryWeights,
+        output_weights: &ResidentTrainableFp16TernaryWeights,
+        batch: usize,
+        time: usize,
+        plan: HyenaChunkPlan,
+        learning_rate: f32,
+        spectrum: &ResidentFilterSpectrum,
+    ) -> Result<MetalHyenaBlockUpdatedBackward> {
+        match self.hyena_block_backward_cached_impl(
+            cache,
+            upstream_slot,
+            destination_slot,
+            &[],
+            &[],
+            &[],
+            &[],
+            &[],
+            &[],
+            &[],
+            batch,
+            time,
+            plan,
+            Some(ResidentTernaryUpdates {
+                input: input_weights,
+                output: output_weights,
+                learning_rate,
+            }),
+            false,
+            false,
+            Some(spectrum),
         )? {
             CachedBlockBackwardResult::Updated(result) => Ok(result),
             CachedBlockBackwardResult::Reference(_) => unreachable!("resident update requested"),
@@ -1876,6 +1924,7 @@ impl MetalRuntime {
         updates: Option<ResidentTernaryUpdates<'_>>,
         compute_filter_gradient: bool,
         readback: bool,
+        static_spectrum: Option<&ResidentFilterSpectrum>,
     ) -> Result<CachedBlockBackwardResult> {
         use objc2_metal::{
             MTLBuffer, MTLCommandBuffer, MTLCommandEncoder, MTLCommandQueue,
@@ -1900,7 +1949,7 @@ impl MetalRuntime {
         let output_shape = TernaryLinearShape::new(rows, channels, channels)?;
         let host_weights = updates.is_none();
         if cache.rows != rows
-            || filter.len() != filter_elements
+            || (static_spectrum.is_none() && filter.len() != filter_elements)
             || (host_weights
                 && (input_positive.len() != input_shape.packed_words()?
                     || input_negative.len() != input_positive.len()
@@ -1908,9 +1957,17 @@ impl MetalRuntime {
                     || output_positive.len() != output_shape.packed_words()?
                     || output_negative.len() != output_positive.len()
                     || output_scales.len() != channels))
-            || filter.iter().any(|value| !value.is_finite())
+            || (static_spectrum.is_none() && filter.iter().any(|value| !value.is_finite()))
         {
             bail!("Metal cached block backward shape/value mismatch");
+        }
+        if let Some(spectrum) = static_spectrum
+            && (spectrum.channels != channels
+                || spectrum.time != time
+                || spectrum.kernel_len != plan.kernel_len
+                || spectrum.fft_len != HyenaFftPlan::new(time)?.fft_len)
+        {
+            bail!("Metal cached block backward filter spectrum shape mismatch");
         }
         if let Some(updates) = updates
             && (!updates.learning_rate.is_finite()
@@ -1993,12 +2050,14 @@ impl MetalRuntime {
         }
         // SAFETY: validated exact-size shared buffers are written before the
         // command begins, and immutable filter values are uploaded once.
-        unsafe {
-            filter_buffer
-                .contents()
-                .cast::<f32>()
-                .as_ptr()
-                .copy_from_nonoverlapping(filter.as_ptr(), filter_elements);
+        if static_spectrum.is_none() {
+            unsafe {
+                filter_buffer
+                    .contents()
+                    .cast::<f32>()
+                    .as_ptr()
+                    .copy_from_nonoverlapping(filter.as_ptr(), filter_elements);
+            }
         }
         let rows_u32 = u32::try_from(rows).map_err(|_| anyhow::anyhow!("Metal rows exceed u32"))?;
         let channels_u32 =
@@ -2091,17 +2150,15 @@ impl MetalRuntime {
                 }
                 (&**positive, &**negative, &**scales)
             };
-        self.encode_elementwise_buffers(
+        self.encode_tiled_ternary_ste_weight_backward(
             encoder.as_ref(),
-            &self.ternary_ste_weight_backward_pipeline,
-            &[
-                gated_mixed,
-                upstream_buffer,
-                output_scale_buffer,
-                output_weight_gradient,
-            ],
-            &[rows_u32, channels_u32, channels_u32],
-            channels * channels,
+            gated_mixed,
+            upstream_buffer,
+            output_scale_buffer,
+            output_weight_gradient,
+            rows_u32,
+            channels_u32,
+            channels_u32,
         )?;
         self.encode_elementwise_buffers(
             encoder.as_ref(),
@@ -2140,18 +2197,20 @@ impl MetalRuntime {
             &[time_u32, channels_u32, fft_len_u32, signal_fft_elements_u32],
             signal_fft_elements,
         )?;
-        self.encode_elementwise_buffers(
-            encoder.as_ref(),
-            &self.pack_filter_pipeline,
-            &[filter_buffer, filter_first],
-            &[
-                channels_u32,
-                kernel_u32,
-                fft_len_u32,
-                filter_fft_elements_u32,
-            ],
-            filter_fft_elements,
-        )?;
+        if static_spectrum.is_none() {
+            self.encode_elementwise_buffers(
+                encoder.as_ref(),
+                &self.pack_filter_pipeline,
+                &[filter_buffer, filter_first],
+                &[
+                    channels_u32,
+                    kernel_u32,
+                    fft_len_u32,
+                    filter_fft_elements_u32,
+                ],
+                filter_fft_elements,
+            )?;
+        }
         let dispatch_two = |pipeline: &objc2::runtime::ProtocolObject<
             dyn MTLComputePipelineState,
         >,
@@ -2194,19 +2253,25 @@ impl MetalRuntime {
             signal_fft_elements,
             false,
         )?;
-        let filter_source_is_first = run_fft(
-            filter_first,
-            filter_second,
-            channels_u32,
-            filter_fft_elements,
-            false,
-        )?;
+        let filter_source_is_first = if static_spectrum.is_none() {
+            Some(run_fft(
+                filter_first,
+                filter_second,
+                channels_u32,
+                filter_fft_elements,
+                false,
+            )?)
+        } else {
+            None
+        };
         let signal_spectrum = if signal_source_is_first {
             signal_first
         } else {
             signal_second
         };
-        let filter_spectrum = if filter_source_is_first {
+        let filter_spectrum = if let Some(spectrum) = static_spectrum {
+            &*spectrum.buffer
+        } else if filter_source_is_first.expect("dynamic filter FFT is present") {
             filter_first
         } else {
             filter_second
@@ -2330,17 +2395,15 @@ impl MetalRuntime {
         let encoder = command
             .computeCommandEncoder()
             .ok_or_else(|| anyhow::anyhow!("Metal compute encoder allocation failed"))?;
-        self.encode_elementwise_buffers(
+        self.encode_tiled_ternary_ste_weight_backward(
             encoder.as_ref(),
-            &self.ternary_ste_weight_backward_pipeline,
-            &[
-                &cache.normalized_input,
-                projection_gradient,
-                input_scale_buffer,
-                input_weight_gradient,
-            ],
-            &[rows_u32, channels_u32, channels_u32 * 2],
-            channels * channels * 2,
+            &cache.normalized_input,
+            projection_gradient,
+            input_scale_buffer,
+            input_weight_gradient,
+            rows_u32,
+            channels_u32,
+            channels_u32 * 2,
         )?;
         self.encode_elementwise_buffers(
             encoder.as_ref(),
@@ -2951,12 +3014,15 @@ impl MetalRuntime {
         let encoder = command.computeCommandEncoder().ok_or_else(|| {
             anyhow::anyhow!("Metal resident MTP-head backward encoder allocation failed")
         })?;
-        self.encode_elementwise_buffers(
+        self.encode_tiled_ternary_ste_weight_backward(
             encoder.as_ref(),
-            &self.ternary_ste_weight_backward_pipeline,
-            &[input, output, weights.scales.as_ref(), parameter_gradient],
-            &[rows_u32, width_u32, width_u32],
-            elements,
+            input,
+            output,
+            weights.scales.as_ref(),
+            parameter_gradient,
+            rows_u32,
+            width_u32,
+            width_u32,
         )?;
         self.encode_elementwise_buffers(
             encoder.as_ref(),
@@ -4119,17 +4185,15 @@ impl MetalRuntime {
             &[rows, in_features, out_features],
             input_len,
         )?;
-        self.encode_elementwise_buffers(
+        self.encode_tiled_ternary_ste_weight_backward(
             encoder.as_ref(),
-            &self.ternary_ste_weight_backward_pipeline,
-            &[
-                input_buffer,
-                output_gradient_buffer,
-                scale_buffer,
-                weight_gradient,
-            ],
-            &[rows, in_features, out_features],
-            weight_len,
+            input_buffer,
+            output_gradient_buffer,
+            scale_buffer,
+            weight_gradient,
+            rows,
+            in_features,
+            out_features,
         )?;
         encoder.endEncoding();
         command.commit();
@@ -6233,6 +6297,53 @@ impl MetalRuntime {
             MTLSize {
                 width,
                 height: 1,
+                depth: 1,
+            },
+        );
+        Ok(())
+    }
+
+    #[allow(unsafe_code)]
+    fn encode_tiled_ternary_ste_weight_backward(
+        &self,
+        encoder: &objc2::runtime::ProtocolObject<dyn objc2_metal::MTLComputeCommandEncoder>,
+        input: &objc2::runtime::ProtocolObject<dyn objc2_metal::MTLBuffer>,
+        output_gradient: &objc2::runtime::ProtocolObject<dyn objc2_metal::MTLBuffer>,
+        scales: &objc2::runtime::ProtocolObject<dyn objc2_metal::MTLBuffer>,
+        weight_gradient: &objc2::runtime::ProtocolObject<dyn objc2_metal::MTLBuffer>,
+        rows: u32,
+        in_features: u32,
+        out_features: u32,
+    ) -> Result<()> {
+        use core::ffi::c_void;
+        use core::ptr::NonNull;
+        use objc2_metal::{MTLComputeCommandEncoder, MTLSize};
+        if rows == 0 || in_features == 0 || out_features == 0 {
+            bail!("Metal tiled ternary weight-backward has an empty shape");
+        }
+        encoder.setComputePipelineState(&self.ternary_ste_weight_backward_tiled_pipeline);
+        unsafe {
+            encoder.setBuffer_offset_atIndex(Some(input), 0, 0);
+            encoder.setBuffer_offset_atIndex(Some(output_gradient), 0, 1);
+            encoder.setBuffer_offset_atIndex(Some(scales), 0, 2);
+            encoder.setBuffer_offset_atIndex(Some(weight_gradient), 0, 3);
+            for (slot, scalar) in [rows, in_features, out_features].iter().enumerate() {
+                encoder.setBytes_length_atIndex(
+                    NonNull::from(scalar).cast::<c_void>(),
+                    size_of::<u32>(),
+                    slot + 4,
+                );
+            }
+        }
+        encoder.dispatchThreadgroups_threadsPerThreadgroup(
+            MTLSize {
+                width: (in_features as usize).div_ceil(16),
+                height: (out_features as usize).div_ceil(16),
+                depth: 1,
+            },
+            MTLSize {
+                width: 16,
+                height: 16,
                 depth: 1,
             },
         );

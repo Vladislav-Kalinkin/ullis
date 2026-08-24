@@ -1561,38 +1561,35 @@ impl UllisHyena {
             .rev()
         {
             let plan = block.chunk_plan.for_sequence(time)?;
-            let mut resident_filter = block.filter.clone();
+            let destination_slot = gradient_slot.other();
             if train_filters {
+                let mut resident_filter = block.filter.clone();
                 let (freq, phase, decay) =
                     runtime.download_resident_implicit_filter_parameters(&weights.filter)?;
                 resident_filter.freq = (0..freq.len()).map(|index| freq.get(index)).collect();
                 resident_filter.phase = (0..phase.len()).map(|index| phase.get(index)).collect();
                 resident_filter.decay = (0..decay.len()).map(|index| decay.get(index)).collect();
-            }
-            let filter = resident_filter.generate(self.cfg.d_model, plan.kernel_len)?;
-            let destination_slot = gradient_slot.other();
-            let backward = runtime.hyena_block_backward_cached_and_update_resident(
-                cache,
-                gradient_slot,
-                destination_slot,
-                &[],
-                &[],
-                &[],
-                &[],
-                &[],
-                &[],
-                &weights.input,
-                &weights.output,
-                &filter,
-                batch,
-                time,
-                block.chunk_plan,
-                learning_rate,
-                train_filters,
-                false,
-            )?;
-            gradient_slot = destination_slot;
-            if train_filters {
+                let filter = resident_filter.generate(self.cfg.d_model, plan.kernel_len)?;
+                let backward = runtime.hyena_block_backward_cached_and_update_resident(
+                    cache,
+                    gradient_slot,
+                    destination_slot,
+                    &[],
+                    &[],
+                    &[],
+                    &[],
+                    &[],
+                    &[],
+                    &weights.input,
+                    &weights.output,
+                    &filter,
+                    batch,
+                    time,
+                    block.chunk_plan,
+                    learning_rate,
+                    true,
+                    false,
+                )?;
                 let filter_backward = resident_filter.backward_prefix(
                     self.cfg.d_model,
                     &backward.filter_gradient,
@@ -1605,7 +1602,21 @@ impl UllisHyena {
                     &filter_backward,
                     learning_rate,
                 )?;
+            } else {
+                runtime.hyena_block_backward_cached_and_update_resident_frozen(
+                    cache,
+                    gradient_slot,
+                    destination_slot,
+                    &weights.input,
+                    &weights.output,
+                    batch,
+                    time,
+                    block.chunk_plan,
+                    learning_rate,
+                    &weights.frozen_filter_spectrum,
+                )?;
             }
+            gradient_slot = destination_slot;
         }
         reverse_filter_gradients.reverse();
         Ok(MetalResidentHyenaProjectionStep {
