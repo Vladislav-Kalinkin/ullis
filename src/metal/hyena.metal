@@ -45,9 +45,12 @@ kernel void ullis_clipped_sgd_fp16(
     }
 }
 
-// Exact streamed tied-embedding cross-entropy. One thread owns one sequence
-// row and scans the vocabulary twice: first for logsumexp, then for the
-// expected embedding. No [rows, vocab] logits or probability tensor exists.
+// Exact tiled streamed tied-embedding cross-entropy. A 16-thread group owns
+// one sequence row: lanes split vocabulary while a 16 KiB threadgroup tile
+// retains their D-wide expected-embedding partials. No [rows, vocab] logits
+// or probability tensor exists. The fast path supports D <= 256.
+constant uint ULLIS_CE_LANES = 16u;
+constant uint ULLIS_CE_MAX_CHANNELS = 256u;
 kernel void ullis_streamed_cross_entropy_fp16(
     device const float *head [[buffer(0)]],
     device const half *embedding [[buffer(1)]],
@@ -60,42 +63,69 @@ kernel void ullis_streamed_cross_entropy_fp16(
     constant uint &vocab [[buffer(8)]],
     constant uint &horizon [[buffer(9)]],
     constant float &gradient_scale [[buffer(10)]],
-    uint row [[thread_position_in_grid]]) {
-    if (row >= rows) return;
+    uint lane [[thread_index_in_threadgroup]],
+    uint row [[threadgroup_position_in_grid]]) {
+    threadgroup float reduction[ULLIS_CE_LANES];
+    threadgroup float partial_expectation[ULLIS_CE_LANES * ULLIS_CE_MAX_CHANNELS];
+    if (row >= rows || channels > ULLIS_CE_MAX_CHANNELS) return;
     const uint position = row % time;
     if (position + horizon >= time) {
-        row_loss[row] = 0.0f;
-        for (uint channel = 0; channel < channels; ++channel) head_gradient[row * channels + channel] = 0.0f;
+        if (lane == 0) row_loss[row] = 0.0f;
+        for (uint channel = lane; channel < channels; channel += ULLIS_CE_LANES) {
+            head_gradient[row * channels + channel] = 0.0f;
+        }
         return;
     }
     const uint target = tokens[row + horizon];
     const device float *state = head + row * channels;
     float maximum = -INFINITY;
-    float target_logit = 0.0f;
-    for (uint token = 0; token < vocab; ++token) {
+    float target_logit = -INFINITY;
+    for (uint token = lane; token < vocab; token += ULLIS_CE_LANES) {
         float logit = 0.0f;
         const device half *row_embedding = embedding + token * channels;
         for (uint channel = 0; channel < channels; ++channel) logit += state[channel] * float(row_embedding[channel]);
         maximum = max(maximum, logit);
         if (token == target) target_logit = logit;
     }
-    // Reuse the final gradient allocation as an unnormalised expected
-    // embedding accumulator. That makes this the second and final vocabulary
-    // scan: a separate probability pass would triple the dominant work.
-    device float *gradient = head_gradient + row * channels;
-    for (uint channel = 0; channel < channels; ++channel) gradient[channel] = 0.0f;
+    reduction[lane] = maximum;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint stride = ULLIS_CE_LANES / 2u; stride > 0u; stride /= 2u) {
+        if (lane < stride) reduction[lane] = max(reduction[lane], reduction[lane + stride]);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    maximum = reduction[0];
+    reduction[lane] = target_logit;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint stride = ULLIS_CE_LANES / 2u; stride > 0u; stride /= 2u) {
+        if (lane < stride) reduction[lane] = max(reduction[lane], reduction[lane + stride]);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    target_logit = reduction[0];
+    threadgroup float *local_expectation = partial_expectation + lane * ULLIS_CE_MAX_CHANNELS;
+    for (uint channel = 0; channel < channels; ++channel) local_expectation[channel] = 0.0f;
     float exp_sum = 0.0f;
-    for (uint token = 0; token < vocab; ++token) {
+    for (uint token = lane; token < vocab; token += ULLIS_CE_LANES) {
         float logit = 0.0f;
         const device half *row_embedding = embedding + token * channels;
         for (uint channel = 0; channel < channels; ++channel) logit += state[channel] * float(row_embedding[channel]);
         const float weight = exp(logit - maximum);
         exp_sum += weight;
-        for (uint channel = 0; channel < channels; ++channel) gradient[channel] += weight * float(row_embedding[channel]);
+        for (uint channel = 0; channel < channels; ++channel) local_expectation[channel] += weight * float(row_embedding[channel]);
     }
-    row_loss[row] = maximum + log(exp_sum) - target_logit;
-    for (uint channel = 0; channel < channels; ++channel) {
-        gradient[channel] = gradient_scale * (gradient[channel] / exp_sum - float(embedding[target * channels + channel]));
+    reduction[lane] = exp_sum;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint stride = ULLIS_CE_LANES / 2u; stride > 0u; stride /= 2u) {
+        if (lane < stride) reduction[lane] += reduction[lane + stride];
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    exp_sum = reduction[0];
+    if (lane == 0) row_loss[row] = maximum + log(exp_sum) - target_logit;
+    for (uint channel = lane; channel < channels; channel += ULLIS_CE_LANES) {
+        float expectation = 0.0f;
+        for (uint worker = 0; worker < ULLIS_CE_LANES; ++worker) {
+            expectation += partial_expectation[worker * ULLIS_CE_MAX_CHANNELS + channel];
+        }
+        head_gradient[row * channels + channel] = gradient_scale * (expectation / exp_sum - float(embedding[target * channels + channel]));
     }
 }
 

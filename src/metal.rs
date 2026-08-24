@@ -4086,6 +4086,7 @@ impl MetalRuntime {
             .ok_or_else(|| anyhow::anyhow!("Metal causal backward filter overflow"))?;
         if batch == 0
             || channels == 0
+            || channels > 256
             || input.len() != elements
             || filter.len() != filter_elements
             || output_gradient.len() != elements
@@ -4752,7 +4753,7 @@ impl MetalRuntime {
         use core::ptr::NonNull;
         use objc2_metal::{
             MTLBuffer, MTLCommandBuffer, MTLCommandEncoder, MTLCommandQueue,
-            MTLComputeCommandEncoder, MTLComputePipelineState, MTLSize,
+            MTLComputeCommandEncoder, MTLSize,
         };
 
         let rows = batch
@@ -4766,6 +4767,7 @@ impl MetalRuntime {
             .ok_or_else(|| anyhow::anyhow!("Metal cross-entropy embedding overflow"))?;
         if rows == 0
             || channels == 0
+            || channels > 256
             || vocab == 0
             || horizon == 0
             || horizon >= time
@@ -4775,7 +4777,7 @@ impl MetalRuntime {
             || head.iter().any(|value| !value.is_finite())
             || tokens.iter().any(|&token| token as usize >= vocab)
         {
-            bail!("Metal streamed cross-entropy shape/value mismatch");
+            bail!("Metal tiled streamed cross-entropy requires valid shapes and d_model <= 256");
         }
         let head_bytes = elements
             .checked_mul(size_of::<f32>())
@@ -4861,18 +4863,14 @@ impl MetalRuntime {
                 10,
             );
         }
-        let width = self
-            .streamed_cross_entropy_fp16_pipeline
-            .maxTotalThreadsPerThreadgroup()
-            .min(rows);
-        encoder.dispatchThreads_threadsPerThreadgroup(
+        encoder.dispatchThreadgroups_threadsPerThreadgroup(
             MTLSize {
                 width: rows,
                 height: 1,
                 depth: 1,
             },
             MTLSize {
-                width,
+                width: 16,
                 height: 1,
                 depth: 1,
             },
@@ -4921,7 +4919,7 @@ impl MetalRuntime {
         use core::ptr::NonNull;
         use objc2_metal::{
             MTLBuffer, MTLCommandBuffer, MTLCommandEncoder, MTLCommandQueue,
-            MTLComputeCommandEncoder, MTLComputePipelineState, MTLSize,
+            MTLComputeCommandEncoder, MTLSize,
         };
 
         let rows = batch
@@ -4935,6 +4933,7 @@ impl MetalRuntime {
             .ok_or_else(|| anyhow::anyhow!("Metal resident cross-entropy embedding overflow"))?;
         if rows == 0
             || channels == 0
+            || channels > 256
             || vocab == 0
             || horizon == 0
             || horizon >= time
@@ -4942,7 +4941,7 @@ impl MetalRuntime {
             || embedding.len != embedding_elements
             || tokens.iter().any(|&token| token as usize >= vocab)
         {
-            bail!("Metal resident streamed cross-entropy shape/value mismatch");
+            bail!("Metal tiled streamed cross-entropy requires valid shapes and d_model <= 256");
         }
         let activation_bytes = elements.checked_mul(size_of::<f32>()).ok_or_else(|| {
             anyhow::anyhow!("Metal resident cross-entropy activation size overflow")
@@ -5019,18 +5018,14 @@ impl MetalRuntime {
                 10,
             );
         }
-        let width = self
-            .streamed_cross_entropy_fp16_pipeline
-            .maxTotalThreadsPerThreadgroup()
-            .min(rows);
-        encoder.dispatchThreads_threadsPerThreadgroup(
+        encoder.dispatchThreadgroups_threadsPerThreadgroup(
             MTLSize {
                 width: rows,
                 height: 1,
                 depth: 1,
             },
             MTLSize {
-                width,
+                width: 16,
                 height: 1,
                 depth: 1,
             },
