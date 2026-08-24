@@ -18,7 +18,17 @@ DESCRIPTION
 TRAIN
        ullis train --data dataset.jsonl --run runs/first --steps 1000
 
-       --config FILE             Optional JSON TrainConfig.
+       --config FILE             Optional TOML TrainConfig. Legacy JSON is accepted.
+       --d-model N               Override model width.
+       --layers N                Override number of Hyena blocks.
+       --context-len N           Override training context; never silently capped.
+       --batch-size N            Override batch size.
+       --filter-order N          Override implicit-filter order.
+       --hyena-kernel-len N      Override causal receptive field.
+       --hyena-chunk-len N       Override overlap-save FFT chunk.
+       --vocab-size N            BPE vocabulary ceiling.
+       --seed N                  Override initialization/BPE seed.
+       --memory-budget-mib N     Override hard allocation budget.
        --resume CHECKPOINT       Restore checkpoint.json and matching tokenizer.
        --steps N                 New optimization steps. Default: 1.
        --learning-rate RATE      Positive stateless-SGD rate. Default: 1e-3.

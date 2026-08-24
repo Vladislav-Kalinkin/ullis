@@ -34,10 +34,12 @@ cargo run -- --smoke
 On an Apple Silicon Mac, train the included tiny example with Metal:
 
 ```sh
-cargo run -- train --data examples/first-train.jsonl --run runs/hello --steps 100 --checkpoint-every 25
+cargo run -- train --data examples/first-train.jsonl --run runs/hello --steps 100 --learning-rate 0.01 --checkpoint-every 25
 ```
 
-The output directory contains `config.json`, `tokenizer.json`, append-only `metrics.jsonl`, and lossless `checkpoint.json`. Continue a run with:
+The default is the runnable Apple-Silicon profile in [config.toml](/Users/vladislavkalinkin/ullis/config.toml): `D=256`, six layers and `context=2048`. Use it with `--config config.toml`, or override only needed fields: `--context-len 1024 --layers 4 --d-model 192 --memory-budget-mib 8192`.
+
+The output directory contains `config.json`, `tokenizer.json`, append-only `metrics.jsonl`, and lossless `checkpoint.json`. Progress reports raw window loss plus EMA; use EMA rather than requiring every distinct batch window to fall. Continue a run with:
 
 ```sh
 cargo run -- train --data examples/first-train.jsonl --run runs/hello --resume runs/hello/checkpoint.json --steps 100

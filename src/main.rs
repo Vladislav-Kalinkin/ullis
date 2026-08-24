@@ -1,5 +1,5 @@
 use anyhow::{Context, Result, bail};
-use clap::{Parser, Subcommand, ValueEnum};
+use clap::{Args, Parser, Subcommand, ValueEnum};
 use serde::{Deserialize, Serialize};
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, BufRead, BufReader, Write};
@@ -28,6 +28,8 @@ enum Command {
         run: PathBuf,
         #[arg(long)]
         config: Option<PathBuf>,
+        #[command(flatten)]
+        overrides: Box<TrainOverrides>,
         /// Continue from a previously saved checkpoint instead of initializing.
         #[arg(long)]
         resume: Option<PathBuf>,
@@ -68,6 +70,31 @@ enum Command {
         #[arg(long, default_value_t = 64)]
         max_tokens: usize,
     },
+}
+
+#[derive(Clone, Debug, Args, Default)]
+struct TrainOverrides {
+    #[arg(long)]
+    d_model: Option<usize>,
+    #[arg(long = "layers")]
+    n_layers: Option<usize>,
+    #[arg(long)]
+    context_len: Option<usize>,
+    #[arg(long)]
+    batch_size: Option<usize>,
+    #[arg(long)]
+    filter_order: Option<usize>,
+    #[arg(long)]
+    hyena_kernel_len: Option<usize>,
+    #[arg(long)]
+    hyena_chunk_len: Option<usize>,
+    /// Upper bound for corpus-trained BPE vocabulary.
+    #[arg(long)]
+    vocab_size: Option<usize>,
+    #[arg(long)]
+    seed: Option<u64>,
+    #[arg(long)]
+    memory_budget_mib: Option<usize>,
 }
 
 #[derive(Clone, Copy, Debug, ValueEnum, Serialize, Deserialize)]
@@ -117,9 +144,14 @@ struct ToolCall {
 struct TrainMetric {
     step: usize,
     tokens: usize,
+    batch_tokens: usize,
+    supervised_tokens: usize,
+    step_millis: f64,
+    step_tokens_per_second: f64,
     tokens_per_second: f64,
     loss: f32,
     loss_ema: f32,
+    loss_delta: f32,
     mtp_next: f32,
     mtp_second: f32,
     learning_rate: f32,
@@ -188,23 +220,61 @@ fn training_text(record: &DatasetRecord) -> String {
         .join("\n")
 }
 
-fn small_config(vocab_size: usize) -> TrainConfig {
+fn default_train_config(vocab_size: usize) -> TrainConfig {
+    TrainConfig {
+        d_model: 256,
+        n_layers: 6,
+        vocab_size,
+        context_len: 2_048,
+        batch_size: 1,
+        hyena_kernel_len: 2_048,
+        hyena_chunk_len: 2_048,
+        ..Default::default()
+    }
+}
+
+fn smoke_config(vocab_size: usize) -> TrainConfig {
     TrainConfig {
         d_model: 16,
         n_layers: 1,
         vocab_size,
         context_len: 32,
-        batch_size: 1,
         hyena_kernel_len: 32,
         hyena_chunk_len: 32,
         ..Default::default()
     }
 }
 
+fn apply_overrides(cfg: &mut TrainConfig, overrides: &TrainOverrides) -> Result<()> {
+    macro_rules! set {
+        ($field:ident) => {
+            if let Some(value) = overrides.$field {
+                cfg.$field = value;
+            }
+        };
+    }
+    set!(d_model);
+    set!(n_layers);
+    set!(context_len);
+    set!(batch_size);
+    set!(filter_order);
+    set!(hyena_kernel_len);
+    set!(hyena_chunk_len);
+    set!(vocab_size);
+    set!(seed);
+    if let Some(mib) = overrides.memory_budget_mib {
+        cfg.memory_budget_bytes = mib
+            .checked_mul(1024 * 1024)
+            .ok_or_else(|| anyhow::anyhow!("memory-budget-mib overflows bytes"))?;
+    }
+    Ok(())
+}
+
 fn train(
     data: PathBuf,
     run: PathBuf,
     config_path: Option<PathBuf>,
+    overrides: TrainOverrides,
     resume: Option<PathBuf>,
     steps: usize,
     learning_rate: f32,
@@ -219,10 +289,15 @@ fn train(
         bail!("dataset has no records");
     }
     let mut cfg = match config_path {
-        Some(path) => serde_json::from_str(&fs::read_to_string(&path)?)
-            .with_context(|| format!("parse config {}", path.display()))?,
-        None => small_config(DEFAULT_VOCAB as usize),
+        Some(path) => {
+            let source = fs::read_to_string(&path)?;
+            toml::from_str(&source)
+                .or_else(|_| serde_json::from_str(&source))
+                .with_context(|| format!("parse TOML or legacy JSON config {}", path.display()))?
+        }
+        None => default_train_config(DEFAULT_VOCAB as usize),
     };
+    apply_overrides(&mut cfg, &overrides)?;
     let training_texts = records.iter().map(training_text).collect::<Vec<_>>();
     let mut tokenizer = train_bpe(&training_texts, cfg.vocab_size as u32, cfg.seed)?;
     let mut tokens = training_texts
@@ -234,7 +309,7 @@ fn train(
     // ledger truthful even when an imported configuration chose Lion.
     cfg.optimizer = OptimizerKind::StatelessSgd;
     cfg.validate()?;
-    let time = cfg.context_len.min(32);
+    let time = cfg.context_len;
     if tokens.len() < time {
         tokens.resize(time, tokenizer.eos_id);
     }
@@ -245,6 +320,19 @@ fn train(
         .create(true)
         .append(true)
         .open(run.join("metrics.jsonl"))?;
+    let estimate = cfg.memory_estimate()?;
+    let planned_peak_mib =
+        estimate.low_memory_training.peak().unwrap_or(usize::MAX) as f64 / 1024.0 / 1024.0;
+    println!(
+        "train | backend {backend:?} | d {} | layers {} | context {} | batch {} | vocab {} | corpus {} tok | planned resident peak {planned_peak_mib:.1} MiB / {} MiB",
+        cfg.d_model,
+        cfg.n_layers,
+        cfg.context_len,
+        cfg.batch_size,
+        cfg.vocab_size,
+        tokens.len(),
+        cfg.memory_budget_bytes / (1024 * 1024),
+    );
     let mut model = match resume {
         Some(path) => {
             let checkpoint: ModelCheckpoint = serde_json::from_slice(&fs::read(&path)?)
@@ -262,6 +350,7 @@ fn train(
     let mut batcher = MtpBatcher::from_config(&tokens, &cfg, time)?;
     let started = Instant::now();
     let mut loss_ema = None;
+    let mut previous_loss = None;
     #[cfg(target_os = "macos")]
     let metal_runtime = matches!(backend, Backend::Metal)
         .then(ullis::metal::MetalRuntime::new)
@@ -278,6 +367,7 @@ fn train(
         );
     }
     for step in 1..=steps {
+        let step_started = Instant::now();
         let batch = batcher.next().unwrap_or_else(|| {
             batcher = MtpBatcher::from_config(&tokens, &cfg, time).expect("validated batcher");
             batcher
@@ -310,27 +400,41 @@ fn train(
             Backend::Metal => unreachable!("rejected before training"),
         };
         let processed = step * batch.tokens().len();
+        let step_seconds = step_started.elapsed().as_secs_f64();
         let loss_ema_value = match loss_ema {
             Some(previous) => 0.95 * previous + 0.05 * loss.mean(),
             None => loss.mean(),
         };
         loss_ema = Some(loss_ema_value);
+        let loss_delta = previous_loss.map_or(0.0, |previous| loss.mean() - previous);
+        previous_loss = Some(loss.mean());
         let metric = TrainMetric {
             step,
             tokens: processed,
+            batch_tokens: batch.tokens().len(),
+            supervised_tokens: loss.next_token_count + loss.second_token_count,
+            step_millis: step_seconds * 1_000.0,
+            step_tokens_per_second: batch.tokens().len() as f64
+                / step_seconds.max(f64::MIN_POSITIVE),
             tokens_per_second: processed as f64
                 / started.elapsed().as_secs_f64().max(f64::MIN_POSITIVE),
             loss: loss.mean(),
             loss_ema: loss_ema_value,
+            loss_delta,
             mtp_next: loss.next_token,
             mtp_second: loss.second_token,
             learning_rate,
         };
         writeln!(metrics, "{}", serde_json::to_string(&metric)?)?;
         println!(
-            "step {step} | tok {processed} | {:.1} tok/s | loss {:.4} | ema {:.4} | mtp+1 {:.4} | mtp+2 {:.4} | lr {learning_rate:.2e}",
+            "step {step}/{steps} | tok {processed} | batch {} | supervised {} | step {:.1} ms {:.1} tok/s | total {:.1} tok/s | loss {:.4} ({:+.4}) | ema {:.4} | mtp+1 {:.4} | mtp+2 {:.4} | lr {learning_rate:.2e}",
+            metric.batch_tokens,
+            metric.supervised_tokens,
+            metric.step_millis,
+            metric.step_tokens_per_second,
             metric.tokens_per_second,
             metric.loss,
+            metric.loss_delta,
             metric.loss_ema,
             metric.mtp_next,
             metric.mtp_second
@@ -467,7 +571,7 @@ fn chat(checkpoint: PathBuf, session: PathBuf, mut thinking: ThinkingLevel) -> R
 fn main() -> Result<()> {
     let cli = Cli::parse();
     if cli.smoke {
-        let model = UllisHyena::new(small_config(512))?;
+        let model = UllisHyena::new(smoke_config(512))?;
         println!(
             "hyena smoke: streamed MTP loss {:.4}",
             model.streamed_mtp_loss(&[4, 5, 6, 7], 1, 4)?.mean()
@@ -479,6 +583,7 @@ fn main() -> Result<()> {
             data,
             run,
             config,
+            overrides,
             resume,
             steps,
             learning_rate,
@@ -488,6 +593,7 @@ fn main() -> Result<()> {
             data,
             run,
             config,
+            *overrides,
             resume,
             steps,
             learning_rate,
