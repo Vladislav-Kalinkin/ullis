@@ -40,6 +40,9 @@ enum Command {
         /// Write a checkpoint after this many steps (and always at the end).
         #[arg(long, default_value_t = 100)]
         checkpoint_every: usize,
+        /// Enable the exact but very expensive implicit-filter backward pass.
+        #[arg(long)]
+        train_filters: bool,
         /// CPU is a diagnostic fallback. Metal is the normal Ullis trainer.
         #[arg(long, value_enum, default_value_t = Backend::Metal)]
         backend: Backend,
@@ -279,6 +282,7 @@ fn train(
     steps: usize,
     learning_rate: f32,
     checkpoint_every: usize,
+    train_filters: bool,
     backend: Backend,
 ) -> Result<()> {
     if steps == 0 || checkpoint_every == 0 || !learning_rate.is_finite() || learning_rate <= 0.0 {
@@ -394,6 +398,7 @@ fn train(
                     batch.batch_size(),
                     batch.time(),
                     learning_rate,
+                    train_filters,
                 )?
             }
             #[cfg(not(target_os = "macos"))]
@@ -588,6 +593,7 @@ fn main() -> Result<()> {
             steps,
             learning_rate,
             checkpoint_every,
+            train_filters,
             backend,
         }) => train(
             data,
@@ -598,6 +604,7 @@ fn main() -> Result<()> {
             steps,
             learning_rate,
             checkpoint_every,
+            train_filters,
             backend,
         ),
         Some(Command::Tokenize { data, output }) => {

@@ -1432,6 +1432,7 @@ impl UllisHyena {
         batch: usize,
         time: usize,
         learning_rate: f32,
+        train_filters: bool,
     ) -> Result<MetalResidentHyenaProjectionStep> {
         let rows = batch
             .checked_mul(time)
@@ -1463,12 +1464,14 @@ impl UllisHyena {
             // Recreate that same compact state for the exact-reference
             // convolution/filter backward; this is a tiny O(D*order)
             // validation bridge, never an activation or optimiser tensor.
-            let (freq, phase, decay) =
-                runtime.download_resident_implicit_filter_parameters(&weights.filter)?;
             let mut resident_filter = block.filter.clone();
-            resident_filter.freq = (0..freq.len()).map(|index| freq.get(index)).collect();
-            resident_filter.phase = (0..phase.len()).map(|index| phase.get(index)).collect();
-            resident_filter.decay = (0..decay.len()).map(|index| decay.get(index)).collect();
+            if train_filters {
+                let (freq, phase, decay) =
+                    runtime.download_resident_implicit_filter_parameters(&weights.filter)?;
+                resident_filter.freq = (0..freq.len()).map(|index| freq.get(index)).collect();
+                resident_filter.phase = (0..phase.len()).map(|index| phase.get(index)).collect();
+                resident_filter.decay = (0..decay.len()).map(|index| decay.get(index)).collect();
+            }
             let filter = resident_filter.generate(self.cfg.d_model, plan.kernel_len)?;
             let destination_slot = gradient_slot.other();
             let backward = runtime.hyena_block_backward_cached_and_update_resident(
@@ -1488,6 +1491,7 @@ impl UllisHyena {
                 time,
                 block.chunk_plan,
                 learning_rate,
+                train_filters,
             )?;
             gradient_slot = destination_slot;
             reverse_filter_gradients.push(backward.filter_gradient);
@@ -1529,6 +1533,7 @@ impl UllisHyena {
         batch: usize,
         time: usize,
         learning_rate: f32,
+        train_filters: bool,
     ) -> Result<MetalResidentHyenaProjectionStep> {
         if caches.len() != self.blocks.len() || !learning_rate.is_finite() || learning_rate <= 0.0 {
             bail!("Metal resident cached backward state/value mismatch");
@@ -1570,20 +1575,23 @@ impl UllisHyena {
                 time,
                 block.chunk_plan,
                 learning_rate,
+                train_filters,
             )?;
             gradient_slot = destination_slot;
-            let filter_backward = resident_filter.backward_prefix(
-                self.cfg.d_model,
-                &backward.filter_gradient,
-                plan.kernel_len,
-                time,
-            )?;
-            reverse_filter_gradients.push(backward.filter_gradient);
-            runtime.resident_implicit_filter_stateless_sgd(
-                &weights.filter,
-                &filter_backward,
-                learning_rate,
-            )?;
+            if train_filters {
+                let filter_backward = resident_filter.backward_prefix(
+                    self.cfg.d_model,
+                    &backward.filter_gradient,
+                    plan.kernel_len,
+                    time,
+                )?;
+                reverse_filter_gradients.push(backward.filter_gradient);
+                runtime.resident_implicit_filter_stateless_sgd(
+                    &weights.filter,
+                    &filter_backward,
+                    learning_rate,
+                )?;
+            }
         }
         reverse_filter_gradients.reverse();
         Ok(MetalResidentHyenaProjectionStep {
@@ -1608,6 +1616,7 @@ impl UllisHyena {
         batch: usize,
         time: usize,
         learning_rate: f32,
+        train_filters: bool,
     ) -> Result<MtpLoss> {
         if time < 3 || !learning_rate.is_finite() || learning_rate <= 0.0 {
             bail!("Metal resident MTP training shape/value mismatch");
@@ -1677,6 +1686,7 @@ impl UllisHyena {
             batch,
             time,
             learning_rate,
+            train_filters,
         )?;
         Ok(MtpLoss {
             next_token: first_loss.loss_sum / first_loss.token_count as f32,
@@ -2915,6 +2925,7 @@ mod tests {
                 4,
                 block.chunk_plan,
                 learning_rate,
+                true,
             )
             .unwrap();
         for (actual, expected) in actual.input_gradient.iter().zip(&expected.input_gradient) {
@@ -2965,7 +2976,9 @@ mod tests {
             0.7, -0.2, 0.4, -0.6, -0.1, 0.5, -0.3, 0.8, 0.6, -0.7, 0.2, 0.1, -0.5, 0.3, 0.9, -0.4,
         ];
         let step = model
-            .hidden_metal_backward_update_resident(&runtime, &state, &ids, &upstream, 1, 4, 0.03)
+            .hidden_metal_backward_update_resident(
+                &runtime, &state, &ids, &upstream, 1, 4, 0.03, true,
+            )
             .unwrap();
         assert_eq!(step.input_gradient.len(), upstream.len());
         assert_eq!(step.filter_gradients.len(), 1);

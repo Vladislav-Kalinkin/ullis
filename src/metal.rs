@@ -1767,6 +1767,7 @@ impl MetalRuntime {
             time,
             plan,
             None,
+            true,
         )? {
             CachedBlockBackwardResult::Reference(result) => Ok(result),
             CachedBlockBackwardResult::Updated(_) => {
@@ -1798,6 +1799,7 @@ impl MetalRuntime {
         time: usize,
         plan: HyenaChunkPlan,
         learning_rate: f32,
+        compute_filter_gradient: bool,
     ) -> Result<MetalHyenaBlockUpdatedBackward> {
         match self.hyena_block_backward_cached_impl(
             cache,
@@ -1818,6 +1820,7 @@ impl MetalRuntime {
                 output: output_weights,
                 learning_rate,
             }),
+            compute_filter_gradient,
         )? {
             CachedBlockBackwardResult::Updated(result) => Ok(result),
             CachedBlockBackwardResult::Reference(_) => unreachable!("resident update requested"),
@@ -1841,6 +1844,7 @@ impl MetalRuntime {
         time: usize,
         plan: HyenaChunkPlan,
         updates: Option<ResidentTernaryUpdates<'_>>,
+        compute_filter_gradient: bool,
     ) -> Result<CachedBlockBackwardResult> {
         use objc2_metal::{
             MTLBuffer, MTLCommandBuffer, MTLCommandEncoder, MTLCommandQueue,
@@ -2233,13 +2237,15 @@ impl MetalRuntime {
             &[time_u32, channels_u32, fft_len_u32, elements_u32],
             elements,
         )?;
-        self.encode_elementwise_buffers(
-            encoder.as_ref(),
-            &self.causal_conv_filter_backward_pipeline,
-            &[signal, signal_gradient, filter_gradient],
-            &[batch_u32, time_u32, channels_u32, kernel_u32],
-            filter_elements,
-        )?;
+        if compute_filter_gradient {
+            self.encode_elementwise_buffers(
+                encoder.as_ref(),
+                &self.causal_conv_filter_backward_pipeline,
+                &[signal, signal_gradient, filter_gradient],
+                &[batch_u32, time_u32, channels_u32, kernel_u32],
+                filter_elements,
+            )?;
+        }
         self.encode_elementwise_buffers(
             encoder.as_ref(),
             &self.add_projection_signal_gradient_pipeline,
@@ -2371,7 +2377,11 @@ impl MetalRuntime {
             values
         };
         let input_gradient = read(resident_destination, elements);
-        let filter_gradient = read(filter_gradient, filter_elements);
+        let filter_gradient = if compute_filter_gradient {
+            read(filter_gradient, filter_elements)
+        } else {
+            Vec::new()
+        };
         Ok(if updates.is_some() {
             CachedBlockBackwardResult::Updated(MetalHyenaBlockUpdatedBackward {
                 input_gradient,
