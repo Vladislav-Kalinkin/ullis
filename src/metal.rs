@@ -734,6 +734,17 @@ pub struct ResidentImplicitFilterParameters {
     order: usize,
 }
 
+/// Immutable frequency-domain Hyena filter retained across training steps.
+/// It is valid only for its exact bounded-convolution plan.
+#[cfg(target_os = "macos")]
+pub struct ResidentFilterSpectrum {
+    buffer: objc2::rc::Retained<objc2::runtime::ProtocolObject<dyn objc2_metal::MTLBuffer>>,
+    channels: usize,
+    time: usize,
+    kernel_len: usize,
+    fft_len: usize,
+}
+
 #[cfg(target_os = "macos")]
 impl ResidentActivationSlot {
     pub const fn other(self) -> Self {
@@ -3267,6 +3278,7 @@ impl MetalRuntime {
             ResidentImplicitFilterSource::Host(filter),
             plan,
             cache,
+            None,
             true,
         )
     }
@@ -3291,7 +3303,37 @@ impl MetalRuntime {
             ResidentImplicitFilterSource::Trainable(filter),
             plan,
             cache,
-            false,
+            None,
+            // The mixer reuses shared FFT work buffers that are initialized
+            // by the CPU before submission. They cannot be repopulated for
+            // the next block until this command has consumed them.
+            true,
+        )
+    }
+
+    /// Frozen-filter training mixer. `spectrum` was built for this exact
+    /// shape and lets the command skip implicit-filter generation plus its FFT.
+    pub fn resident_hyena_mixer_trainable_frozen(
+        &self,
+        slot: ResidentActivationSlot,
+        batch: usize,
+        time: usize,
+        channels: usize,
+        filter: &ResidentImplicitFilterParameters,
+        plan: HyenaChunkPlan,
+        cache: Option<&ResidentHyenaBlockCache>,
+        spectrum: &ResidentFilterSpectrum,
+    ) -> Result<()> {
+        self.resident_hyena_mixer_impl(
+            slot,
+            batch,
+            time,
+            channels,
+            ResidentImplicitFilterSource::Trainable(filter),
+            plan,
+            cache,
+            Some(spectrum),
+            true,
         )
     }
 
@@ -3305,6 +3347,7 @@ impl MetalRuntime {
         filter_source: ResidentImplicitFilterSource<'_>,
         plan: HyenaChunkPlan,
         cache: Option<&ResidentHyenaBlockCache>,
+        static_spectrum: Option<&ResidentFilterSpectrum>,
         wait_for_completion: bool,
     ) -> Result<()> {
         use objc2_metal::{
@@ -3314,6 +3357,14 @@ impl MetalRuntime {
 
         let shape = MetalDispatchShape::new(batch, time, channels)?;
         let plan = plan.for_sequence(time)?;
+        if let Some(spectrum) = static_spectrum
+            && (spectrum.channels != channels
+                || spectrum.time != time
+                || spectrum.kernel_len != plan.kernel_len
+                || spectrum.fft_len != plan.fft_len)
+        {
+            bail!("Metal resident filter spectrum shape mismatch");
+        }
         let chunks = time.div_ceil(plan.chunk_len);
         let transforms = batch
             .checked_mul(chunks)
@@ -3463,27 +3514,29 @@ impl MetalRuntime {
                 .cast::<Complex32>()
                 .as_ptr()
                 .write_bytes(0, signal_elements);
-            filter_first
-                .contents()
-                .cast::<Complex32>()
-                .as_ptr()
-                .write_bytes(0, filter_fft_elements);
-            if let Some((freq, phase, decay)) = host_parameters {
-                freq_buffer
+            if static_spectrum.is_none() {
+                filter_first
                     .contents()
-                    .cast::<f32>()
+                    .cast::<Complex32>()
                     .as_ptr()
-                    .copy_from_nonoverlapping(freq.as_ptr(), freq.len());
-                phase_buffer
-                    .contents()
-                    .cast::<f32>()
-                    .as_ptr()
-                    .copy_from_nonoverlapping(phase.as_ptr(), phase.len());
-                decay_buffer
-                    .contents()
-                    .cast::<f32>()
-                    .as_ptr()
-                    .copy_from_nonoverlapping(decay.as_ptr(), decay.len());
+                    .write_bytes(0, filter_fft_elements);
+                if let Some((freq, phase, decay)) = host_parameters {
+                    freq_buffer
+                        .contents()
+                        .cast::<f32>()
+                        .as_ptr()
+                        .copy_from_nonoverlapping(freq.as_ptr(), freq.len());
+                    phase_buffer
+                        .contents()
+                        .cast::<f32>()
+                        .as_ptr()
+                        .copy_from_nonoverlapping(phase.as_ptr(), phase.len());
+                    decay_buffer
+                        .contents()
+                        .cast::<f32>()
+                        .as_ptr()
+                        .copy_from_nonoverlapping(decay.as_ptr(), decay.len());
+                }
             }
         }
         let command = self
@@ -3513,31 +3566,33 @@ impl MetalRuntime {
             ],
             signal_elements,
         )?;
-        match filter_source {
-            ResidentImplicitFilterSource::Host(_) => self.encode_implicit_filter(
-                encoder.as_ref(),
-                freq_buffer,
-                phase_buffer,
-                decay_buffer,
-                filter_first,
-                kernel_u32,
-                time_u32,
-                order_u32,
-                fft_len,
-                filter_elements_u32,
-            )?,
-            ResidentImplicitFilterSource::Trainable(_) => self.encode_implicit_filter_fp16(
-                encoder.as_ref(),
-                freq_buffer,
-                phase_buffer,
-                decay_buffer,
-                filter_first,
-                kernel_u32,
-                time_u32,
-                order_u32,
-                fft_len,
-                filter_elements_u32,
-            )?,
+        if static_spectrum.is_none() {
+            match filter_source {
+                ResidentImplicitFilterSource::Host(_) => self.encode_implicit_filter(
+                    encoder.as_ref(),
+                    freq_buffer,
+                    phase_buffer,
+                    decay_buffer,
+                    filter_first,
+                    kernel_u32,
+                    time_u32,
+                    order_u32,
+                    fft_len,
+                    filter_elements_u32,
+                )?,
+                ResidentImplicitFilterSource::Trainable(_) => self.encode_implicit_filter_fp16(
+                    encoder.as_ref(),
+                    freq_buffer,
+                    phase_buffer,
+                    decay_buffer,
+                    filter_first,
+                    kernel_u32,
+                    time_u32,
+                    order_u32,
+                    fft_len,
+                    filter_elements_u32,
+                )?,
+            }
         }
         let dispatch_two = |pipeline: &objc2::runtime::ProtocolObject<
             dyn MTLComputePipelineState,
@@ -3581,19 +3636,25 @@ impl MetalRuntime {
             signal_elements,
             false,
         )?;
-        let filter_source_is_first = run_fft(
-            filter_first,
-            filter_second,
-            channels_u32,
-            filter_fft_elements,
-            false,
-        )?;
+        let filter_source_is_first = if static_spectrum.is_none() {
+            Some(run_fft(
+                filter_first,
+                filter_second,
+                channels_u32,
+                filter_fft_elements,
+                false,
+            )?)
+        } else {
+            None
+        };
         let signal_spectrum = if signal_source_is_first {
             signal_first
         } else {
             signal_second
         };
-        let filter_spectrum = if filter_source_is_first {
+        let filter_spectrum = if let Some(spectrum) = static_spectrum {
+            &*spectrum.buffer
+        } else if filter_source_is_first.expect("dynamic filter FFT is present") {
             filter_first
         } else {
             filter_second
@@ -5106,6 +5167,68 @@ impl MetalRuntime {
             )?,
             channels,
             order,
+        })
+    }
+
+    /// Builds one immutable filter spectrum for a frozen-filter training run.
+    /// The CPU work happens once during state construction; every later mixer
+    /// reuses this resident buffer instead of generating and FFTing a filter.
+    #[allow(unsafe_code)]
+    pub fn upload_resident_filter_spectrum(
+        &self,
+        filter: &crate::hyena::ImplicitFilter,
+        channels: usize,
+        time: usize,
+        plan: HyenaChunkPlan,
+    ) -> Result<ResidentFilterSpectrum> {
+        use objc2_metal::{MTLBuffer, MTLDevice, MTLResourceOptions};
+
+        let plan = plan.for_sequence(time)?;
+        let values = filter.generate(channels, plan.kernel_len)?;
+        let elements = channels
+            .checked_mul(plan.fft_len)
+            .ok_or_else(|| anyhow::anyhow!("Metal resident filter spectrum overflow"))?;
+        let bytes = elements
+            .checked_mul(size_of::<Complex32>())
+            .ok_or_else(|| anyhow::anyhow!("Metal resident filter spectrum bytes overflow"))?;
+        let mut spectrum = vec![Complex32::default(); elements];
+        for channel in 0..channels {
+            let start = channel * plan.fft_len;
+            let mut fft_values = spectrum[start..start + plan.fft_len]
+                .iter()
+                .map(|value| (value.real, value.imaginary))
+                .collect::<Vec<_>>();
+            for (destination, &value) in fft_values
+                .iter_mut()
+                .zip(&values[channel * plan.kernel_len..(channel + 1) * plan.kernel_len])
+            {
+                destination.0 = value;
+            }
+            crate::hyena::fft(&mut fft_values, false);
+            for (destination, (real, imaginary)) in spectrum[start..start + plan.fft_len]
+                .iter_mut()
+                .zip(fft_values)
+            {
+                *destination = Complex32 { real, imaginary };
+            }
+        }
+        let buffer = self
+            .device
+            .newBufferWithLength_options(bytes, MTLResourceOptions::StorageModeShared)
+            .ok_or_else(|| anyhow::anyhow!("Metal resident filter spectrum allocation failed"))?;
+        unsafe {
+            buffer
+                .contents()
+                .cast::<Complex32>()
+                .as_ptr()
+                .copy_from_nonoverlapping(spectrum.as_ptr(), elements);
+        }
+        Ok(ResidentFilterSpectrum {
+            buffer,
+            channels,
+            time,
+            kernel_len: plan.kernel_len,
+            fft_len: plan.fft_len,
         })
     }
 

@@ -336,8 +336,25 @@ fn train(
     let estimate = cfg.memory_estimate()?;
     let planned_peak_mib =
         estimate.low_memory_training.peak().unwrap_or(usize::MAX) as f64 / 1024.0 / 1024.0;
+    let frozen_filter_spectrum_bytes = if train_filters {
+        0
+    } else {
+        let chunk = cfg.hyena_chunk_len.min(cfg.context_len);
+        let kernel = cfg.hyena_kernel_len.min(cfg.context_len);
+        let fft_len = chunk
+            .checked_add(kernel)
+            .and_then(|value| value.checked_sub(1))
+            .and_then(usize::checked_next_power_of_two)
+            .ok_or_else(|| anyhow::anyhow!("frozen filter spectrum FFT length overflows"))?;
+        cfg.n_layers
+            .checked_mul(cfg.d_model)
+            .and_then(|value| value.checked_mul(fft_len))
+            .and_then(|value| value.checked_mul(2 * size_of::<f32>()))
+            .ok_or_else(|| anyhow::anyhow!("frozen filter spectrum memory estimate overflows"))?
+    };
+    let frozen_filter_spectrum_mib = frozen_filter_spectrum_bytes as f64 / 1024.0 / 1024.0;
     println!(
-        "train | backend {backend:?} | d {} | layers {} | context {} | kernel {} | chunk {} | batch {} | vocab {} | corpus {} tok | planned resident peak {planned_peak_mib:.1} MiB / {} MiB | ingest {json_seconds:.1}s | bpe {bpe_seconds:.1}s | tokenize {tokenize_seconds:.1}s",
+        "train | backend {backend:?} | d {} | layers {} | context {} | kernel {} | chunk {} | batch {} | vocab {} | corpus {} tok | planned resident peak {:.1} MiB (base {planned_peak_mib:.1} + frozen-filter FFT {frozen_filter_spectrum_mib:.1}) / {} MiB | ingest {json_seconds:.1}s | bpe {bpe_seconds:.1}s | tokenize {tokenize_seconds:.1}s",
         cfg.d_model,
         cfg.n_layers,
         cfg.context_len,
@@ -346,6 +363,7 @@ fn train(
         cfg.batch_size,
         cfg.vocab_size,
         tokens.len(),
+        planned_peak_mib + frozen_filter_spectrum_mib,
         cfg.memory_budget_bytes / (1024 * 1024),
     );
     if cfg.hyena_kernel_len > cfg.hyena_chunk_len {

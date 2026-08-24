@@ -479,7 +479,7 @@ fn complex_mul(a: (f32, f32), b: (f32, f32)) -> (f32, f32) {
 }
 
 /// In-place, unnormalised forward / normalised inverse radix-2 FFT.
-fn fft(values: &mut [(f32, f32)], inverse: bool) {
+pub(crate) fn fft(values: &mut [(f32, f32)], inverse: bool) {
     let n = values.len();
     let mut j = 0;
     for i in 1..n {

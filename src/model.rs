@@ -105,6 +105,7 @@ struct MetalResidentHyenaBlockWeights {
     input: crate::metal::ResidentTrainableFp16TernaryWeights,
     output: crate::metal::ResidentTrainableFp16TernaryWeights,
     filter: crate::metal::ResidentImplicitFilterParameters,
+    frozen_filter_spectrum: crate::metal::ResidentFilterSpectrum,
 }
 
 /// Readbacks from a projection-only resident training step. Projection
@@ -843,6 +844,7 @@ impl HyenaBlock {
         weights: &MetalResidentHyenaBlockWeights,
         batch: usize,
         time: usize,
+        frozen_filter: bool,
     ) -> Result<(
         crate::metal::ResidentActivationSlot,
         crate::metal::ResidentHyenaBlockCache,
@@ -858,15 +860,28 @@ impl HyenaBlock {
             &weights.input,
             Some(&cache),
         )?;
-        runtime.resident_hyena_mixer_trainable(
-            slot,
-            batch,
-            time,
-            self.d_model,
-            &weights.filter,
-            self.chunk_plan,
-            Some(&cache),
-        )?;
+        if frozen_filter {
+            runtime.resident_hyena_mixer_trainable_frozen(
+                slot,
+                batch,
+                time,
+                self.d_model,
+                &weights.filter,
+                self.chunk_plan,
+                Some(&cache),
+                &weights.frozen_filter_spectrum,
+            )?;
+        } else {
+            runtime.resident_hyena_mixer_trainable(
+                slot,
+                batch,
+                time,
+                self.d_model,
+                &weights.filter,
+                self.chunk_plan,
+                Some(&cache),
+            )?;
+        }
         let next = runtime.resident_output_projection_trainable(
             slot,
             rows,
@@ -1253,6 +1268,12 @@ impl UllisHyena {
                 )?,
                 filter: runtime
                     .upload_resident_implicit_filter_parameters(&block.filter, self.cfg.d_model)?,
+                frozen_filter_spectrum: runtime.upload_resident_filter_spectrum(
+                    &block.filter,
+                    self.cfg.d_model,
+                    self.cfg.context_len,
+                    block.chunk_plan,
+                )?,
             });
         }
         Ok(MetalResidentHyenaTrainingState {
@@ -1344,7 +1365,7 @@ impl UllisHyena {
         time: usize,
     ) -> Result<(Vec<f32>, Vec<crate::metal::ResidentHyenaBlockCache>)> {
         let (slot, caches) =
-            self.forward_metal_resident_training_cached(runtime, state, ids, batch, time)?;
+            self.forward_metal_resident_training_cached(runtime, state, ids, batch, time, false)?;
         let rows = batch
             .checked_mul(time)
             .ok_or_else(|| anyhow::anyhow!("token shape overflow"))?;
@@ -1362,6 +1383,7 @@ impl UllisHyena {
         ids: &[u32],
         batch: usize,
         time: usize,
+        frozen_filter: bool,
     ) -> Result<(
         crate::metal::ResidentActivationSlot,
         Vec<crate::metal::ResidentHyenaBlockCache>,
@@ -1397,8 +1419,14 @@ impl UllisHyena {
         let mut slot = runtime.upload_resident_activations(&embedding_stream, rows, d)?;
         let mut caches = Vec::with_capacity(self.blocks.len());
         for (block, weights) in self.blocks.iter().zip(&state.blocks) {
-            let (next, cache) = block
-                .forward_metal_resident_with_trainable_cache(runtime, slot, weights, batch, time)?;
+            let (next, cache) = block.forward_metal_resident_with_trainable_cache(
+                runtime,
+                slot,
+                weights,
+                batch,
+                time,
+                frozen_filter,
+            )?;
             slot = next;
             caches.push(cache);
         }
@@ -1609,8 +1637,14 @@ impl UllisHyena {
         let rows = batch
             .checked_mul(time)
             .ok_or_else(|| anyhow::anyhow!("Metal resident MTP rows overflow"))?;
-        let (hidden_slot, caches) =
-            self.forward_metal_resident_training_cached(runtime, state, ids, batch, time)?;
+        let (hidden_slot, caches) = self.forward_metal_resident_training_cached(
+            runtime,
+            state,
+            ids,
+            batch,
+            time,
+            !train_filters,
+        )?;
         let first_head = runtime.resident_ternary_head_forward_trainable(
             hidden_slot,
             rows,
