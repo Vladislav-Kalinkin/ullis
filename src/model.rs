@@ -759,11 +759,6 @@ impl HyenaBlock {
         batch: usize,
         time: usize,
     ) -> Result<crate::metal::ResidentActivationSlot> {
-        if self.chunk_plan.for_sequence(time)?.kernel_len != time {
-            bail!(
-                "resident Metal long-convolution reference does not yet implement the configured bounded Hyena receptive field"
-            );
-        }
         let rows = batch
             .checked_mul(time)
             .ok_or_else(|| anyhow::anyhow!("Metal Hyena block row overflow"))?;
@@ -804,11 +799,6 @@ impl HyenaBlock {
         crate::metal::ResidentActivationSlot,
         crate::metal::ResidentHyenaBlockCache,
     )> {
-        if self.chunk_plan.for_sequence(time)?.kernel_len != time {
-            bail!(
-                "resident Metal long-convolution reference does not yet implement the configured bounded Hyena receptive field"
-            );
-        }
         let rows = batch
             .checked_mul(time)
             .ok_or_else(|| anyhow::anyhow!("Metal Hyena block row overflow"))?;
@@ -857,11 +847,6 @@ impl HyenaBlock {
         crate::metal::ResidentActivationSlot,
         crate::metal::ResidentHyenaBlockCache,
     )> {
-        if self.chunk_plan.for_sequence(time)?.kernel_len != time {
-            bail!(
-                "resident Metal long-convolution reference does not yet implement the configured bounded Hyena receptive field"
-            );
-        }
         let rows = batch
             .checked_mul(time)
             .ok_or_else(|| anyhow::anyhow!("Metal Hyena block row overflow"))?;
@@ -1492,6 +1477,7 @@ impl UllisHyena {
                 block.chunk_plan,
                 learning_rate,
                 train_filters,
+                true,
             )?;
             gradient_slot = destination_slot;
             reverse_filter_gradients.push(backward.filter_gradient);
@@ -1538,9 +1524,6 @@ impl UllisHyena {
         if caches.len() != self.blocks.len() || !learning_rate.is_finite() || learning_rate <= 0.0 {
             bail!("Metal resident cached backward state/value mismatch");
         }
-        let rows = batch
-            .checked_mul(time)
-            .ok_or_else(|| anyhow::anyhow!("Metal stack backward row overflow"))?;
         let mut reverse_filter_gradients = Vec::with_capacity(self.blocks.len());
         for ((block, cache), weights) in self
             .blocks
@@ -1550,12 +1533,14 @@ impl UllisHyena {
             .rev()
         {
             let plan = block.chunk_plan.for_sequence(time)?;
-            let (freq, phase, decay) =
-                runtime.download_resident_implicit_filter_parameters(&weights.filter)?;
             let mut resident_filter = block.filter.clone();
-            resident_filter.freq = (0..freq.len()).map(|index| freq.get(index)).collect();
-            resident_filter.phase = (0..phase.len()).map(|index| phase.get(index)).collect();
-            resident_filter.decay = (0..decay.len()).map(|index| decay.get(index)).collect();
+            if train_filters {
+                let (freq, phase, decay) =
+                    runtime.download_resident_implicit_filter_parameters(&weights.filter)?;
+                resident_filter.freq = (0..freq.len()).map(|index| freq.get(index)).collect();
+                resident_filter.phase = (0..phase.len()).map(|index| phase.get(index)).collect();
+                resident_filter.decay = (0..decay.len()).map(|index| decay.get(index)).collect();
+            }
             let filter = resident_filter.generate(self.cfg.d_model, plan.kernel_len)?;
             let destination_slot = gradient_slot.other();
             let backward = runtime.hyena_block_backward_cached_and_update_resident(
@@ -1576,6 +1561,7 @@ impl UllisHyena {
                 block.chunk_plan,
                 learning_rate,
                 train_filters,
+                false,
             )?;
             gradient_slot = destination_slot;
             if train_filters {
@@ -1595,11 +1581,10 @@ impl UllisHyena {
         }
         reverse_filter_gradients.reverse();
         Ok(MetalResidentHyenaProjectionStep {
-            input_gradient: runtime.download_resident_gradient(
-                gradient_slot,
-                rows,
-                self.cfg.d_model,
-            )?,
+            // The complete training graph is resident and no caller consumes
+            // the stack-input gradient. Avoid an otherwise synchronous host
+            // copy; the public reference entry point retains that readback.
+            input_gradient: Vec::new(),
             filter_gradients: reverse_filter_gradients,
         })
     }
@@ -2925,6 +2910,7 @@ mod tests {
                 4,
                 block.chunk_plan,
                 learning_rate,
+                true,
                 true,
             )
             .unwrap();

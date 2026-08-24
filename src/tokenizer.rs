@@ -84,6 +84,12 @@ fn byte_bpe_model() -> String {
     "byte_bpe_v1".into()
 }
 
+#[derive(Clone, Debug, Default)]
+struct PieceTrieNode {
+    token_id: Option<u32>,
+    children: HashMap<u8, usize>,
+}
+
 #[derive(Clone, Debug)]
 pub struct BpeTokenizer {
     vocab_size: u32,
@@ -94,8 +100,7 @@ pub struct BpeTokenizer {
     pub unk_id: u32,
     pub merges: Vec<(u32, u32)>,
     id_to_bytes: Vec<Vec<u8>>,
-    piece_to_id: HashMap<Vec<u8>, u32>,
-    max_piece_len: usize,
+    piece_trie: Vec<PieceTrieNode>,
     encode_cache: HashMap<Vec<u8>, Vec<u32>>,
     encode_cache_bytes: usize,
 }
@@ -142,8 +147,7 @@ impl BpeTokenizer {
             unk_id: 3,
             merges,
             id_to_bytes: vec![Vec::new(); vocab_size as usize],
-            piece_to_id: HashMap::new(),
-            max_piece_len: 1,
+            piece_trie: vec![PieceTrieNode::default()],
             encode_cache: HashMap::new(),
             encode_cache_bytes: 0,
         };
@@ -161,19 +165,20 @@ impl BpeTokenizer {
     }
 
     fn rebuild(&mut self) {
-        self.piece_to_id.clear();
         self.encode_cache.clear();
         self.encode_cache_bytes = 0;
         self.id_to_bytes = vec![Vec::new(); self.vocab_size as usize];
-        self.max_piece_len = 1;
+        self.piece_trie.clear();
+        self.piece_trie.push(PieceTrieNode::default());
         for b in 0..=255u8 {
             let id = byte_id(b);
             let bytes = vec![b];
             self.id_to_bytes[id as usize] = bytes.clone();
-            self.piece_to_id.insert(bytes, id);
+            self.insert_piece(&bytes, id);
         }
         let mut next_id = BYTE_OFFSET + 256;
-        for &(left, right) in &self.merges {
+        for index in 0..self.merges.len() {
+            let (left, right) = self.merges[index];
             let lu = left as usize;
             let ru = right as usize;
             let mut bytes = self.id_to_bytes[lu].clone();
@@ -182,11 +187,27 @@ impl BpeTokenizer {
                 !bytes.is_empty(),
                 "validated merge inputs are defined pieces"
             );
-            self.piece_to_id.insert(bytes.clone(), next_id);
-            self.max_piece_len = self.max_piece_len.max(bytes.len());
+            self.insert_piece(&bytes, next_id);
             self.id_to_bytes[next_id as usize] = bytes;
             next_id += 1;
         }
+    }
+
+    fn insert_piece(&mut self, bytes: &[u8], token_id: u32) {
+        let mut node = 0;
+        for &byte in bytes {
+            let child = match self.piece_trie[node].children.get(&byte) {
+                Some(&child) => child,
+                None => {
+                    let child = self.piece_trie.len();
+                    self.piece_trie.push(PieceTrieNode::default());
+                    self.piece_trie[node].children.insert(byte, child);
+                    child
+                }
+            };
+            node = child;
+        }
+        self.piece_trie[node].token_id = Some(token_id);
     }
 
     /// Greedy longest-match WordPiece. Unknown bytes become `byte_id(b)`.
@@ -211,17 +232,23 @@ impl BpeTokenizer {
         let mut ids = Vec::with_capacity(data.len());
         let mut i = 0;
         while i < data.len() {
-            let max_l = self.max_piece_len.min(data.len() - i);
-            let mut matched = false;
-            for len in (1..=max_l).rev() {
-                if let Some(&id) = self.piece_to_id.get(&data[i..i + len]) {
-                    ids.push(id);
-                    i += len;
-                    matched = true;
+            let mut node = 0;
+            let mut matched = None;
+            for (offset, &byte) in data[i..].iter().enumerate() {
+                let Some(&child) = self.piece_trie[node].children.get(&byte) else {
                     break;
+                };
+                node = child;
+                if let Some(token_id) = self.piece_trie[node].token_id {
+                    matched = Some((token_id, offset + 1));
                 }
             }
-            if !matched {
+            if let Some((token_id, length)) = matched {
+                ids.push(token_id);
+                i += length;
+            } else {
+                // Every byte is inserted above, but keep this fallback so an
+                // invalid future vocabulary can never make encoding loop.
                 ids.push(byte_id(data[i]));
                 i += 1;
             }

@@ -288,10 +288,6 @@ fn train(
     if steps == 0 || checkpoint_every == 0 || !learning_rate.is_finite() || learning_rate <= 0.0 {
         bail!("steps, checkpoint-every, and learning-rate must be positive");
     }
-    let records = load_dataset(&data)?;
-    if records.is_empty() {
-        bail!("dataset has no records");
-    }
     let mut cfg = match config_path {
         Some(path) => {
             let source = fs::read_to_string(&path)?;
@@ -302,12 +298,25 @@ fn train(
         None => default_train_config(DEFAULT_VOCAB as usize),
     };
     apply_overrides(&mut cfg, &overrides)?;
+    eprintln!("reading and validating dataset {}…", data.display());
+    let ingest_started = Instant::now();
+    let records = load_dataset(&data)?;
+    if records.is_empty() {
+        bail!("dataset has no records");
+    }
     let training_texts = records.iter().map(training_text).collect::<Vec<_>>();
+    let json_seconds = ingest_started.elapsed().as_secs_f64();
+    let bpe_started = Instant::now();
     let mut tokenizer = train_bpe(&training_texts, cfg.vocab_size as u32, cfg.seed)?;
+    let bpe_seconds = bpe_started.elapsed().as_secs_f64();
+    let tokenize_started = Instant::now();
     let mut tokens = training_texts
         .iter()
         .flat_map(|text| tokenizer.encode(text, true, true))
         .collect::<Vec<_>>();
+    let tokenize_seconds = tokenize_started.elapsed().as_secs_f64();
+    drop(training_texts);
+    drop(records);
     cfg.vocab_size = tokenizer.vocab_size() as usize;
     // The CLI's actual updater is stateless SGD. Keep the persisted memory
     // ledger truthful even when an imported configuration chose Lion.
@@ -328,15 +337,26 @@ fn train(
     let planned_peak_mib =
         estimate.low_memory_training.peak().unwrap_or(usize::MAX) as f64 / 1024.0 / 1024.0;
     println!(
-        "train | backend {backend:?} | d {} | layers {} | context {} | batch {} | vocab {} | corpus {} tok | planned resident peak {planned_peak_mib:.1} MiB / {} MiB",
+        "train | backend {backend:?} | d {} | layers {} | context {} | kernel {} | chunk {} | batch {} | vocab {} | corpus {} tok | planned resident peak {planned_peak_mib:.1} MiB / {} MiB | ingest {json_seconds:.1}s | bpe {bpe_seconds:.1}s | tokenize {tokenize_seconds:.1}s",
         cfg.d_model,
         cfg.n_layers,
         cfg.context_len,
+        cfg.hyena_kernel_len,
+        cfg.hyena_chunk_len,
         cfg.batch_size,
         cfg.vocab_size,
         tokens.len(),
         cfg.memory_budget_bytes / (1024 * 1024),
     );
+    if cfg.hyena_kernel_len > cfg.hyena_chunk_len {
+        eprintln!(
+            "warning: kernel {} > chunk {}; this is valid overlap-save, but FFT length is {}. For faster 8k-context training, start with --hyena-kernel-len {}.",
+            cfg.hyena_kernel_len,
+            cfg.hyena_chunk_len,
+            (cfg.hyena_kernel_len + cfg.hyena_chunk_len - 1).next_power_of_two(),
+            cfg.hyena_chunk_len,
+        );
+    }
     let mut model = match resume {
         Some(path) => {
             let checkpoint: ModelCheckpoint = serde_json::from_slice(&fs::read(&path)?)
@@ -345,7 +365,26 @@ fn train(
             if model.cfg.vocab_size != tokenizer.vocab_size() as usize {
                 bail!("checkpoint vocabulary does not match tokenizer");
             }
+            let checkpoint_shape = (
+                model.cfg.d_model,
+                model.cfg.n_layers,
+                model.cfg.vocab_size,
+                model.cfg.filter_order,
+            );
+            apply_overrides(&mut model.cfg, &overrides)?;
+            if (
+                model.cfg.d_model,
+                model.cfg.n_layers,
+                model.cfg.vocab_size,
+                model.cfg.filter_order,
+            ) != checkpoint_shape
+            {
+                bail!(
+                    "--resume may change context, batch, Hyena kernel/chunk, memory budget, or seed; d-model, layers, vocab-size, and filter-order are checkpoint shapes"
+                );
+            }
             model.cfg.optimizer = OptimizerKind::StatelessSgd;
+            model.cfg.validate()?;
             cfg = model.cfg.clone();
             model
         }
@@ -449,6 +488,7 @@ fn train(
             let checkpoint = if let (Some(runtime), Some(state)) =
                 (metal_runtime.as_ref(), metal_state.as_ref())
             {
+                runtime.synchronize()?;
                 model.checkpoint_metal_resident(runtime, state)?
             } else {
                 model.checkpoint()

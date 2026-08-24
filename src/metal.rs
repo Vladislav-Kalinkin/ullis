@@ -1264,6 +1264,22 @@ impl TernaryBuffers {
 
 #[cfg(target_os = "macos")]
 impl MetalRuntime {
+    /// Establishes an explicit host-visible boundary after queued resident
+    /// work. Training uses this only before checkpoint readback.
+    pub fn synchronize(&self) -> Result<()> {
+        use objc2_metal::{MTLCommandBuffer, MTLCommandQueue};
+
+        let command = self.queue.commandBuffer().ok_or_else(|| {
+            anyhow::anyhow!("Metal synchronization command buffer allocation failed")
+        })?;
+        command.commit();
+        command.waitUntilCompleted();
+        if let Some(error) = command.error() {
+            bail!("Metal synchronization failed: {error}");
+        }
+        Ok(())
+    }
+
     /// Compiles the ternary pipeline once and creates its command queue.
     pub fn new() -> Result<Self> {
         use objc2_foundation::NSString;
@@ -1768,6 +1784,7 @@ impl MetalRuntime {
             plan,
             None,
             true,
+            true,
         )? {
             CachedBlockBackwardResult::Reference(result) => Ok(result),
             CachedBlockBackwardResult::Updated(_) => {
@@ -1800,6 +1817,7 @@ impl MetalRuntime {
         plan: HyenaChunkPlan,
         learning_rate: f32,
         compute_filter_gradient: bool,
+        readback: bool,
     ) -> Result<MetalHyenaBlockUpdatedBackward> {
         match self.hyena_block_backward_cached_impl(
             cache,
@@ -1821,6 +1839,7 @@ impl MetalRuntime {
                 learning_rate,
             }),
             compute_filter_gradient,
+            readback,
         )? {
             CachedBlockBackwardResult::Updated(result) => Ok(result),
             CachedBlockBackwardResult::Reference(_) => unreachable!("resident update requested"),
@@ -1845,6 +1864,7 @@ impl MetalRuntime {
         plan: HyenaChunkPlan,
         updates: Option<ResidentTernaryUpdates<'_>>,
         compute_filter_gradient: bool,
+        readback: bool,
     ) -> Result<CachedBlockBackwardResult> {
         use objc2_metal::{
             MTLBuffer, MTLCommandBuffer, MTLCommandEncoder, MTLCommandQueue,
@@ -2255,9 +2275,11 @@ impl MetalRuntime {
         )?;
         encoder.endEncoding();
         command.commit();
-        command.waitUntilCompleted();
-        if let Some(error) = command.error() {
-            bail!("Metal cached block backward first command failed: {error}");
+        if readback {
+            command.waitUntilCompleted();
+            if let Some(error) = command.error() {
+                bail!("Metal cached block backward first command failed: {error}");
+            }
         }
         let (input_positive_buffer, input_negative_buffer, input_scale_buffer) =
             if let Some(updates) = updates {
@@ -2363,9 +2385,11 @@ impl MetalRuntime {
         }
         encoder.endEncoding();
         command.commit();
-        command.waitUntilCompleted();
-        if let Some(error) = command.error() {
-            bail!("Metal cached block backward command failed: {error}");
+        if readback {
+            command.waitUntilCompleted();
+            if let Some(error) = command.error() {
+                bail!("Metal cached block backward command failed: {error}");
+            }
         }
         let read = |buffer: &objc2::runtime::ProtocolObject<dyn MTLBuffer>, len: usize| {
             let mut values = vec![0.0; len];
@@ -2376,8 +2400,12 @@ impl MetalRuntime {
             }
             values
         };
-        let input_gradient = read(resident_destination, elements);
-        let filter_gradient = if compute_filter_gradient {
+        let input_gradient = if readback {
+            read(resident_destination, elements)
+        } else {
+            Vec::new()
+        };
+        let filter_gradient = if readback && compute_filter_gradient {
             read(filter_gradient, filter_elements)
         } else {
             Vec::new()
@@ -2776,10 +2804,8 @@ impl MetalRuntime {
         )?;
         encoder.endEncoding();
         command.commit();
-        command.waitUntilCompleted();
-        if let Some(error) = command.error() {
-            bail!("Metal resident trainable output command failed: {error}");
-        }
+        // The training queue is in-order. Its next consumer establishes the
+        // completion boundary, so waiting here only serializes CPU submission.
         Ok(residual_slot.other())
     }
 
@@ -2831,10 +2857,8 @@ impl MetalRuntime {
         )?;
         encoder.endEncoding();
         command.commit();
-        command.waitUntilCompleted();
-        if let Some(error) = command.error() {
-            bail!("Metal resident MTP-head forward command failed: {error}");
-        }
+        // Streamed cross-entropy consumes this slot on the same in-order
+        // queue and waits before its scalar loss is read back.
         Ok(input_slot.other())
     }
 
@@ -3215,10 +3239,7 @@ impl MetalRuntime {
         }
         encoder.endEncoding();
         command.commit();
-        command.waitUntilCompleted();
-        if let Some(error) = command.error() {
-            bail!("Metal resident trainable input command failed: {error}");
-        }
+        // The following resident mixer is ordered after this submission.
         Ok(())
     }
 
@@ -3246,6 +3267,7 @@ impl MetalRuntime {
             ResidentImplicitFilterSource::Host(filter),
             plan,
             cache,
+            true,
         )
     }
 
@@ -3269,6 +3291,7 @@ impl MetalRuntime {
             ResidentImplicitFilterSource::Trainable(filter),
             plan,
             cache,
+            false,
         )
     }
 
@@ -3282,6 +3305,7 @@ impl MetalRuntime {
         filter_source: ResidentImplicitFilterSource<'_>,
         plan: HyenaChunkPlan,
         cache: Option<&ResidentHyenaBlockCache>,
+        wait_for_completion: bool,
     ) -> Result<()> {
         use objc2_metal::{
             MTLBuffer, MTLCommandBuffer, MTLCommandEncoder, MTLCommandQueue,
@@ -3656,9 +3680,11 @@ impl MetalRuntime {
         )?;
         encoder.endEncoding();
         command.commit();
-        command.waitUntilCompleted();
-        if let Some(error) = command.error() {
-            bail!("Metal resident Hyena mixer failed: {error}");
+        if wait_for_completion {
+            command.waitUntilCompleted();
+            if let Some(error) = command.error() {
+                bail!("Metal resident Hyena mixer failed: {error}");
+            }
         }
         Ok(())
     }
