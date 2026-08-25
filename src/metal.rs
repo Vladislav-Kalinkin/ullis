@@ -5272,7 +5272,6 @@ impl MetalRuntime {
             .ok_or_else(|| anyhow::anyhow!("Metal resident cross-entropy embedding overflow"))?;
         if rows == 0
             || channels == 0
-            || channels > 256
             || vocab == 0
             || horizon == 0
             || horizon >= time
@@ -5280,7 +5279,7 @@ impl MetalRuntime {
             || embedding.len != embedding_elements
             || tokens.iter().any(|&token| token as usize >= vocab)
         {
-            bail!("Metal tiled streamed cross-entropy requires valid shapes and d_model <= 256");
+            bail!("Metal resident cross-entropy requires valid shapes");
         }
         let activation_bytes = elements.checked_mul(size_of::<f32>()).ok_or_else(|| {
             anyhow::anyhow!("Metal resident cross-entropy activation size overflow")
