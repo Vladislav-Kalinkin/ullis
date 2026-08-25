@@ -54,6 +54,9 @@ pub const CLIPPED_SGD_FP16_KERNEL_NAME: &str = "ullis_clipped_sgd_fp16";
 pub const STREAMED_CROSS_ENTROPY_FP16_KERNEL_NAME: &str = "ullis_streamed_cross_entropy_fp16";
 pub const TIED_LOGITS_FP16_KERNEL_NAME: &str = "ullis_tied_logits_fp16";
 pub const CROSS_ENTROPY_LOGITS_FP16_KERNEL_NAME: &str = "ullis_cross_entropy_logits_fp16";
+pub const SOFTMAX_LOGITS_FP16_KERNEL_NAME: &str = "ullis_softmax_logits_fp16";
+pub const FINALIZE_CROSS_ENTROPY_GRADIENT_FP16_KERNEL_NAME: &str =
+    "ullis_finalize_cross_entropy_gradient_fp16";
 pub const TERNARY_ROW_SCALES_FP16_KERNEL_NAME: &str = "ullis_ternary_row_scales_fp16";
 pub const REFRESH_TERNARY_CODES_FP16_KERNEL_NAME: &str = "ullis_refresh_ternary_codes_fp16";
 pub const RMS_NORM_KERNEL_NAME: &str = "ullis_rms_norm";
@@ -70,6 +73,7 @@ pub const ADD_PROJECTION_SIGNAL_GRADIENT_KERNEL_NAME: &str = "ullis_add_projecti
 pub const RMS_NORM_TERNARY_LINEAR_KERNEL_NAME: &str = "ullis_rms_norm_ternary_linear";
 pub const FFT_BITREVERSE_KERNEL_NAME: &str = "ullis_fft_bitreverse";
 pub const FFT_STAGE_KERNEL_NAME: &str = "ullis_fft_stage";
+pub const FFT_THREADGROUP_4096_KERNEL_NAME: &str = "ullis_fft_threadgroup_4096";
 pub const FFT_COMPLEX_MULTIPLY_KERNEL_NAME: &str = "ullis_fft_complex_multiply";
 pub const PACK_REVERSE_GRADIENT_KERNEL_NAME: &str = "ullis_pack_reverse_gradient_to_complex";
 pub const PACK_FILTER_KERNEL_NAME: &str = "ullis_pack_filter_to_complex";
@@ -520,6 +524,12 @@ pub struct MetalRuntime {
     cross_entropy_logits_fp16_pipeline: objc2::rc::Retained<
         objc2::runtime::ProtocolObject<dyn objc2_metal::MTLComputePipelineState>,
     >,
+    softmax_logits_fp16_pipeline: objc2::rc::Retained<
+        objc2::runtime::ProtocolObject<dyn objc2_metal::MTLComputePipelineState>,
+    >,
+    finalize_cross_entropy_gradient_fp16_pipeline: objc2::rc::Retained<
+        objc2::runtime::ProtocolObject<dyn objc2_metal::MTLComputePipelineState>,
+    >,
     ternary_row_scales_fp16_pipeline: objc2::rc::Retained<
         objc2::runtime::ProtocolObject<dyn objc2_metal::MTLComputePipelineState>,
     >,
@@ -557,6 +567,9 @@ pub struct MetalRuntime {
         objc2::runtime::ProtocolObject<dyn objc2_metal::MTLComputePipelineState>,
     >,
     fft_stage_pipeline: objc2::rc::Retained<
+        objc2::runtime::ProtocolObject<dyn objc2_metal::MTLComputePipelineState>,
+    >,
+    fft_threadgroup_4096_pipeline: objc2::rc::Retained<
         objc2::runtime::ProtocolObject<dyn objc2_metal::MTLComputePipelineState>,
     >,
     fft_multiply_pipeline: objc2::rc::Retained<
@@ -694,6 +707,21 @@ pub struct ResidentFp16TernaryWeights {
 pub struct ResidentFp16Parameters {
     parameters: objc2::rc::Retained<objc2::runtime::ProtocolObject<dyn objc2_metal::MTLBuffer>>,
     len: usize,
+}
+
+/// FP32 view of the tied embedding plus an MPS GEMM plan for terminal logits.
+///
+/// The model master remains FP16. This immutable expansion exists solely so
+/// MPS can execute `[B*T,D] × [V,D]^T` with its optimized FP32 matrix path.
+/// It replaces a much slower hand-written logits kernel and carries no
+/// optimizer state.
+#[cfg(target_os = "macos")]
+pub struct ResidentMpsExpectedEmbedding {
+    embedding: objc2::rc::Retained<objc2::runtime::ProtocolObject<dyn objc2_metal::MTLBuffer>>,
+    rows: usize,
+    vocab: usize,
+    channels: usize,
+    multiplication: objc2::rc::Retained<objc2_metal_performance_shaders::MPSMatrixMultiplication>,
 }
 
 /// Exact streamed cross-entropy result at the explicit CPU graph boundary.
@@ -1360,6 +1388,21 @@ impl MetalRuntime {
             .map_err(|error| {
                 anyhow::anyhow!("Metal logits cross-entropy pipeline failed: {error}")
             })?;
+        let softmax_logits_name = NSString::from_str(SOFTMAX_LOGITS_FP16_KERNEL_NAME);
+        let softmax_logits_function = library
+            .newFunctionWithName(&softmax_logits_name)
+            .ok_or_else(|| anyhow::anyhow!("Metal softmax-logits function is missing"))?;
+        let softmax_logits_fp16_pipeline = device
+            .newComputePipelineStateWithFunction_error(&softmax_logits_function)
+            .map_err(|error| anyhow::anyhow!("Metal softmax-logits pipeline failed: {error}"))?;
+        let finalize_cross_entropy_gradient_name =
+            NSString::from_str(FINALIZE_CROSS_ENTROPY_GRADIENT_FP16_KERNEL_NAME);
+        let finalize_cross_entropy_gradient_function = library
+            .newFunctionWithName(&finalize_cross_entropy_gradient_name)
+            .ok_or_else(|| anyhow::anyhow!("Metal final CE-gradient function is missing"))?;
+        let finalize_cross_entropy_gradient_fp16_pipeline = device
+            .newComputePipelineStateWithFunction_error(&finalize_cross_entropy_gradient_function)
+            .map_err(|error| anyhow::anyhow!("Metal final CE-gradient pipeline failed: {error}"))?;
         let rms_name = NSString::from_str(RMS_NORM_KERNEL_NAME);
         let rms_function = library
             .newFunctionWithName(&rms_name)
@@ -1473,6 +1516,13 @@ impl MetalRuntime {
             .map_err(|error| {
                 anyhow::anyhow!("Metal FFT stage pipeline creation failed: {error}")
             })?;
+        let fft_threadgroup_name = NSString::from_str(FFT_THREADGROUP_4096_KERNEL_NAME);
+        let fft_threadgroup_function = library
+            .newFunctionWithName(&fft_threadgroup_name)
+            .ok_or_else(|| anyhow::anyhow!("Metal threadgroup FFT function is missing"))?;
+        let fft_threadgroup_4096_pipeline = device
+            .newComputePipelineStateWithFunction_error(&fft_threadgroup_function)
+            .map_err(|error| anyhow::anyhow!("Metal threadgroup FFT pipeline failed: {error}"))?;
         let multiply_name = NSString::from_str(FFT_COMPLEX_MULTIPLY_KERNEL_NAME);
         let multiply_function = library
             .newFunctionWithName(&multiply_name)
@@ -1564,6 +1614,8 @@ impl MetalRuntime {
             streamed_cross_entropy_fp16_pipeline,
             tied_logits_fp16_pipeline,
             cross_entropy_logits_fp16_pipeline,
+            softmax_logits_fp16_pipeline,
+            finalize_cross_entropy_gradient_fp16_pipeline,
             ternary_row_scales_fp16_pipeline,
             refresh_ternary_codes_fp16_pipeline,
             rms_norm_pipeline,
@@ -1579,6 +1631,7 @@ impl MetalRuntime {
             fused_rms_norm_ternary_pipeline,
             fft_bitreverse_pipeline,
             fft_stage_pipeline,
+            fft_threadgroup_4096_pipeline,
             fft_multiply_pipeline,
             pack_reverse_gradient_pipeline,
             pack_filter_pipeline,
@@ -2256,6 +2309,17 @@ impl MetalRuntime {
             self.encode_fft_two_buffer(encoder.as_ref(), pipeline, input, output, total, scalars)
         };
         let run_fft = |first, second, transform_count, total, inverse| -> Result<bool> {
+            if fft_plan.fft_len <= 4096 {
+                self.encode_fft_threadgroup_4096(
+                    encoder.as_ref(),
+                    first,
+                    second,
+                    fft_len_u32,
+                    transform_count,
+                    inverse,
+                )?;
+                return Ok(false);
+            }
             dispatch_two(
                 &self.fft_bitreverse_pipeline,
                 first,
@@ -3705,6 +3769,17 @@ impl MetalRuntime {
             self.encode_fft_two_buffer(encoder.as_ref(), pipeline, input, output, total, scalars)
         };
         let run_fft = |first, second, transform_count, total, inverse| -> Result<bool> {
+            if plan.fft_len <= 4096 {
+                self.encode_fft_threadgroup_4096(
+                    encoder.as_ref(),
+                    first,
+                    second,
+                    fft_len,
+                    transform_count,
+                    inverse,
+                )?;
+                return Ok(false);
+            }
             dispatch_two(
                 &self.fft_bitreverse_pipeline,
                 first,
@@ -3782,29 +3857,42 @@ impl MetalRuntime {
         } else {
             signal_second
         };
-        dispatch_two(
-            &self.fft_bitreverse_pipeline,
-            product,
-            inverse_bitreversed,
-            signal_elements,
-            &[fft_len, transforms_u32],
-        )?;
-        let mut inverse_source_is_first = inverse_bitreversed_is_first;
-        for stage in 1..=plan.stages {
-            let (source, destination) = if inverse_source_is_first {
-                (signal_first, signal_second)
-            } else {
-                (signal_second, signal_first)
-            };
-            dispatch_two(
-                &self.fft_stage_pipeline,
-                source,
-                destination,
-                signal_elements,
-                &[fft_len, transforms_u32, stage, 1],
+        let inverse_source_is_first = if plan.fft_len <= 4096 {
+            self.encode_fft_threadgroup_4096(
+                encoder.as_ref(),
+                product,
+                inverse_bitreversed,
+                fft_len,
+                transforms_u32,
+                true,
             )?;
-            inverse_source_is_first = !inverse_source_is_first;
-        }
+            inverse_bitreversed_is_first
+        } else {
+            dispatch_two(
+                &self.fft_bitreverse_pipeline,
+                product,
+                inverse_bitreversed,
+                signal_elements,
+                &[fft_len, transforms_u32],
+            )?;
+            let mut source_is_first = inverse_bitreversed_is_first;
+            for stage in 1..=plan.stages {
+                let (source, destination) = if source_is_first {
+                    (signal_first, signal_second)
+                } else {
+                    (signal_second, signal_first)
+                };
+                dispatch_two(
+                    &self.fft_stage_pipeline,
+                    source,
+                    destination,
+                    signal_elements,
+                    &[fft_len, transforms_u32, stage, 1],
+                )?;
+                source_is_first = !source_is_first;
+            }
+            source_is_first
+        };
         let inverse = if inverse_source_is_first {
             signal_first
         } else {
@@ -4849,6 +4937,59 @@ impl MetalRuntime {
         })
     }
 
+    /// Creates the immutable FP32 embedding view used by the MPS expected-value GEMM.
+    #[allow(unsafe_code)]
+    pub fn upload_resident_mps_expected_embedding(
+        &self,
+        embedding: &crate::precision::Fp16Storage,
+        rows: usize,
+        vocab: usize,
+        channels: usize,
+    ) -> Result<ResidentMpsExpectedEmbedding> {
+        use objc2::AnyThread;
+        use objc2_metal::{MTLBuffer, MTLDevice, MTLResourceOptions};
+        use objc2_metal_performance_shaders::MPSMatrixMultiplication;
+
+        let elements = vocab
+            .checked_mul(channels)
+            .ok_or_else(|| anyhow::anyhow!("MPS tied embedding shape overflow"))?;
+        if rows == 0
+            || vocab == 0
+            || channels == 0
+            || embedding.len() != elements
+            || (0..embedding.len()).any(|index| !embedding.get(index).is_finite())
+        {
+            bail!("MPS tied embedding shape/value mismatch");
+        }
+        let bytes = elements
+            .checked_mul(size_of::<f32>())
+            .ok_or_else(|| anyhow::anyhow!("MPS tied embedding size overflow"))?;
+        let buffer = self
+            .device
+            .newBufferWithLength_options(bytes, MTLResourceOptions::StorageModeShared)
+            .ok_or_else(|| anyhow::anyhow!("MPS tied embedding allocation failed"))?;
+        // SAFETY: the allocation has exactly `elements` FP32 slots.
+        unsafe {
+            let destination = buffer.contents().cast::<f32>().as_ptr();
+            for index in 0..elements {
+                destination.add(index).write(embedding.get(index));
+            }
+        }
+        let multiplication = unsafe {
+            MPSMatrixMultiplication::initWithDevice_transposeLeft_transposeRight_resultRows_resultColumns_interiorColumns_alpha_beta(
+                MPSMatrixMultiplication::alloc(),
+                self.device.as_ref(), false, false, rows, channels, vocab, 1.0, 0.0,
+            )
+        };
+        Ok(ResidentMpsExpectedEmbedding {
+            embedding: buffer,
+            rows,
+            vocab,
+            channels,
+            multiplication,
+        })
+    }
+
     /// Applies clipped stateless SGD to FP16 master parameters on Metal.
     /// Gradients are temporary FP32 values in a grow-only shared workspace;
     /// no momentum or variance allocation is created.
@@ -5105,6 +5246,7 @@ impl MetalRuntime {
         &self,
         head_slot: ResidentActivationSlot,
         embedding: &ResidentFp16Parameters,
+        mps_expected_embedding: Option<&ResidentMpsExpectedEmbedding>,
         tokens: &[u32],
         batch: usize,
         time: usize,
@@ -5201,6 +5343,11 @@ impl MetalRuntime {
                 "Metal resident streamed cross-entropy command buffer allocation failed"
             )
         })?;
+        if let Some(mps) = mps_expected_embedding
+            && (mps.rows != rows || mps.vocab != vocab || mps.channels != channels)
+        {
+            bail!("MPS expected-embedding plan does not match resident cross-entropy shape");
+        }
         let encoder = command.computeCommandEncoder().ok_or_else(|| {
             anyhow::anyhow!("Metal resident streamed cross-entropy encoder allocation failed")
         })?;
@@ -5230,6 +5377,150 @@ impl MetalRuntime {
             },
         );
         encoder.endEncoding();
+        if let Some(mps) = mps_expected_embedding {
+            use objc2::AnyThread;
+            use objc2_metal_performance_shaders::{MPSDataType, MPSMatrix, MPSMatrixDescriptor};
+
+            let encoder = command.computeCommandEncoder().ok_or_else(|| {
+                anyhow::anyhow!("Metal resident softmax encoder allocation failed")
+            })?;
+            encoder.setComputePipelineState(&self.softmax_logits_fp16_pipeline);
+            unsafe {
+                encoder.setBuffer_offset_atIndex(Some(logits_buffer), 0, 0);
+                encoder.setBuffer_offset_atIndex(Some(tokens_buffer), 0, 1);
+                encoder.setBuffer_offset_atIndex(Some(loss_buffer), 0, 2);
+                for (slot, scalar) in [scalars[0], scalars[1], scalars[3], scalars[4]]
+                    .iter()
+                    .enumerate()
+                {
+                    encoder.setBytes_length_atIndex(
+                        NonNull::from(scalar).cast::<c_void>(),
+                        size_of::<u32>(),
+                        slot + 3,
+                    );
+                }
+            }
+            encoder.dispatchThreadgroups_threadsPerThreadgroup(
+                MTLSize {
+                    width: rows,
+                    height: 1,
+                    depth: 1,
+                },
+                MTLSize {
+                    width: 16,
+                    height: 1,
+                    depth: 1,
+                },
+            );
+            encoder.endEncoding();
+            let probability_descriptor = unsafe {
+                MPSMatrixDescriptor::matrixDescriptorWithRows_columns_rowBytes_dataType(
+                    rows,
+                    vocab,
+                    vocab * size_of::<f32>(),
+                    MPSDataType::Float32,
+                )
+            };
+            let embedding_descriptor = unsafe {
+                MPSMatrixDescriptor::matrixDescriptorWithRows_columns_rowBytes_dataType(
+                    vocab,
+                    channels,
+                    channels * size_of::<f32>(),
+                    MPSDataType::Float32,
+                )
+            };
+            let gradient_descriptor = unsafe {
+                MPSMatrixDescriptor::matrixDescriptorWithRows_columns_rowBytes_dataType(
+                    rows,
+                    channels,
+                    channels * size_of::<f32>(),
+                    MPSDataType::Float32,
+                )
+            };
+            let probability_matrix = unsafe {
+                MPSMatrix::initWithBuffer_descriptor(
+                    MPSMatrix::alloc(),
+                    logits_buffer,
+                    &probability_descriptor,
+                )
+            };
+            let embedding_matrix = unsafe {
+                MPSMatrix::initWithBuffer_descriptor(
+                    MPSMatrix::alloc(),
+                    mps.embedding.as_ref(),
+                    &embedding_descriptor,
+                )
+            };
+            let gradient_matrix = unsafe {
+                MPSMatrix::initWithBuffer_descriptor(
+                    MPSMatrix::alloc(),
+                    gradient,
+                    &gradient_descriptor,
+                )
+            };
+            unsafe {
+                mps.multiplication
+                    .encodeToCommandBuffer_leftMatrix_rightMatrix_resultMatrix(
+                        command.as_ref(),
+                        &probability_matrix,
+                        &embedding_matrix,
+                        &gradient_matrix,
+                    );
+            }
+            let encoder = command.computeCommandEncoder().ok_or_else(|| {
+                anyhow::anyhow!("Metal resident final CE-gradient encoder allocation failed")
+            })?;
+            encoder.setComputePipelineState(&self.finalize_cross_entropy_gradient_fp16_pipeline);
+            unsafe {
+                encoder.setBuffer_offset_atIndex(Some(gradient), 0, 0);
+                encoder.setBuffer_offset_atIndex(Some(embedding.parameters.as_ref()), 0, 1);
+                encoder.setBuffer_offset_atIndex(Some(tokens_buffer), 0, 2);
+                for (slot, scalar) in [scalars[0], scalars[1], scalars[2], scalars[4]]
+                    .iter()
+                    .enumerate()
+                {
+                    encoder.setBytes_length_atIndex(
+                        NonNull::from(scalar).cast::<c_void>(),
+                        size_of::<u32>(),
+                        slot + 3,
+                    );
+                }
+                encoder.setBytes_length_atIndex(
+                    NonNull::from(&gradient_scale).cast::<c_void>(),
+                    size_of::<f32>(),
+                    7,
+                );
+            }
+            encoder.dispatchThreads_threadsPerThreadgroup(
+                MTLSize {
+                    width: elements,
+                    height: 1,
+                    depth: 1,
+                },
+                MTLSize {
+                    width: 256,
+                    height: 1,
+                    depth: 1,
+                },
+            );
+            encoder.endEncoding();
+            command.commit();
+            command.waitUntilCompleted();
+            if let Some(error) = command.error() {
+                bail!("Metal resident MPS cross-entropy command failed: {error}");
+            }
+            let mut losses = vec![0.0; rows];
+            unsafe {
+                losses
+                    .as_mut_ptr()
+                    .copy_from_nonoverlapping(loss_buffer.contents().cast::<f32>().as_ptr(), rows);
+            }
+            return Ok(MetalResidentCrossEntropy {
+                loss_sum: losses.into_iter().sum(),
+                token_count: batch * (time - horizon),
+                gradient_slot: ResidentGradientSlot::First,
+            });
+        }
         let encoder = command.computeCommandEncoder().ok_or_else(|| {
             anyhow::anyhow!("Metal resident logits cross-entropy encoder allocation failed")
         })?;
@@ -5318,21 +5609,27 @@ impl MetalRuntime {
         channels: usize,
         time: usize,
         plan: HyenaChunkPlan,
+        full_sequence_fft: bool,
     ) -> Result<ResidentFilterSpectrum> {
         use objc2_metal::{MTLBuffer, MTLDevice, MTLResourceOptions};
 
         let plan = plan.for_sequence(time)?;
+        let fft_len = if full_sequence_fft {
+            HyenaFftPlan::new(time)?.fft_len
+        } else {
+            plan.fft_len
+        };
         let values = filter.generate(channels, plan.kernel_len)?;
         let elements = channels
-            .checked_mul(plan.fft_len)
+            .checked_mul(fft_len)
             .ok_or_else(|| anyhow::anyhow!("Metal resident filter spectrum overflow"))?;
         let bytes = elements
             .checked_mul(size_of::<Complex32>())
             .ok_or_else(|| anyhow::anyhow!("Metal resident filter spectrum bytes overflow"))?;
         let mut spectrum = vec![Complex32::default(); elements];
         for channel in 0..channels {
-            let start = channel * plan.fft_len;
-            let mut fft_values = spectrum[start..start + plan.fft_len]
+            let start = channel * fft_len;
+            let mut fft_values = spectrum[start..start + fft_len]
                 .iter()
                 .map(|value| (value.real, value.imaginary))
                 .collect::<Vec<_>>();
@@ -5343,9 +5640,8 @@ impl MetalRuntime {
                 destination.0 = value;
             }
             crate::hyena::fft(&mut fft_values, false);
-            for (destination, (real, imaginary)) in spectrum[start..start + plan.fft_len]
-                .iter_mut()
-                .zip(fft_values)
+            for (destination, (real, imaginary)) in
+                spectrum[start..start + fft_len].iter_mut().zip(fft_values)
             {
                 *destination = Complex32 { real, imaginary };
             }
@@ -5366,7 +5662,7 @@ impl MetalRuntime {
             channels,
             time,
             kernel_len: plan.kernel_len,
-            fft_len: plan.fft_len,
+            fft_len,
         })
     }
 
@@ -6738,6 +7034,51 @@ impl MetalRuntime {
             },
             MTLSize {
                 width,
+                height: 1,
+                depth: 1,
+            },
+        );
+        Ok(())
+    }
+
+    #[allow(unsafe_code)]
+    fn encode_fft_threadgroup_4096(
+        &self,
+        encoder: &objc2::runtime::ProtocolObject<dyn objc2_metal::MTLComputeCommandEncoder>,
+        input: &objc2::runtime::ProtocolObject<dyn objc2_metal::MTLBuffer>,
+        output: &objc2::runtime::ProtocolObject<dyn objc2_metal::MTLBuffer>,
+        fft_len: u32,
+        transforms: u32,
+        inverse: bool,
+    ) -> Result<()> {
+        use core::ffi::c_void;
+        use core::ptr::NonNull;
+        use objc2_metal::{MTLComputeCommandEncoder, MTLSize};
+
+        if fft_len > 4096 || transforms == 0 {
+            bail!("threadgroup FFT requires 1..=4096-point transforms");
+        }
+        encoder.setComputePipelineState(&self.fft_threadgroup_4096_pipeline);
+        let inverse = u32::from(inverse);
+        unsafe {
+            encoder.setBuffer_offset_atIndex(Some(input), 0, 0);
+            encoder.setBuffer_offset_atIndex(Some(output), 0, 1);
+            for (slot, scalar) in [fft_len, transforms, inverse].iter().enumerate() {
+                encoder.setBytes_length_atIndex(
+                    NonNull::from(scalar).cast::<c_void>(),
+                    size_of::<u32>(),
+                    slot + 2,
+                );
+            }
+        }
+        encoder.dispatchThreadgroups_threadsPerThreadgroup(
+            MTLSize {
+                width: transforms as usize,
+                height: 1,
+                depth: 1,
+            },
+            MTLSize {
+                width: 256,
                 height: 1,
                 depth: 1,
             },

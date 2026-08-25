@@ -46,6 +46,9 @@ enum Command {
         /// CPU is a diagnostic fallback. Metal is the normal Ullis trainer.
         #[arg(long, value_enum, default_value_t = Backend::Metal)]
         backend: Backend,
+        /// In-memory corpus budget for training BPE, in MiB. Set 0 for the full corpus.
+        #[arg(long, default_value_t = 16)]
+        bpe_train_mib: usize,
     },
     Tokenize {
         #[arg(long)]
@@ -223,6 +226,24 @@ fn training_text(record: &DatasetRecord) -> String {
         .join("\n")
 }
 
+/// Selects evenly distributed complete records for BPE training in memory.
+/// Encoding still always uses the full just-validated corpus; this only bounds
+/// the expensive merge-discovery phase and never persists derived data.
+fn representative_bpe_texts(texts: &[String], byte_budget: usize) -> Vec<String> {
+    let total_bytes = texts.iter().map(String::len).sum::<usize>();
+    if byte_budget == 0 || total_bytes <= byte_budget {
+        return texts.to_vec();
+    }
+    let sample_count = texts
+        .len()
+        .saturating_mul(byte_budget)
+        .div_ceil(total_bytes)
+        .clamp(1, texts.len());
+    (0..sample_count)
+        .map(|slot| texts[slot * texts.len() / sample_count].clone())
+        .collect()
+}
+
 fn default_train_config(vocab_size: usize) -> TrainConfig {
     TrainConfig {
         d_model: 256,
@@ -284,6 +305,7 @@ fn train(
     checkpoint_every: usize,
     train_filters: bool,
     backend: Backend,
+    bpe_train_mib: usize,
 ) -> Result<()> {
     if steps == 0 || checkpoint_every == 0 || !learning_rate.is_finite() || learning_rate <= 0.0 {
         bail!("steps, checkpoint-every, and learning-rate must be positive");
@@ -307,7 +329,12 @@ fn train(
     let training_texts = records.iter().map(training_text).collect::<Vec<_>>();
     let json_seconds = ingest_started.elapsed().as_secs_f64();
     let bpe_started = Instant::now();
-    let mut tokenizer = train_bpe(&training_texts, cfg.vocab_size as u32, cfg.seed)?;
+    let bpe_train_bytes = bpe_train_mib
+        .checked_mul(1024 * 1024)
+        .ok_or_else(|| anyhow::anyhow!("bpe-train-mib overflows bytes"))?;
+    let bpe_texts = representative_bpe_texts(&training_texts, bpe_train_bytes);
+    let bpe_sample_bytes = bpe_texts.iter().map(String::len).sum::<usize>();
+    let mut tokenizer = train_bpe(&bpe_texts, cfg.vocab_size as u32, cfg.seed)?;
     let bpe_seconds = bpe_started.elapsed().as_secs_f64();
     let tokenize_started = Instant::now();
     let mut tokens = training_texts
@@ -353,6 +380,22 @@ fn train(
             .ok_or_else(|| anyhow::anyhow!("frozen filter spectrum memory estimate overflows"))?
     };
     let frozen_filter_spectrum_mib = frozen_filter_spectrum_bytes as f64 / 1024.0 / 1024.0;
+    let frozen_backward_spectrum_bytes = if train_filters || cfg.context_len <= cfg.hyena_chunk_len
+    {
+        0
+    } else {
+        let fft_len = cfg
+            .context_len
+            .checked_mul(2)
+            .and_then(usize::checked_next_power_of_two)
+            .ok_or_else(|| anyhow::anyhow!("frozen backward spectrum FFT length overflows"))?;
+        cfg.n_layers
+            .checked_mul(cfg.d_model)
+            .and_then(|value| value.checked_mul(fft_len))
+            .and_then(|value| value.checked_mul(2 * size_of::<f32>()))
+            .ok_or_else(|| anyhow::anyhow!("frozen backward spectrum memory estimate overflows"))?
+    };
+    let frozen_backward_spectrum_mib = frozen_backward_spectrum_bytes as f64 / 1024.0 / 1024.0;
     let ce_logits_bytes = cfg
         .context_len
         .checked_mul(cfg.batch_size)
@@ -360,8 +403,14 @@ fn train(
         .and_then(|value| value.checked_mul(size_of::<f32>()))
         .ok_or_else(|| anyhow::anyhow!("cross-entropy logits memory estimate overflows"))?;
     let ce_logits_mib = ce_logits_bytes as f64 / 1024.0 / 1024.0;
+    let mps_embedding_bytes = cfg
+        .vocab_size
+        .checked_mul(cfg.d_model)
+        .and_then(|value| value.checked_mul(size_of::<f32>()))
+        .ok_or_else(|| anyhow::anyhow!("MPS tied-embedding memory estimate overflows"))?;
+    let mps_embedding_mib = mps_embedding_bytes as f64 / 1024.0 / 1024.0;
     println!(
-        "train | backend {backend:?} | d {} | layers {} | context {} | kernel {} | chunk {} | batch {} | vocab {} | corpus {} tok | planned resident peak {:.1} MiB (base {planned_peak_mib:.1} + frozen-filter FFT {frozen_filter_spectrum_mib:.1} + CE logits {ce_logits_mib:.1}) / {} MiB | ingest {json_seconds:.1}s | bpe {bpe_seconds:.1}s | tokenize {tokenize_seconds:.1}s",
+        "train | backend {backend:?} | d {} | layers {} | context {} | kernel {} | chunk {} | batch {} | vocab {} | corpus {} tok | planned resident peak {:.1} MiB (base {planned_peak_mib:.1} + frozen-filter FFT {frozen_filter_spectrum_mib:.1} + backward FFT {frozen_backward_spectrum_mib:.1} + CE logits {ce_logits_mib:.1} + MPS embedding {mps_embedding_mib:.1}) / {} MiB | ingest {json_seconds:.1}s | bpe {bpe_seconds:.1}s ({:.1} MiB sample) | tokenize {tokenize_seconds:.1}s",
         cfg.d_model,
         cfg.n_layers,
         cfg.context_len,
@@ -370,8 +419,13 @@ fn train(
         cfg.batch_size,
         cfg.vocab_size,
         tokens.len(),
-        planned_peak_mib + frozen_filter_spectrum_mib + ce_logits_mib,
+        planned_peak_mib
+            + frozen_filter_spectrum_mib
+            + frozen_backward_spectrum_mib
+            + ce_logits_mib
+            + mps_embedding_mib,
         cfg.memory_budget_bytes / (1024 * 1024),
+        bpe_sample_bytes as f64 / 1024.0 / 1024.0,
     );
     if cfg.hyena_kernel_len > cfg.hyena_chunk_len {
         eprintln!(
@@ -660,6 +714,7 @@ fn main() -> Result<()> {
             checkpoint_every,
             train_filters,
             backend,
+            bpe_train_mib,
         }) => train(
             data,
             run,
@@ -671,6 +726,7 @@ fn main() -> Result<()> {
             checkpoint_every,
             train_filters,
             backend,
+            bpe_train_mib,
         ),
         Some(Command::Tokenize { data, output }) => {
             let records = load_dataset(&data)?;

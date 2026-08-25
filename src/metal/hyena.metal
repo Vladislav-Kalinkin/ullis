@@ -225,6 +225,77 @@ kernel void ullis_cross_entropy_logits_fp16(
     }
 }
 
+// MPS-backed resident CE path: reduce each row and overwrite logits with its
+// normalized probabilities. The following MPS GEMM computes P × E, avoiding
+// the former scalar D-wide expectation loop in every vocabulary lane.
+kernel void ullis_softmax_logits_fp16(
+    device float *logits [[buffer(0)]],
+    device const uint *tokens [[buffer(1)]],
+    device float *row_loss [[buffer(2)]],
+    constant uint &rows [[buffer(3)]],
+    constant uint &time [[buffer(4)]],
+    constant uint &vocab [[buffer(5)]],
+    constant uint &horizon [[buffer(6)]],
+    uint lane [[thread_index_in_threadgroup]],
+    uint row [[threadgroup_position_in_grid]]) {
+    threadgroup float reduction[ULLIS_CE_LANES];
+    if (row >= rows) return;
+    const uint position = row % time;
+    device float *row_logits = logits + row * vocab;
+    if (position + horizon >= time) {
+        for (uint token = lane; token < vocab; token += ULLIS_CE_LANES) row_logits[token] = 0.0f;
+        if (lane == 0) row_loss[row] = 0.0f;
+        return;
+    }
+    const uint target = tokens[row + horizon];
+    float maximum = -INFINITY;
+    float target_logit = -INFINITY;
+    for (uint token = lane; token < vocab; token += ULLIS_CE_LANES) {
+        const float logit = row_logits[token];
+        maximum = max(maximum, logit);
+        if (token == target) target_logit = logit;
+    }
+    reduction[lane] = maximum;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint stride = ULLIS_CE_LANES / 2u; stride > 0u; stride /= 2u) { if (lane < stride) reduction[lane] = max(reduction[lane], reduction[lane + stride]); threadgroup_barrier(mem_flags::mem_threadgroup); }
+    maximum = reduction[0];
+    reduction[lane] = target_logit;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint stride = ULLIS_CE_LANES / 2u; stride > 0u; stride /= 2u) { if (lane < stride) reduction[lane] = max(reduction[lane], reduction[lane + stride]); threadgroup_barrier(mem_flags::mem_threadgroup); }
+    target_logit = reduction[0];
+    float exp_sum = 0.0f;
+    for (uint token = lane; token < vocab; token += ULLIS_CE_LANES) {
+        const float probability = exp(row_logits[token] - maximum);
+        row_logits[token] = probability;
+        exp_sum += probability;
+    }
+    reduction[lane] = exp_sum;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint stride = ULLIS_CE_LANES / 2u; stride > 0u; stride /= 2u) { if (lane < stride) reduction[lane] += reduction[lane + stride]; threadgroup_barrier(mem_flags::mem_threadgroup); }
+    exp_sum = reduction[0];
+    for (uint token = lane; token < vocab; token += ULLIS_CE_LANES) row_logits[token] /= exp_sum;
+    if (lane == 0) row_loss[row] = maximum + log(exp_sum) - target_logit;
+}
+
+kernel void ullis_finalize_cross_entropy_gradient_fp16(
+    device float *expected_embedding [[buffer(0)]],
+    device const half *embedding [[buffer(1)]],
+    device const uint *tokens [[buffer(2)]],
+    constant uint &rows [[buffer(3)]],
+    constant uint &time [[buffer(4)]],
+    constant uint &channels [[buffer(5)]],
+    constant uint &horizon [[buffer(6)]],
+    constant float &gradient_scale [[buffer(7)]],
+    uint index [[thread_position_in_grid]]) {
+    const uint elements = rows * channels;
+    if (index >= elements) return;
+    const uint row = index / channels;
+    if (row % time + horizon >= time) { expected_embedding[index] = 0.0f; return; }
+    const uint target = tokens[row + horizon];
+    const uint channel = index % channels;
+    expected_embedding[index] = gradient_scale * (expected_embedding[index] - float(embedding[target * channels + channel]));
+}
+
 // Rebuild the per-output ternary scale after an FP16 master update. A single
 // thread owns a row so there are no reductions through global memory.
 kernel void ullis_ternary_row_scales_fp16(
@@ -642,6 +713,50 @@ kernel void ullis_fft_stage(
         odd_source.x * twiddle.x - odd_source.y * twiddle.y,
         odd_source.x * twiddle.y + odd_source.y * twiddle.x);
     output[index] = position < half_width ? even + odd : even - odd;
+}
+
+// Fast small-FFT path for the common 2k-context overlap-save plan
+// (`fft_len == 4096`). One workgroup owns a complete transform, avoiding the
+// 13 global-memory kernel passes used by the scalable fallback above.
+kernel void ullis_fft_threadgroup_4096(
+    device const float2 *input [[buffer(0)]],
+    device float2 *output [[buffer(1)]],
+    constant uint &fft_len [[buffer(2)]],
+    constant uint &transforms [[buffer(3)]],
+    constant uint &inverse [[buffer(4)]],
+    uint lane [[thread_index_in_threadgroup]],
+    uint transform [[threadgroup_position_in_grid]]) {
+    if (transform >= transforms || fft_len > 4096u) return;
+    threadgroup float2 values[4096];
+    for (uint index = lane; index < fft_len; index += 256u) {
+        uint source = index;
+        uint reversed = 0u;
+        for (uint remaining = fft_len; remaining > 1u; remaining >>= 1u) {
+            reversed = (reversed << 1u) | (source & 1u);
+            source >>= 1u;
+        }
+        values[index] = input[transform * fft_len + reversed];
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    const float sign = inverse != 0u ? 1.0f : -1.0f;
+    for (uint width = 2u; width <= fft_len; width <<= 1u) {
+        const uint half_width = width >> 1u;
+        for (uint butterfly = lane; butterfly < fft_len / 2u; butterfly += 256u) {
+            const uint group = butterfly / half_width;
+            const uint offset = butterfly - group * half_width;
+            const uint even_index = group * width + offset;
+            const uint odd_index = even_index + half_width;
+            const float angle = sign * 6.28318530718f * float(offset) / float(width);
+            const float2 twiddle = float2(cos(angle), sin(angle));
+            const float2 even = values[even_index];
+            const float2 source = values[odd_index];
+            const float2 odd = float2(source.x * twiddle.x - source.y * twiddle.y, source.x * twiddle.y + source.y * twiddle.x);
+            values[even_index] = even + odd;
+            values[odd_index] = even - odd;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    for (uint index = lane; index < fft_len; index += 256u) output[transform * fft_len + index] = values[index];
 }
 
 kernel void ullis_fft_complex_multiply(

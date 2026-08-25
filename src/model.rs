@@ -100,6 +100,7 @@ pub struct MetalResidentHyenaTrainingState {
     mtp_one: crate::metal::ResidentTrainableFp16TernaryWeights,
     mtp_two: crate::metal::ResidentTrainableFp16TernaryWeights,
     embedding: crate::metal::ResidentFp16Parameters,
+    mps_expected_embedding: crate::metal::ResidentMpsExpectedEmbedding,
 }
 
 #[cfg(target_os = "macos")]
@@ -108,6 +109,7 @@ struct MetalResidentHyenaBlockWeights {
     output: crate::metal::ResidentTrainableFp16TernaryWeights,
     filter: crate::metal::ResidentImplicitFilterParameters,
     frozen_filter_spectrum: crate::metal::ResidentFilterSpectrum,
+    frozen_backward_filter_spectrum: Option<crate::metal::ResidentFilterSpectrum>,
 }
 
 /// Readbacks from a projection-only resident training step. Projection
@@ -1275,7 +1277,20 @@ impl UllisHyena {
                     self.cfg.d_model,
                     self.cfg.context_len,
                     block.chunk_plan,
+                    false,
                 )?,
+                frozen_backward_filter_spectrum: (self.cfg.context_len
+                    > block.chunk_plan.chunk_len)
+                    .then(|| {
+                        runtime.upload_resident_filter_spectrum(
+                            &block.filter,
+                            self.cfg.d_model,
+                            self.cfg.context_len,
+                            block.chunk_plan,
+                            true,
+                        )
+                    })
+                    .transpose()?,
             });
         }
         Ok(MetalResidentHyenaTrainingState {
@@ -1293,6 +1308,12 @@ impl UllisHyena {
                 self.mtp_two.threshold_ratio,
             )?,
             embedding: runtime.upload_resident_fp16_parameters(&self.embedding)?,
+            mps_expected_embedding: runtime.upload_resident_mps_expected_embedding(
+                &self.embedding,
+                self.cfg.batch_size * self.cfg.context_len,
+                self.cfg.vocab_size,
+                self.cfg.d_model,
+            )?,
         })
     }
 
@@ -1366,7 +1387,7 @@ impl UllisHyena {
         batch: usize,
         time: usize,
     ) -> Result<(Vec<f32>, Vec<crate::metal::ResidentHyenaBlockCache>)> {
-        let (slot, caches) =
+        let (slot, caches, _) =
             self.forward_metal_resident_training_cached(runtime, state, ids, batch, time, false)?;
         let rows = batch
             .checked_mul(time)
@@ -1389,6 +1410,7 @@ impl UllisHyena {
     ) -> Result<(
         crate::metal::ResidentActivationSlot,
         Vec<crate::metal::ResidentHyenaBlockCache>,
+        [f64; 3],
     )> {
         let rows = batch
             .checked_mul(time)
@@ -1420,7 +1442,9 @@ impl UllisHyena {
         }
         let mut slot = runtime.upload_resident_activations(&embedding_stream, rows, d)?;
         let mut caches = Vec::with_capacity(self.blocks.len());
+        let mut phase_millis = [0.0; 3];
         for (block, weights) in self.blocks.iter().zip(&state.blocks) {
+            let block_started = Instant::now();
             let (next, cache) = block.forward_metal_resident_with_trainable_cache(
                 runtime,
                 slot,
@@ -1429,10 +1453,11 @@ impl UllisHyena {
                 time,
                 frozen_filter,
             )?;
+            phase_millis[1] += block_started.elapsed().as_secs_f64() * 1_000.0;
             slot = next;
             caches.push(cache);
         }
-        Ok((slot, caches))
+        Ok((slot, caches, phase_millis))
     }
 
     /// Consumes a terminal gradient and updates every resident projection in
@@ -1615,7 +1640,10 @@ impl UllisHyena {
                     time,
                     block.chunk_plan,
                     learning_rate,
-                    &weights.frozen_filter_spectrum,
+                    weights
+                        .frozen_backward_filter_spectrum
+                        .as_ref()
+                        .unwrap_or(&weights.frozen_filter_spectrum),
                 )?;
             }
             gradient_slot = destination_slot;
@@ -1651,7 +1679,7 @@ impl UllisHyena {
             .checked_mul(time)
             .ok_or_else(|| anyhow::anyhow!("Metal resident MTP rows overflow"))?;
         let forward_started = Instant::now();
-        let (hidden_slot, caches) = self.forward_metal_resident_training_cached(
+        let (hidden_slot, caches, forward_phases) = self.forward_metal_resident_training_cached(
             runtime,
             state,
             ids,
@@ -1670,6 +1698,7 @@ impl UllisHyena {
         let first_loss = runtime.streamed_cross_entropy_fp16_from_activation(
             first_head,
             &state.embedding,
+            Some(&state.mps_expected_embedding),
             ids,
             batch,
             time,
@@ -1696,6 +1725,7 @@ impl UllisHyena {
         let second_loss = runtime.streamed_cross_entropy_fp16_from_activation(
             second_head,
             &state.embedding,
+            Some(&state.mps_expected_embedding),
             ids,
             batch,
             time,
@@ -1727,7 +1757,8 @@ impl UllisHyena {
         )?;
         let backward_millis = backward_started.elapsed().as_secs_f64() * 1_000.0;
         eprintln!(
-            "metal phases | hyena-forward {forward_millis:.1} ms | mtp+ce {heads_millis:.1} ms | hyena-backward {backward_millis:.1} ms"
+            "metal phases | hyena-forward {forward_millis:.1} ms (block chain {:.1}) | mtp+ce {heads_millis:.1} ms | hyena-backward {backward_millis:.1} ms",
+            forward_phases[1],
         );
         Ok(MtpLoss {
             next_token: first_loss.loss_sum / first_loss.token_count as f32,
@@ -2378,7 +2409,7 @@ mod tests {
         let head_slot = runtime.upload_resident_activations(&head, 3, 2).unwrap();
         let resident = runtime
             .streamed_cross_entropy_fp16_from_activation(
-                head_slot, &embedding, &ids, 1, 3, 2, 17, 1,
+                head_slot, &embedding, None, &ids, 1, 3, 2, 17, 1,
             )
             .unwrap();
         let resident_gradient = runtime
