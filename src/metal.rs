@@ -51,6 +51,12 @@ impl MetalDispatchShape {
 /// RMSNorm/ternary and FFT stages.
 pub const IDENTITY_KERNEL_NAME: &str = "ullis_identity";
 pub const CLIPPED_SGD_FP16_KERNEL_NAME: &str = "ullis_clipped_sgd_fp16";
+pub const EMBEDDING_LOOKUP_FP16_KERNEL_NAME: &str = "ullis_embedding_lookup_fp16";
+pub const TARGET_EMBEDDING_GRADIENT_FP16_KERNEL_NAME: &str = "ullis_target_embedding_gradient_fp16";
+pub const INPUT_EMBEDDING_GRADIENT_KERNEL_NAME: &str = "ullis_input_embedding_gradient";
+pub const SCALE_FP32_KERNEL_NAME: &str = "ullis_scale_fp32";
+pub const ADD_FP32_KERNEL_NAME: &str = "ullis_add_fp32";
+pub const FP16_TO_FP32_KERNEL_NAME: &str = "ullis_fp16_to_fp32";
 pub const STREAMED_CROSS_ENTROPY_FP16_KERNEL_NAME: &str = "ullis_streamed_cross_entropy_fp16";
 pub const TIED_LOGITS_FP16_KERNEL_NAME: &str = "ullis_tied_logits_fp16";
 pub const CROSS_ENTROPY_LOGITS_FP16_KERNEL_NAME: &str = "ullis_cross_entropy_logits_fp16";
@@ -515,6 +521,24 @@ pub struct MetalRuntime {
     clipped_sgd_fp16_pipeline: objc2::rc::Retained<
         objc2::runtime::ProtocolObject<dyn objc2_metal::MTLComputePipelineState>,
     >,
+    embedding_lookup_fp16_pipeline: objc2::rc::Retained<
+        objc2::runtime::ProtocolObject<dyn objc2_metal::MTLComputePipelineState>,
+    >,
+    target_embedding_gradient_fp16_pipeline: objc2::rc::Retained<
+        objc2::runtime::ProtocolObject<dyn objc2_metal::MTLComputePipelineState>,
+    >,
+    input_embedding_gradient_pipeline: objc2::rc::Retained<
+        objc2::runtime::ProtocolObject<dyn objc2_metal::MTLComputePipelineState>,
+    >,
+    scale_fp32_pipeline: objc2::rc::Retained<
+        objc2::runtime::ProtocolObject<dyn objc2_metal::MTLComputePipelineState>,
+    >,
+    add_fp32_pipeline: objc2::rc::Retained<
+        objc2::runtime::ProtocolObject<dyn objc2_metal::MTLComputePipelineState>,
+    >,
+    fp16_to_fp32_pipeline: objc2::rc::Retained<
+        objc2::runtime::ProtocolObject<dyn objc2_metal::MTLComputePipelineState>,
+    >,
     streamed_cross_entropy_fp16_pipeline: objc2::rc::Retained<
         objc2::runtime::ProtocolObject<dyn objc2_metal::MTLComputePipelineState>,
     >,
@@ -632,6 +656,7 @@ pub struct MetalRuntime {
     activations: std::cell::RefCell<ActivationBuffers>,
     gradient_activations: std::cell::RefCell<ActivationBuffers>,
     fp16_activations: std::cell::RefCell<Fp16ActivationBuffers>,
+    resident_tokens: std::cell::RefCell<ResidentTokenBuffers>,
     streamed_cross_entropy: std::cell::RefCell<StreamedCrossEntropyBuffers>,
     backward_buffers: std::cell::RefCell<BackwardBuffers>,
     block_backward_buffers: std::cell::RefCell<BlockBackwardBuffers>,
@@ -655,13 +680,17 @@ pub enum ResidentActivationSlot {
 pub enum ResidentGradientSlot {
     First,
     Second,
+    /// A terminal-only scratch slot keeps the second MTP head's source
+    /// derivative disjoint from its destination. It is consumed immediately
+    /// by the Hyena reverse chain and carries no persistent optimizer state.
+    Third,
 }
 
 #[cfg(target_os = "macos")]
 impl ResidentGradientSlot {
     pub const fn other(self) -> Self {
         match self {
-            Self::First => Self::Second,
+            Self::First | Self::Third => Self::Second,
             Self::Second => Self::First,
         }
     }
@@ -718,10 +747,14 @@ pub struct ResidentFp16Parameters {
 #[cfg(target_os = "macos")]
 pub struct ResidentMpsExpectedEmbedding {
     embedding: objc2::rc::Retained<objc2::runtime::ProtocolObject<dyn objc2_metal::MTLBuffer>>,
+    gradient: objc2::rc::Retained<objc2::runtime::ProtocolObject<dyn objc2_metal::MTLBuffer>>,
+    accumulator: objc2::rc::Retained<objc2::runtime::ProtocolObject<dyn objc2_metal::MTLBuffer>>,
     rows: usize,
     vocab: usize,
     channels: usize,
     multiplication: objc2::rc::Retained<objc2_metal_performance_shaders::MPSMatrixMultiplication>,
+    output_gradient_multiplication:
+        objc2::rc::Retained<objc2_metal_performance_shaders::MPSMatrixMultiplication>,
 }
 
 /// Exact streamed cross-entropy result at the explicit CPU graph boundary.
@@ -757,6 +790,71 @@ pub struct ResidentTrainableFp16TernaryWeights {
     in_features: usize,
     out_features: usize,
     threshold_ratio: f32,
+}
+
+/// A compact CPU-side snapshot of one resident ternary code plane.
+///
+/// This is an explicit diagnostics boundary, not part of the training path:
+/// it reads only the two packed bitplanes (one bit per parameter each), never
+/// the FP16 master weights or transient activation/gradient workspaces.
+#[cfg(target_os = "macos")]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MetalTernaryCodeSnapshot {
+    pub parameters: usize,
+    pub positive: Vec<u64>,
+    pub negative: Vec<u64>,
+}
+
+/// Aggregate code-plane telemetry for one interval between two snapshots.
+#[cfg(target_os = "macos")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct MetalTernaryCodeStats {
+    pub parameters: usize,
+    pub positive: usize,
+    pub negative: usize,
+    pub changed: usize,
+}
+
+#[cfg(target_os = "macos")]
+impl MetalTernaryCodeSnapshot {
+    /// Counts signed codes, masking unused tail bits in the final packed word.
+    pub fn stats_against(&self, previous: Option<&Self>) -> MetalTernaryCodeStats {
+        let tail_bits = self.parameters % 64;
+        let tail_mask = if tail_bits == 0 {
+            u64::MAX
+        } else {
+            (1_u64 << tail_bits) - 1
+        };
+        let mut positive = 0;
+        let mut negative = 0;
+        let mut changed = 0;
+        for index in 0..self.positive.len() {
+            let mask = if index + 1 == self.positive.len() {
+                tail_mask
+            } else {
+                u64::MAX
+            };
+            let current_positive = self.positive[index] & mask;
+            let current_negative = self.negative[index] & mask;
+            positive += current_positive.count_ones() as usize;
+            negative += current_negative.count_ones() as usize;
+            if let Some(previous) = previous.filter(|previous| {
+                previous.parameters == self.parameters
+                    && previous.positive.len() == self.positive.len()
+                    && previous.negative.len() == self.negative.len()
+            }) {
+                changed += ((current_positive ^ previous.positive[index])
+                    | (current_negative ^ previous.negative[index]))
+                    .count_ones() as usize;
+            }
+        }
+        MetalTernaryCodeStats {
+            parameters: self.parameters,
+            positive,
+            negative,
+            changed,
+        }
+    }
 }
 
 /// Compact, persistent FP16 state for one implicit Hyena filter. It contains
@@ -844,6 +942,7 @@ struct GateBuffers {
 struct ActivationBuffers {
     first: Option<objc2::rc::Retained<objc2::runtime::ProtocolObject<dyn objc2_metal::MTLBuffer>>>,
     second: Option<objc2::rc::Retained<objc2::runtime::ProtocolObject<dyn objc2_metal::MTLBuffer>>>,
+    third: Option<objc2::rc::Retained<objc2::runtime::ProtocolObject<dyn objc2_metal::MTLBuffer>>>,
     capacity: usize,
 }
 
@@ -854,6 +953,16 @@ struct Fp16ActivationBuffers {
     first: Option<objc2::rc::Retained<objc2::runtime::ProtocolObject<dyn objc2_metal::MTLBuffer>>>,
     second: Option<objc2::rc::Retained<objc2::runtime::ProtocolObject<dyn objc2_metal::MTLBuffer>>>,
     third: Option<objc2::rc::Retained<objc2::runtime::ProtocolObject<dyn objc2_metal::MTLBuffer>>>,
+    capacity: usize,
+}
+
+/// Token IDs for the resident input lookup. Kept distinct from the CE token
+/// workspace because the lookup is issued before the block chain and must not
+/// depend on loss-buffer allocation or lifetime.
+#[cfg(target_os = "macos")]
+#[derive(Default)]
+struct ResidentTokenBuffers {
+    tokens: Option<objc2::rc::Retained<objc2::runtime::ProtocolObject<dyn objc2_metal::MTLBuffer>>>,
     capacity: usize,
 }
 
@@ -1057,6 +1166,13 @@ impl ActivationBuffers {
                     .newBufferWithLength_options(bytes, options)
                     .ok_or_else(|| anyhow::anyhow!("Metal activation scratch allocation failed"))?,
             );
+            self.third = Some(
+                device
+                    .newBufferWithLength_options(bytes, options)
+                    .ok_or_else(|| {
+                        anyhow::anyhow!("Metal activation terminal allocation failed")
+                    })?,
+            );
             self.capacity = bytes;
         }
         Ok(())
@@ -1157,6 +1273,27 @@ impl StreamedCrossEntropyBuffers {
             logits_bytes,
             "logits",
         )
+    }
+}
+
+#[cfg(target_os = "macos")]
+impl ResidentTokenBuffers {
+    fn ensure(
+        &mut self,
+        device: &objc2::runtime::ProtocolObject<dyn objc2_metal::MTLDevice>,
+        bytes: usize,
+    ) -> Result<()> {
+        use objc2_metal::{MTLDevice, MTLResourceOptions};
+
+        if self.capacity < bytes {
+            self.tokens = Some(
+                device
+                    .newBufferWithLength_options(bytes, MTLResourceOptions::StorageModeShared)
+                    .ok_or_else(|| anyhow::anyhow!("Metal resident token allocation failed"))?,
+            );
+            self.capacity = bytes;
+        }
+        Ok(())
     }
 }
 
@@ -1362,6 +1499,58 @@ impl MetalRuntime {
         let clipped_sgd_fp16_pipeline = device
             .newComputePipelineStateWithFunction_error(&clipped_sgd_fp16_function)
             .map_err(|error| anyhow::anyhow!("Metal FP16 SGD pipeline failed: {error}"))?;
+        let embedding_lookup_fp16_name = NSString::from_str(EMBEDDING_LOOKUP_FP16_KERNEL_NAME);
+        let embedding_lookup_fp16_function = library
+            .newFunctionWithName(&embedding_lookup_fp16_name)
+            .ok_or_else(|| anyhow::anyhow!("Metal FP16 embedding lookup function is missing"))?;
+        let embedding_lookup_fp16_pipeline = device
+            .newComputePipelineStateWithFunction_error(&embedding_lookup_fp16_function)
+            .map_err(|error| {
+                anyhow::anyhow!("Metal FP16 embedding lookup pipeline failed: {error}")
+            })?;
+        let target_embedding_gradient_fp16_name =
+            NSString::from_str(TARGET_EMBEDDING_GRADIENT_FP16_KERNEL_NAME);
+        let target_embedding_gradient_fp16_function = library
+            .newFunctionWithName(&target_embedding_gradient_fp16_name)
+            .ok_or_else(|| {
+                anyhow::anyhow!("Metal target embedding-gradient function is missing")
+            })?;
+        let target_embedding_gradient_fp16_pipeline = device
+            .newComputePipelineStateWithFunction_error(&target_embedding_gradient_fp16_function)
+            .map_err(|error| {
+                anyhow::anyhow!("Metal target embedding-gradient pipeline failed: {error}")
+            })?;
+        let input_embedding_gradient_name =
+            NSString::from_str(INPUT_EMBEDDING_GRADIENT_KERNEL_NAME);
+        let input_embedding_gradient_function = library
+            .newFunctionWithName(&input_embedding_gradient_name)
+            .ok_or_else(|| anyhow::anyhow!("Metal input embedding-gradient function is missing"))?;
+        let input_embedding_gradient_pipeline = device
+            .newComputePipelineStateWithFunction_error(&input_embedding_gradient_function)
+            .map_err(|error| {
+                anyhow::anyhow!("Metal input embedding-gradient pipeline failed: {error}")
+            })?;
+        let scale_fp32_name = NSString::from_str(SCALE_FP32_KERNEL_NAME);
+        let scale_fp32_function = library
+            .newFunctionWithName(&scale_fp32_name)
+            .ok_or_else(|| anyhow::anyhow!("Metal FP32 scale function is missing"))?;
+        let scale_fp32_pipeline = device
+            .newComputePipelineStateWithFunction_error(&scale_fp32_function)
+            .map_err(|error| anyhow::anyhow!("Metal FP32 scale pipeline failed: {error}"))?;
+        let add_fp32_name = NSString::from_str(ADD_FP32_KERNEL_NAME);
+        let add_fp32_function = library
+            .newFunctionWithName(&add_fp32_name)
+            .ok_or_else(|| anyhow::anyhow!("Metal FP32 add function is missing"))?;
+        let add_fp32_pipeline = device
+            .newComputePipelineStateWithFunction_error(&add_fp32_function)
+            .map_err(|error| anyhow::anyhow!("Metal FP32 add pipeline failed: {error}"))?;
+        let fp16_to_fp32_name = NSString::from_str(FP16_TO_FP32_KERNEL_NAME);
+        let fp16_to_fp32_function = library
+            .newFunctionWithName(&fp16_to_fp32_name)
+            .ok_or_else(|| anyhow::anyhow!("Metal FP16-to-FP32 function is missing"))?;
+        let fp16_to_fp32_pipeline = device
+            .newComputePipelineStateWithFunction_error(&fp16_to_fp32_function)
+            .map_err(|error| anyhow::anyhow!("Metal FP16-to-FP32 pipeline failed: {error}"))?;
         let streamed_cross_entropy_name =
             NSString::from_str(STREAMED_CROSS_ENTROPY_FP16_KERNEL_NAME);
         let streamed_cross_entropy_function = library
@@ -1611,6 +1800,12 @@ impl MetalRuntime {
             queue,
             identity_pipeline,
             clipped_sgd_fp16_pipeline,
+            embedding_lookup_fp16_pipeline,
+            target_embedding_gradient_fp16_pipeline,
+            input_embedding_gradient_pipeline,
+            scale_fp32_pipeline,
+            add_fp32_pipeline,
+            fp16_to_fp32_pipeline,
             streamed_cross_entropy_fp16_pipeline,
             tied_logits_fp16_pipeline,
             cross_entropy_logits_fp16_pipeline,
@@ -1658,6 +1853,7 @@ impl MetalRuntime {
             activations: std::cell::RefCell::new(ActivationBuffers::default()),
             gradient_activations: std::cell::RefCell::new(ActivationBuffers::default()),
             fp16_activations: std::cell::RefCell::new(Fp16ActivationBuffers::default()),
+            resident_tokens: std::cell::RefCell::new(ResidentTokenBuffers::default()),
             streamed_cross_entropy: std::cell::RefCell::new(StreamedCrossEntropyBuffers::default()),
             backward_buffers: std::cell::RefCell::new(BackwardBuffers::default()),
             block_backward_buffers: std::cell::RefCell::new(BlockBackwardBuffers::default()),
@@ -2126,11 +2322,13 @@ impl MetalRuntime {
         let resident_upstream = match upstream_slot {
             ResidentGradientSlot::First => gradients.first.as_ref(),
             ResidentGradientSlot::Second => gradients.second.as_ref(),
+            ResidentGradientSlot::Third => gradients.third.as_ref(),
         }
         .expect("checked Metal resident gradient source");
         let resident_destination = match destination_slot {
             ResidentGradientSlot::First => gradients.first.as_ref(),
             ResidentGradientSlot::Second => gradients.second.as_ref(),
+            ResidentGradientSlot::Third => gradients.third.as_ref(),
         }
         .expect("checked Metal resident gradient destination");
         if std::ptr::eq(resident_upstream, resident_destination) {
@@ -2696,6 +2894,117 @@ impl MetalRuntime {
         Ok(ResidentActivationSlot::First)
     }
 
+    /// Gathers an FP16 resident embedding into the FP32 activation stream.
+    ///
+    /// This is deliberately a GPU lookup rather than a CPU-built embedding
+    /// stream: a stateless update to the tied embedding must become visible to
+    /// the very next forward pass without downloading the master weights.
+    #[allow(unsafe_code)]
+    pub fn resident_embedding_lookup_fp16(
+        &self,
+        tokens: &[u32],
+        embedding: &ResidentFp16Parameters,
+        rows: usize,
+        channels: usize,
+        vocab: usize,
+    ) -> Result<ResidentActivationSlot> {
+        use core::ffi::c_void;
+        use core::ptr::NonNull;
+        use objc2_metal::{
+            MTLBuffer, MTLCommandBuffer, MTLCommandEncoder, MTLCommandQueue,
+            MTLComputeCommandEncoder, MTLComputePipelineState, MTLSize,
+        };
+
+        let elements = rows
+            .checked_mul(channels)
+            .ok_or_else(|| anyhow::anyhow!("Metal resident embedding lookup shape overflow"))?;
+        let embedding_elements = vocab.checked_mul(channels).ok_or_else(|| {
+            anyhow::anyhow!("Metal resident embedding lookup vocabulary overflow")
+        })?;
+        if rows == 0
+            || channels == 0
+            || vocab == 0
+            || tokens.len() != rows
+            || embedding.len != embedding_elements
+            || tokens.iter().any(|&token| token as usize >= vocab)
+        {
+            bail!("Metal resident embedding lookup shape/value mismatch");
+        }
+        self.reserve_activations(rows, channels)?;
+        let token_bytes = rows
+            .checked_mul(size_of::<u32>())
+            .ok_or_else(|| anyhow::anyhow!("Metal resident embedding token size overflow"))?;
+        let mut token_buffers = self.resident_tokens.borrow_mut();
+        token_buffers.ensure(&self.device, token_bytes)?;
+        let tokens_buffer = token_buffers
+            .tokens
+            .as_ref()
+            .expect("checked Metal resident token buffer");
+        // SAFETY: the shared allocation holds `rows` u32 IDs exactly.
+        unsafe {
+            tokens_buffer
+                .contents()
+                .cast::<u32>()
+                .as_ptr()
+                .copy_from_nonoverlapping(tokens.as_ptr(), rows);
+        }
+        let activations = self.activations.borrow();
+        let output = activations
+            .first
+            .as_ref()
+            .expect("checked Metal resident embedding activation buffer");
+        let rows_u32 = u32::try_from(rows)
+            .map_err(|_| anyhow::anyhow!("Metal resident embedding rows exceed u32"))?;
+        let channels_u32 = u32::try_from(channels)
+            .map_err(|_| anyhow::anyhow!("Metal resident embedding channels exceed u32"))?;
+        let vocab_u32 = u32::try_from(vocab)
+            .map_err(|_| anyhow::anyhow!("Metal resident embedding vocabulary exceeds u32"))?;
+        let command = self.queue.commandBuffer().ok_or_else(|| {
+            anyhow::anyhow!("Metal resident embedding lookup command buffer allocation failed")
+        })?;
+        let encoder = command.computeCommandEncoder().ok_or_else(|| {
+            anyhow::anyhow!("Metal resident embedding lookup encoder allocation failed")
+        })?;
+        encoder.setComputePipelineState(&self.embedding_lookup_fp16_pipeline);
+        // SAFETY: buffers and scalar ABI match `ullis_embedding_lookup_fp16`.
+        unsafe {
+            encoder.setBuffer_offset_atIndex(Some(embedding.parameters.as_ref()), 0, 0);
+            encoder.setBuffer_offset_atIndex(Some(tokens_buffer), 0, 1);
+            encoder.setBuffer_offset_atIndex(Some(output), 0, 2);
+            for (slot, scalar) in [rows_u32, channels_u32, vocab_u32].iter().enumerate() {
+                encoder.setBytes_length_atIndex(
+                    NonNull::from(scalar).cast::<c_void>(),
+                    size_of::<u32>(),
+                    slot + 3,
+                );
+            }
+        }
+        let width = self
+            .embedding_lookup_fp16_pipeline
+            .maxTotalThreadsPerThreadgroup()
+            .min(elements);
+        if width == 0 {
+            bail!("Metal resident embedding lookup pipeline reported zero threads");
+        }
+        encoder.dispatchThreads_threadsPerThreadgroup(
+            MTLSize {
+                width: elements,
+                height: 1,
+                depth: 1,
+            },
+            MTLSize {
+                width,
+                height: 1,
+                depth: 1,
+            },
+        );
+        encoder.endEncoding();
+        command.commit();
+        // Deliberately no wait: the single queue preserves this lookup before
+        // the block chain, and the input token allocation remains retained.
+        Ok(ResidentActivationSlot::First)
+    }
+
     /// Reads a resident hidden stream only after the complete model forward.
     #[allow(unsafe_code)]
     pub fn download_resident_activations(
@@ -2789,6 +3098,7 @@ impl MetalRuntime {
         let buffer = match slot {
             ResidentGradientSlot::First => gradients.first.as_ref(),
             ResidentGradientSlot::Second => gradients.second.as_ref(),
+            ResidentGradientSlot::Third => gradients.third.as_ref(),
         }
         .expect("checked Metal resident gradient buffer");
         let mut result = vec![0.0; elements];
@@ -3084,16 +3394,19 @@ impl MetalRuntime {
         let output = match output_gradient {
             ResidentGradientSlot::First => gradients.first.as_ref(),
             ResidentGradientSlot::Second => gradients.second.as_ref(),
+            ResidentGradientSlot::Third => gradients.third.as_ref(),
         }
         .expect("checked resident MTP-head output gradient");
         let destination_buffer = match destination {
             ResidentGradientSlot::First => gradients.first.as_ref(),
             ResidentGradientSlot::Second => gradients.second.as_ref(),
+            ResidentGradientSlot::Third => gradients.third.as_ref(),
         }
         .expect("checked resident MTP-head input gradient");
         let previous = match destination.other() {
             ResidentGradientSlot::First => gradients.first.as_ref(),
             ResidentGradientSlot::Second => gradients.second.as_ref(),
+            ResidentGradientSlot::Third => gradients.third.as_ref(),
         }
         .expect("checked resident MTP-head accumulated gradient");
         let backward = self.backward_buffers.borrow();
@@ -4968,6 +5281,14 @@ impl MetalRuntime {
             .device
             .newBufferWithLength_options(bytes, MTLResourceOptions::StorageModeShared)
             .ok_or_else(|| anyhow::anyhow!("MPS tied embedding allocation failed"))?;
+        let gradient = self
+            .device
+            .newBufferWithLength_options(bytes, MTLResourceOptions::StorageModeShared)
+            .ok_or_else(|| anyhow::anyhow!("MPS tied embedding-gradient allocation failed"))?;
+        let accumulator = self
+            .device
+            .newBufferWithLength_options(bytes, MTLResourceOptions::StorageModeShared)
+            .ok_or_else(|| anyhow::anyhow!("MPS tied embedding accumulator allocation failed"))?;
         // SAFETY: the allocation has exactly `elements` FP32 slots.
         unsafe {
             let destination = buffer.contents().cast::<f32>().as_ptr();
@@ -4981,12 +5302,21 @@ impl MetalRuntime {
                 self.device.as_ref(), false, false, rows, channels, vocab, 1.0, 0.0,
             )
         };
+        let output_gradient_multiplication = unsafe {
+            MPSMatrixMultiplication::initWithDevice_transposeLeft_transposeRight_resultRows_resultColumns_interiorColumns_alpha_beta(
+                MPSMatrixMultiplication::alloc(),
+                self.device.as_ref(), true, false, vocab, channels, rows, 1.0, 0.0,
+            )
+        };
         Ok(ResidentMpsExpectedEmbedding {
             embedding: buffer,
+            gradient,
+            accumulator,
             rows,
             vocab,
             channels,
             multiplication,
+            output_gradient_multiplication,
         })
     }
 
@@ -5048,6 +5378,196 @@ impl MetalRuntime {
             bail!("Metal FP16 SGD command failed: {error}");
         }
         Ok(())
+    }
+
+    /// Applies the GPU-built tied output-embedding gradient and refreshes the
+    /// transient FP32 MPS view. The FP16 master remains the sole persistent
+    /// parameter copy; `mps.embedding` is a compute-only expansion.
+    #[allow(unsafe_code)]
+    pub fn resident_tied_embedding_stateless_sgd(
+        &self,
+        parameters: &ResidentFp16Parameters,
+        mps: &ResidentMpsExpectedEmbedding,
+        learning_rate: f32,
+    ) -> Result<()> {
+        use core::ffi::c_void;
+        use core::ptr::NonNull;
+        use objc2_metal::{
+            MTLCommandBuffer, MTLCommandEncoder, MTLCommandQueue, MTLComputeCommandEncoder,
+            MTLComputePipelineState, MTLSize,
+        };
+
+        if parameters.len != mps.vocab.checked_mul(mps.channels).unwrap_or(0)
+            || !learning_rate.is_finite()
+            || learning_rate <= 0.0
+        {
+            bail!("Metal tied embedding SGD shape/value mismatch");
+        }
+        let elements = u32::try_from(parameters.len)
+            .map_err(|_| anyhow::anyhow!("Metal tied embedding SGD elements exceed u32"))?;
+        let command = self.queue.commandBuffer().ok_or_else(|| {
+            anyhow::anyhow!("Metal tied embedding SGD command buffer allocation failed")
+        })?;
+        let encoder = command
+            .computeCommandEncoder()
+            .ok_or_else(|| anyhow::anyhow!("Metal tied embedding SGD encoder allocation failed"))?;
+        self.encode_clipped_sgd_fp16(
+            encoder.as_ref(),
+            parameters.parameters.as_ref(),
+            mps.accumulator.as_ref(),
+            learning_rate,
+            parameters.len,
+        )?;
+        encoder.endEncoding();
+        let encoder = command.computeCommandEncoder().ok_or_else(|| {
+            anyhow::anyhow!("Metal tied embedding refresh encoder allocation failed")
+        })?;
+        encoder.setComputePipelineState(&self.fp16_to_fp32_pipeline);
+        unsafe {
+            encoder.setBuffer_offset_atIndex(Some(parameters.parameters.as_ref()), 0, 0);
+            encoder.setBuffer_offset_atIndex(Some(mps.embedding.as_ref()), 0, 1);
+            encoder.setBytes_length_atIndex(
+                NonNull::from(&elements).cast::<c_void>(),
+                size_of::<u32>(),
+                2,
+            );
+        }
+        let width = self
+            .fp16_to_fp32_pipeline
+            .maxTotalThreadsPerThreadgroup()
+            .min(parameters.len);
+        if width == 0 {
+            bail!("Metal tied embedding refresh pipeline reported zero threads");
+        }
+        encoder.dispatchThreads_threadsPerThreadgroup(
+            MTLSize {
+                width: parameters.len,
+                height: 1,
+                depth: 1,
+            },
+            MTLSize {
+                width,
+                height: 1,
+                depth: 1,
+            },
+        );
+        encoder.endEncoding();
+        command.commit();
+        command.waitUntilCompleted();
+        if let Some(error) = command.error() {
+            bail!("Metal tied embedding SGD command failed: {error}");
+        }
+        Ok(())
+    }
+
+    /// Applies the input-side contribution of a tied embedding. This consumes
+    /// the final resident Hyena gradient, so no `[B*T,D]` tensor crosses CPU.
+    #[allow(unsafe_code)]
+    pub fn resident_input_embedding_stateless_sgd(
+        &self,
+        parameters: &ResidentFp16Parameters,
+        mps: &ResidentMpsExpectedEmbedding,
+        input_gradient_slot: ResidentGradientSlot,
+        tokens: &[u32],
+        rows: usize,
+        channels: usize,
+        vocab: usize,
+        learning_rate: f32,
+    ) -> Result<()> {
+        use core::ffi::c_void;
+        use core::ptr::NonNull;
+        use objc2_metal::{
+            MTLBuffer, MTLCommandBuffer, MTLCommandEncoder, MTLCommandQueue,
+            MTLComputeCommandEncoder, MTLSize,
+        };
+
+        let elements = rows
+            .checked_mul(channels)
+            .ok_or_else(|| anyhow::anyhow!("Metal input embedding gradient shape overflow"))?;
+        let embedding_elements = vocab
+            .checked_mul(channels)
+            .ok_or_else(|| anyhow::anyhow!("Metal input embedding gradient vocabulary overflow"))?;
+        if rows == 0
+            || channels == 0
+            || vocab == 0
+            || tokens.len() != rows
+            || parameters.len != embedding_elements
+            || mps.vocab != vocab
+            || mps.channels != channels
+            || !learning_rate.is_finite()
+            || learning_rate <= 0.0
+            || tokens.iter().any(|&token| token as usize >= vocab)
+        {
+            bail!("Metal input embedding gradient shape/value mismatch");
+        }
+        self.reserve_gradients(rows, channels)?;
+        let token_bytes = rows
+            .checked_mul(size_of::<u32>())
+            .ok_or_else(|| anyhow::anyhow!("Metal input embedding token size overflow"))?;
+        let mut token_buffers = self.resident_tokens.borrow_mut();
+        token_buffers.ensure(&self.device, token_bytes)?;
+        let tokens_buffer = token_buffers
+            .tokens
+            .as_ref()
+            .expect("checked Metal resident token buffer");
+        unsafe {
+            tokens_buffer
+                .contents()
+                .cast::<u32>()
+                .as_ptr()
+                .copy_from_nonoverlapping(tokens.as_ptr(), rows);
+        }
+        let gradients = self.gradient_activations.borrow();
+        let input_gradient = match input_gradient_slot {
+            ResidentGradientSlot::First => gradients.first.as_ref(),
+            ResidentGradientSlot::Second => gradients.second.as_ref(),
+            ResidentGradientSlot::Third => gradients.third.as_ref(),
+        }
+        .expect("checked Metal input embedding gradient activation");
+        let rows_u32 = u32::try_from(rows)
+            .map_err(|_| anyhow::anyhow!("Metal input embedding rows exceed u32"))?;
+        let channels_u32 = u32::try_from(channels)
+            .map_err(|_| anyhow::anyhow!("Metal input embedding channels exceed u32"))?;
+        let vocab_u32 = u32::try_from(vocab)
+            .map_err(|_| anyhow::anyhow!("Metal input embedding vocabulary exceeds u32"))?;
+        let command = self.queue.commandBuffer().ok_or_else(|| {
+            anyhow::anyhow!("Metal input embedding gradient command buffer allocation failed")
+        })?;
+        let encoder = command.computeCommandEncoder().ok_or_else(|| {
+            anyhow::anyhow!("Metal input embedding gradient encoder allocation failed")
+        })?;
+        encoder.setComputePipelineState(&self.input_embedding_gradient_pipeline);
+        unsafe {
+            encoder.setBuffer_offset_atIndex(Some(mps.accumulator.as_ref()), 0, 0);
+            encoder.setBuffer_offset_atIndex(Some(input_gradient), 0, 1);
+            encoder.setBuffer_offset_atIndex(Some(tokens_buffer), 0, 2);
+            for (slot, scalar) in [rows_u32, channels_u32, vocab_u32].iter().enumerate() {
+                encoder.setBytes_length_atIndex(
+                    NonNull::from(scalar).cast::<c_void>(),
+                    size_of::<u32>(),
+                    slot + 3,
+                );
+            }
+        }
+        encoder.dispatchThreads_threadsPerThreadgroup(
+            MTLSize {
+                width: elements,
+                height: 1,
+                depth: 1,
+            },
+            MTLSize {
+                width: 256,
+                height: 1,
+                depth: 1,
+            },
+        );
+        encoder.endEncoding();
+        command.commit();
+        command.waitUntilCompleted();
+        if let Some(error) = command.error() {
+            bail!("Metal input embedding gradient command failed: {error}");
+        }
+        self.resident_tied_embedding_stateless_sgd(parameters, mps, learning_rate)
     }
 
     /// Reads resident master parameters at an explicit validation or
@@ -5247,6 +5767,7 @@ impl MetalRuntime {
         head_slot: ResidentActivationSlot,
         embedding: &ResidentFp16Parameters,
         mps_expected_embedding: Option<&ResidentMpsExpectedEmbedding>,
+        reset_tied_embedding_gradient: bool,
         tokens: &[u32],
         batch: usize,
         time: usize,
@@ -5466,6 +5987,156 @@ impl MetalRuntime {
                         &gradient_matrix,
                     );
             }
+            let output_gradient_descriptor = unsafe {
+                MPSMatrixDescriptor::matrixDescriptorWithRows_columns_rowBytes_dataType(
+                    vocab,
+                    channels,
+                    channels * size_of::<f32>(),
+                    MPSDataType::Float32,
+                )
+            };
+            let head_matrix = unsafe {
+                MPSMatrix::initWithBuffer_descriptor(MPSMatrix::alloc(), head, &gradient_descriptor)
+            };
+            let output_gradient_matrix = unsafe {
+                MPSMatrix::initWithBuffer_descriptor(
+                    MPSMatrix::alloc(),
+                    mps.gradient.as_ref(),
+                    &output_gradient_descriptor,
+                )
+            };
+            unsafe {
+                mps.output_gradient_multiplication
+                    .encodeToCommandBuffer_leftMatrix_rightMatrix_resultMatrix(
+                        command.as_ref(),
+                        &probability_matrix,
+                        &head_matrix,
+                        &output_gradient_matrix,
+                    );
+            }
+            let encoder = command.computeCommandEncoder().ok_or_else(|| {
+                anyhow::anyhow!("Metal resident tied embedding-gradient encoder allocation failed")
+            })?;
+            encoder.setComputePipelineState(&self.target_embedding_gradient_fp16_pipeline);
+            unsafe {
+                encoder.setBuffer_offset_atIndex(Some(mps.gradient.as_ref()), 0, 0);
+                encoder.setBuffer_offset_atIndex(Some(head), 0, 1);
+                encoder.setBuffer_offset_atIndex(Some(tokens_buffer), 0, 2);
+                for (slot, scalar) in scalars.iter().enumerate() {
+                    encoder.setBytes_length_atIndex(
+                        NonNull::from(scalar).cast::<c_void>(),
+                        size_of::<u32>(),
+                        slot + 3,
+                    );
+                }
+            }
+            encoder.dispatchThreads_threadsPerThreadgroup(
+                MTLSize {
+                    width: elements,
+                    height: 1,
+                    depth: 1,
+                },
+                MTLSize {
+                    width: 256,
+                    height: 1,
+                    depth: 1,
+                },
+            );
+            encoder.endEncoding();
+            let embedding_elements_u32 = u32::try_from(embedding_elements).map_err(|_| {
+                anyhow::anyhow!("Metal tied embedding gradient elements exceed u32")
+            })?;
+            let encoder = command.computeCommandEncoder().ok_or_else(|| {
+                anyhow::anyhow!(
+                    "Metal resident tied embedding-gradient scale encoder allocation failed"
+                )
+            })?;
+            encoder.setComputePipelineState(&self.scale_fp32_pipeline);
+            unsafe {
+                encoder.setBuffer_offset_atIndex(Some(mps.gradient.as_ref()), 0, 0);
+                encoder.setBytes_length_atIndex(
+                    NonNull::from(&gradient_scale).cast::<c_void>(),
+                    size_of::<f32>(),
+                    1,
+                );
+                encoder.setBytes_length_atIndex(
+                    NonNull::from(&embedding_elements_u32).cast::<c_void>(),
+                    size_of::<u32>(),
+                    2,
+                );
+            }
+            encoder.dispatchThreads_threadsPerThreadgroup(
+                MTLSize {
+                    width: embedding_elements,
+                    height: 1,
+                    depth: 1,
+                },
+                MTLSize {
+                    width: 256,
+                    height: 1,
+                    depth: 1,
+                },
+            );
+            encoder.endEncoding();
+            let encoder = command.computeCommandEncoder().ok_or_else(|| {
+                anyhow::anyhow!("Metal tied embedding accumulator encoder allocation failed")
+            })?;
+            if reset_tied_embedding_gradient {
+                let zero = 0.0f32;
+                let elements_u32 = u32::try_from(embedding_elements)
+                    .map_err(|_| anyhow::anyhow!("Metal tied embedding accumulator exceeds u32"))?;
+                encoder.setComputePipelineState(&self.scale_fp32_pipeline);
+                unsafe {
+                    encoder.setBuffer_offset_atIndex(Some(mps.accumulator.as_ref()), 0, 0);
+                    encoder.setBytes_length_atIndex(
+                        NonNull::from(&zero).cast::<c_void>(),
+                        size_of::<f32>(),
+                        1,
+                    );
+                    encoder.setBytes_length_atIndex(
+                        NonNull::from(&elements_u32).cast::<c_void>(),
+                        size_of::<u32>(),
+                        2,
+                    );
+                }
+                encoder.dispatchThreads_threadsPerThreadgroup(
+                    MTLSize {
+                        width: embedding_elements,
+                        height: 1,
+                        depth: 1,
+                    },
+                    MTLSize {
+                        width: 256,
+                        height: 1,
+                        depth: 1,
+                    },
+                );
+            }
+            let elements_u32 = u32::try_from(embedding_elements)
+                .map_err(|_| anyhow::anyhow!("Metal tied embedding accumulator exceeds u32"))?;
+            encoder.setComputePipelineState(&self.add_fp32_pipeline);
+            unsafe {
+                encoder.setBuffer_offset_atIndex(Some(mps.accumulator.as_ref()), 0, 0);
+                encoder.setBuffer_offset_atIndex(Some(mps.gradient.as_ref()), 0, 1);
+                encoder.setBytes_length_atIndex(
+                    NonNull::from(&elements_u32).cast::<c_void>(),
+                    size_of::<u32>(),
+                    2,
+                );
+            }
+            encoder.dispatchThreads_threadsPerThreadgroup(
+                MTLSize {
+                    width: embedding_elements,
+                    height: 1,
+                    depth: 1,
+                },
+                MTLSize {
+                    width: 256,
+                    height: 1,
+                    depth: 1,
+                },
+            );
+            encoder.endEncoding();
             let encoder = command.computeCommandEncoder().ok_or_else(|| {
                 anyhow::anyhow!("Metal resident final CE-gradient encoder allocation failed")
             })?;
@@ -5808,6 +6479,39 @@ impl MetalRuntime {
             negative,
             scales,
         ))
+    }
+
+    /// Downloads only packed ternary codes for periodic learning diagnostics.
+    #[allow(unsafe_code)]
+    pub fn download_trainable_fp16_ternary_codes(
+        &self,
+        weights: &ResidentTrainableFp16TernaryWeights,
+    ) -> Result<MetalTernaryCodeSnapshot> {
+        use objc2_metal::MTLBuffer;
+
+        let parameters = weights
+            .in_features
+            .checked_mul(weights.out_features)
+            .ok_or_else(|| anyhow::anyhow!("Metal trainable ternary parameter overflow"))?;
+        let words = parameters.div_ceil(64);
+        let mut positive = vec![0_u64; words];
+        let mut negative = vec![0_u64; words];
+        // SAFETY: both shared buffers have exactly `words` packed u64 entries.
+        unsafe {
+            positive.as_mut_ptr().copy_from_nonoverlapping(
+                weights.positive.contents().cast::<u64>().as_ptr(),
+                words,
+            );
+            negative.as_mut_ptr().copy_from_nonoverlapping(
+                weights.negative.contents().cast::<u64>().as_ptr(),
+                words,
+            );
+        }
+        Ok(MetalTernaryCodeSnapshot {
+            parameters,
+            positive,
+            negative,
+        })
     }
 
     #[allow(unsafe_code)]
@@ -8535,6 +9239,26 @@ pub fn ternary_linear_forward(
 mod tests {
     use super::*;
 
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn ternary_code_stats_mask_tail_bits_and_count_state_changes() {
+        let previous = MetalTernaryCodeSnapshot {
+            parameters: 65,
+            positive: vec![0b1, 0],
+            negative: vec![0, 0],
+        };
+        let current = MetalTernaryCodeSnapshot {
+            parameters: 65,
+            positive: vec![0b10, u64::MAX],
+            negative: vec![0b100, 0],
+        };
+        let stats = current.stats_against(Some(&previous));
+        assert_eq!(stats.parameters, 65);
+        assert_eq!(stats.positive, 2);
+        assert_eq!(stats.negative, 1);
+        assert_eq!(stats.changed, 4);
+    }
+
     #[test]
     fn dispatch_shape_rejects_zero_and_32_bit_overflow() {
         assert!(MetalDispatchShape::new(0, 1, 1).is_err());
@@ -8938,6 +9662,12 @@ mod tests {
         let slot = runtime.upload_resident_gradient(&source, 2, 2).unwrap();
         assert_eq!(slot, ResidentGradientSlot::First);
         assert_eq!(slot.other(), ResidentGradientSlot::Second);
+        // The second MTP head writes to Third while accumulating the first
+        // head from Second; the reverse Hyena chain then resumes at Second.
+        assert_eq!(
+            ResidentGradientSlot::Third.other(),
+            ResidentGradientSlot::Second
+        );
         assert_eq!(
             runtime.download_resident_gradient(slot, 2, 2).unwrap(),
             source

@@ -45,6 +45,103 @@ kernel void ullis_clipped_sgd_fp16(
     }
 }
 
+// GPU-side tied-embedding gather. The persistent table stays FP16; only the
+// active [B*T,D] stream is expanded to FP32 for the existing Hyena kernels.
+kernel void ullis_embedding_lookup_fp16(
+    device const half *embedding [[buffer(0)]],
+    device const uint *tokens [[buffer(1)]],
+    device float *output [[buffer(2)]],
+    constant uint &rows [[buffer(3)]],
+    constant uint &channels [[buffer(4)]],
+    constant uint &vocab [[buffer(5)]],
+    uint index [[thread_position_in_grid]]) {
+    if (index >= rows * channels) return;
+    const uint row = index / channels;
+    const uint channel = index % channels;
+    const uint token = tokens[row];
+    output[index] = token < vocab ? float(embedding[token * channels + channel]) : 0.0f;
+}
+
+// Subtract the target term from a tied output-embedding gradient. The GEMM
+// has already written P^T H; repeated token IDs need atomic accumulation but
+// touch only [B*T,D] elements, not the full vocabulary matrix.
+kernel void ullis_target_embedding_gradient_fp16(
+    device atomic_uint *gradient_bits [[buffer(0)]],
+    device const float *head [[buffer(1)]],
+    device const uint *tokens [[buffer(2)]],
+    constant uint &rows [[buffer(3)]],
+    constant uint &time [[buffer(4)]],
+    constant uint &channels [[buffer(5)]],
+    constant uint &vocab [[buffer(6)]],
+    constant uint &horizon [[buffer(7)]],
+    uint index [[thread_position_in_grid]]) {
+    if (index >= rows * channels) return;
+    const uint row = index / channels;
+    if (row % time + horizon >= time) return;
+    const uint token = tokens[row + horizon];
+    if (token >= vocab) return;
+    const uint destination = token * channels + (index % channels);
+    uint current = atomic_load_explicit(gradient_bits + destination, memory_order_relaxed);
+    while (true) {
+        const float updated = as_type<float>(current) - head[index];
+        if (atomic_compare_exchange_weak_explicit(
+                gradient_bits + destination,
+                &current,
+                as_type<uint>(updated),
+                memory_order_relaxed,
+                memory_order_relaxed)) break;
+    }
+}
+
+// Accumulate the input-side term of a tied embedding after the complete
+// Hyena backward chain. The incoming gradient is already loss-normalized.
+kernel void ullis_input_embedding_gradient(
+    device atomic_uint *gradient_bits [[buffer(0)]],
+    device const float *input_gradient [[buffer(1)]],
+    device const uint *tokens [[buffer(2)]],
+    constant uint &rows [[buffer(3)]],
+    constant uint &channels [[buffer(4)]],
+    constant uint &vocab [[buffer(5)]],
+    uint index [[thread_position_in_grid]]) {
+    if (index >= rows * channels) return;
+    const uint row = index / channels;
+    const uint token = tokens[row];
+    if (token >= vocab) return;
+    const uint destination = token * channels + (index % channels);
+    uint current = atomic_load_explicit(gradient_bits + destination, memory_order_relaxed);
+    while (true) {
+        const float updated = as_type<float>(current) + input_gradient[index];
+        if (atomic_compare_exchange_weak_explicit(
+                gradient_bits + destination,
+                &current,
+                as_type<uint>(updated),
+                memory_order_relaxed,
+                memory_order_relaxed)) break;
+    }
+}
+
+kernel void ullis_scale_fp32(
+    device float *values [[buffer(0)]],
+    constant float &scale [[buffer(1)]],
+    constant uint &elements [[buffer(2)]],
+    uint index [[thread_position_in_grid]]) {
+    if (index < elements) values[index] *= scale;
+}
+kernel void ullis_add_fp32(
+    device float *destination [[buffer(0)]], device const float *source [[buffer(1)]],
+    constant uint &elements [[buffer(2)]], uint index [[thread_position_in_grid]]) {
+    if (index < elements) destination[index] += source[index];
+}
+
+
+kernel void ullis_fp16_to_fp32(
+    device const half *source [[buffer(0)]],
+    device float *destination [[buffer(1)]],
+    constant uint &elements [[buffer(2)]],
+    uint index [[thread_position_in_grid]]) {
+    if (index < elements) destination[index] = float(source[index]);
+}
+
 // Exact tiled streamed tied-embedding cross-entropy. A 16-thread group owns
 // one sequence row: lanes split vocabulary while a 16 KiB threadgroup tile
 // retains their D-wide expected-embedding partials. No [rows, vocab] logits

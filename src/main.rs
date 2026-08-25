@@ -49,6 +49,9 @@ enum Command {
         /// In-memory corpus budget for training BPE, in MiB. Set 0 for the full corpus.
         #[arg(long, default_value_t = 16)]
         bpe_train_mib: usize,
+        /// Print compact ternary-code learning telemetry every N steps. Set 0 to disable.
+        #[arg(long, default_value_t = 100)]
+        diagnostics_every: usize,
     },
     Tokenize {
         #[arg(long)]
@@ -161,6 +164,10 @@ struct TrainMetric {
     mtp_next: f32,
     mtp_second: f32,
     learning_rate: f32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    ternary_active_fraction: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    ternary_code_changes: Option<usize>,
 }
 
 fn validate_record(record: &DatasetRecord) -> Result<()> {
@@ -306,6 +313,7 @@ fn train(
     train_filters: bool,
     backend: Backend,
     bpe_train_mib: usize,
+    diagnostics_every: usize,
 ) -> Result<()> {
     if steps == 0 || checkpoint_every == 0 || !learning_rate.is_finite() || learning_rate <= 0.0 {
         bail!("steps, checkpoint-every, and learning-rate must be positive");
@@ -403,14 +411,27 @@ fn train(
         .and_then(|value| value.checked_mul(size_of::<f32>()))
         .ok_or_else(|| anyhow::anyhow!("cross-entropy logits memory estimate overflows"))?;
     let ce_logits_mib = ce_logits_bytes as f64 / 1024.0 / 1024.0;
+    let terminal_gradient_bytes = cfg
+        .context_len
+        .checked_mul(cfg.batch_size)
+        .and_then(|value| value.checked_mul(cfg.d_model))
+        .and_then(|value| value.checked_mul(size_of::<f32>()))
+        .ok_or_else(|| anyhow::anyhow!("terminal gradient memory estimate overflows"))?;
+    let terminal_gradient_mib = terminal_gradient_bytes as f64 / 1024.0 / 1024.0;
     let mps_embedding_bytes = cfg
         .vocab_size
         .checked_mul(cfg.d_model)
         .and_then(|value| value.checked_mul(size_of::<f32>()))
         .ok_or_else(|| anyhow::anyhow!("MPS tied-embedding memory estimate overflows"))?;
-    let mps_embedding_mib = mps_embedding_bytes as f64 / 1024.0 / 1024.0;
+    // MPS retains the FP32 table, one output-gradient matrix, and their
+    // per-step accumulator. These are temporary training workspace, not a
+    // second persistent model, but the resident budget must include all three.
+    let mps_tied_workspace_bytes = mps_embedding_bytes
+        .checked_mul(3)
+        .ok_or_else(|| anyhow::anyhow!("MPS tied workspace memory estimate overflows"))?;
+    let mps_tied_workspace_mib = mps_tied_workspace_bytes as f64 / 1024.0 / 1024.0;
     println!(
-        "train | backend {backend:?} | d {} | layers {} | context {} | kernel {} | chunk {} | batch {} | vocab {} | corpus {} tok | planned resident peak {:.1} MiB (base {planned_peak_mib:.1} + frozen-filter FFT {frozen_filter_spectrum_mib:.1} + backward FFT {frozen_backward_spectrum_mib:.1} + CE logits {ce_logits_mib:.1} + MPS embedding {mps_embedding_mib:.1}) / {} MiB | ingest {json_seconds:.1}s | bpe {bpe_seconds:.1}s ({:.1} MiB sample) | tokenize {tokenize_seconds:.1}s",
+        "train | backend {backend:?} | d {} | layers {} | context {} | kernel {} | chunk {} | batch {} | vocab {} | corpus {} tok | planned resident peak {:.1} MiB (base {planned_peak_mib:.1} + frozen-filter FFT {frozen_filter_spectrum_mib:.1} + backward FFT {frozen_backward_spectrum_mib:.1} + CE logits {ce_logits_mib:.1} + terminal gradient {terminal_gradient_mib:.1} + MPS tied workspace {mps_tied_workspace_mib:.1}) / {} MiB | ingest {json_seconds:.1}s | bpe {bpe_seconds:.1}s ({:.1} MiB sample) | tokenize {tokenize_seconds:.1}s",
         cfg.d_model,
         cfg.n_layers,
         cfg.context_len,
@@ -423,7 +444,8 @@ fn train(
             + frozen_filter_spectrum_mib
             + frozen_backward_spectrum_mib
             + ce_logits_mib
-            + mps_embedding_mib,
+            + terminal_gradient_mib
+            + mps_tied_workspace_mib,
         cfg.memory_budget_bytes / (1024 * 1024),
         bpe_sample_bytes as f64 / 1024.0 / 1024.0,
     );
@@ -473,6 +495,10 @@ fn train(
     let started = Instant::now();
     let mut loss_ema = None;
     let mut previous_loss = None;
+    #[cfg(target_os = "macos")]
+    let mut previous_ternary_codes: Option<
+        Vec<ullis::model::MetalResidentTernaryCodeSnapshot>,
+    > = None;
     #[cfg(target_os = "macos")]
     let metal_runtime = matches!(backend, Backend::Metal)
         .then(ullis::metal::MetalRuntime::new)
@@ -531,6 +557,42 @@ fn train(
         loss_ema = Some(loss_ema_value);
         let loss_delta = previous_loss.map_or(0.0, |previous| loss.mean() - previous);
         previous_loss = Some(loss.mean());
+        #[cfg(target_os = "macos")]
+        let ternary_diagnostics = if matches!(backend, Backend::Metal)
+            && diagnostics_every != 0
+            && step % diagnostics_every == 0
+        {
+            let runtime = metal_runtime
+                .as_ref()
+                .expect("Metal runtime is initialized");
+            let state = metal_state.as_ref().expect("Metal state is initialized");
+            runtime.synchronize()?;
+            let current = model.metal_resident_ternary_code_snapshots(runtime, state)?;
+            let mut parameters = 0_usize;
+            let mut active = 0_usize;
+            let mut changes = 0_usize;
+            for (index, snapshot) in current.iter().enumerate() {
+                let previous = previous_ternary_codes
+                    .as_ref()
+                    .and_then(|snapshots| snapshots.get(index))
+                    .filter(|previous| previous.name == snapshot.name)
+                    .map(|previous| &previous.codes);
+                let stats = snapshot.codes.stats_against(previous);
+                parameters += stats.parameters;
+                active += stats.positive + stats.negative;
+                changes += stats.changed;
+            }
+            previous_ternary_codes = Some(current);
+            Some((
+                active as f64 / parameters.max(1) as f64,
+                changes,
+                parameters,
+            ))
+        } else {
+            None
+        };
+        #[cfg(not(target_os = "macos"))]
+        let ternary_diagnostics: Option<(f64, usize, usize)> = None;
         let metric = TrainMetric {
             step,
             tokens: processed,
@@ -547,6 +609,8 @@ fn train(
             mtp_next: loss.next_token,
             mtp_second: loss.second_token,
             learning_rate,
+            ternary_active_fraction: ternary_diagnostics.map(|value| value.0),
+            ternary_code_changes: ternary_diagnostics.map(|value| value.1),
         };
         writeln!(metrics, "{}", serde_json::to_string(&metric)?)?;
         println!(
@@ -562,6 +626,13 @@ fn train(
             metric.mtp_next,
             metric.mtp_second
         );
+        if let Some((active_fraction, changes, parameters)) = ternary_diagnostics {
+            println!(
+                "ternary codes | active {:.2}% | changed {changes}/{parameters} ({:.4}%) since prior diagnostic",
+                active_fraction * 100.0,
+                changes as f64 * 100.0 / parameters.max(1) as f64,
+            );
+        }
         if step % checkpoint_every == 0 || step == steps {
             #[cfg(target_os = "macos")]
             let checkpoint = if let (Some(runtime), Some(state)) =
@@ -715,6 +786,7 @@ fn main() -> Result<()> {
             train_filters,
             backend,
             bpe_train_mib,
+            diagnostics_every,
         }) => train(
             data,
             run,
@@ -727,6 +799,7 @@ fn main() -> Result<()> {
             train_filters,
             backend,
             bpe_train_mib,
+            diagnostics_every,
         ),
         Some(Command::Tokenize { data, output }) => {
             let records = load_dataset(&data)?;

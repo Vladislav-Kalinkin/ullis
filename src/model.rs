@@ -103,6 +103,21 @@ pub struct MetalResidentHyenaTrainingState {
     mps_expected_embedding: crate::metal::ResidentMpsExpectedEmbedding,
 }
 
+/// Named compact ternary-code snapshot for a resident training state.
+#[cfg(target_os = "macos")]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MetalResidentTernaryCodeSnapshot {
+    pub name: String,
+    pub codes: crate::metal::MetalTernaryCodeSnapshot,
+}
+
+// A tied table receives three independent contributions per MTP step (two
+// output heads plus the input-side chain). Stateless FP16 SGD has no moments
+// to absorb their variance, so keep its trust region narrower than projection
+// updates while preserving the user-visible base learning-rate schedule.
+#[cfg(target_os = "macos")]
+const TIED_EMBEDDING_LR_SCALE: f32 = 0.01;
+
 #[cfg(target_os = "macos")]
 struct MetalResidentHyenaBlockWeights {
     input: crate::metal::ResidentTrainableFp16TernaryWeights,
@@ -1377,6 +1392,39 @@ impl UllisHyena {
         Ok(checkpoint)
     }
 
+    /// Reads packed ternary codes only at an explicit diagnostics boundary.
+    /// Normal resident training never calls this method.
+    #[cfg(target_os = "macos")]
+    pub fn metal_resident_ternary_code_snapshots(
+        &self,
+        runtime: &crate::metal::MetalRuntime,
+        state: &MetalResidentHyenaTrainingState,
+    ) -> Result<Vec<MetalResidentTernaryCodeSnapshot>> {
+        if state.blocks.len() != self.blocks.len() {
+            bail!("Metal resident ternary state does not match model");
+        }
+        let mut snapshots = Vec::with_capacity(state.blocks.len() * 2 + 2);
+        for (index, block) in state.blocks.iter().enumerate() {
+            snapshots.push(MetalResidentTernaryCodeSnapshot {
+                name: format!("block{index}.input"),
+                codes: runtime.download_trainable_fp16_ternary_codes(&block.input)?,
+            });
+            snapshots.push(MetalResidentTernaryCodeSnapshot {
+                name: format!("block{index}.output"),
+                codes: runtime.download_trainable_fp16_ternary_codes(&block.output)?,
+            });
+        }
+        snapshots.push(MetalResidentTernaryCodeSnapshot {
+            name: "mtp+1".into(),
+            codes: runtime.download_trainable_fp16_ternary_codes(&state.mtp_one)?,
+        });
+        snapshots.push(MetalResidentTernaryCodeSnapshot {
+            name: "mtp+2".into(),
+            codes: runtime.download_trainable_fp16_ternary_codes(&state.mtp_two)?,
+        });
+        Ok(snapshots)
+    }
+
     /// Runs a cached resident forward pass using Metal-owned projection state.
     #[cfg(target_os = "macos")]
     pub fn hidden_metal_resident_for_training(
@@ -1425,22 +1473,13 @@ impl UllisHyena {
             bail!("Metal resident training state or token shape is invalid");
         }
         let d = self.cfg.d_model;
-        let mut embedding_stream = vec![
-            0.0;
-            rows.checked_mul(d).ok_or_else(|| anyhow::anyhow!(
-                "hidden-state shape overflow"
-            ))?
-        ];
-        for (row, &id) in ids.iter().enumerate() {
-            let id = id as usize;
-            if id >= self.cfg.vocab_size {
-                bail!("token id {id} out of vocabulary");
-            }
-            for channel in 0..d {
-                embedding_stream[row * d + channel] = self.embedding.get(id * d + channel);
-            }
-        }
-        let mut slot = runtime.upload_resident_activations(&embedding_stream, rows, d)?;
+        let mut slot = runtime.resident_embedding_lookup_fp16(
+            ids,
+            &state.embedding,
+            rows,
+            d,
+            self.cfg.vocab_size,
+        )?;
         let mut caches = Vec::with_capacity(self.blocks.len());
         let mut phase_millis = [0.0; 3];
         for (block, weights) in self.blocks.iter().zip(&state.blocks) {
@@ -1575,11 +1614,10 @@ impl UllisHyena {
         time: usize,
         learning_rate: f32,
         train_filters: bool,
-    ) -> Result<MetalResidentHyenaProjectionStep> {
+    ) -> Result<crate::metal::ResidentGradientSlot> {
         if caches.len() != self.blocks.len() || !learning_rate.is_finite() || learning_rate <= 0.0 {
             bail!("Metal resident cached backward state/value mismatch");
         }
-        let mut reverse_filter_gradients = Vec::with_capacity(self.blocks.len());
         for ((block, cache), weights) in self
             .blocks
             .iter()
@@ -1623,7 +1661,6 @@ impl UllisHyena {
                     plan.kernel_len,
                     time,
                 )?;
-                reverse_filter_gradients.push(backward.filter_gradient);
                 runtime.resident_implicit_filter_stateless_sgd(
                     &weights.filter,
                     &filter_backward,
@@ -1648,14 +1685,7 @@ impl UllisHyena {
             }
             gradient_slot = destination_slot;
         }
-        reverse_filter_gradients.reverse();
-        Ok(MetalResidentHyenaProjectionStep {
-            // The complete training graph is resident and no caller consumes
-            // the stack-input gradient. Avoid an otherwise synchronous host
-            // copy; the public reference entry point retains that readback.
-            input_gradient: Vec::new(),
-            filter_gradients: reverse_filter_gradients,
-        })
+        Ok(gradient_slot)
     }
 
     /// One complete resident Metal MTP step. MTP heads, streamed loss, their
@@ -1699,6 +1729,7 @@ impl UllisHyena {
             first_head,
             &state.embedding,
             Some(&state.mps_expected_embedding),
+            true,
             ids,
             batch,
             time,
@@ -1726,6 +1757,7 @@ impl UllisHyena {
             second_head,
             &state.embedding,
             Some(&state.mps_expected_embedding),
+            false,
             ids,
             batch,
             time,
@@ -1736,7 +1768,7 @@ impl UllisHyena {
         let terminal_gradient = runtime.resident_ternary_head_backward_update(
             hidden_slot,
             second_loss.gradient_slot,
-            second_loss.gradient_slot,
+            crate::metal::ResidentGradientSlot::Third,
             rows,
             self.cfg.d_model,
             &state.mtp_two,
@@ -1745,7 +1777,7 @@ impl UllisHyena {
         )?;
         let heads_millis = heads_started.elapsed().as_secs_f64() * 1_000.0;
         let backward_started = Instant::now();
-        self.hidden_metal_backward_update_from_resident_gradient(
+        let input_gradient = self.hidden_metal_backward_update_from_resident_gradient(
             runtime,
             state,
             &caches,
@@ -1754,6 +1786,16 @@ impl UllisHyena {
             time,
             learning_rate,
             train_filters,
+        )?;
+        runtime.resident_input_embedding_stateless_sgd(
+            &state.embedding,
+            &state.mps_expected_embedding,
+            input_gradient,
+            ids,
+            rows,
+            self.cfg.d_model,
+            self.cfg.vocab_size,
+            learning_rate * TIED_EMBEDDING_LR_SCALE,
         )?;
         let backward_millis = backward_started.elapsed().as_secs_f64() * 1_000.0;
         eprintln!(
@@ -2409,7 +2451,7 @@ mod tests {
         let head_slot = runtime.upload_resident_activations(&head, 3, 2).unwrap();
         let resident = runtime
             .streamed_cross_entropy_fp16_from_activation(
-                head_slot, &embedding, None, &ids, 1, 3, 2, 17, 1,
+                head_slot, &embedding, None, true, &ids, 1, 3, 2, 17, 1,
             )
             .unwrap();
         let resident_gradient = runtime
