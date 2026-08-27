@@ -1,13 +1,13 @@
 [package]
 name = "ullis"
-version = "0.9.0"
+version = "0.10.0"
 edition = "2024"
-description = "Ullis — dense ternary Hyena language-model core for Apple Silicon"
+description = "Ullis — RWKV-8 Heron / ROSA language-model core for Apple Silicon"
 license = "MIT-only"
 default-run = "ullis"
 rust-version = "1.88"
 readme = "README.md"
-keywords = ["hyena", "ternary", "metal", "llm"]
+keywords = ["rwkv", "rosa", "metal", "llm"]
 categories = ["science"]
 repository = "https://github.com/vladislav-kalinkin/ullis"
 publish = false
@@ -28,17 +28,15 @@ accelerate = []
 [dependencies]
 anyhow = "1"
 clap = { version = "4.5", features = ["derive"] }
-objc2-metal = "0.3.2"
-objc2-foundation = "0.3.2"
-objc2 = "0.6.4"
 rand = "0.10"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 toml = "0.9"
 
 [target.'cfg(target_os = "macos")'.dependencies]
-mach2 = "0.6"
-objc2-metal-performance-shaders = "0.3.2"
+objc2-metal = "0.3.2"
+objc2-foundation = "0.3.2"
+objc2 = "0.6.4"
 
 [lints.rust]
 unsafe_code = "deny"
