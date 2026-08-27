@@ -29,7 +29,7 @@ pub struct RosaSam {
 impl RosaSam {
     /// Allocates `2 * max_time + 1` nodes, the same bound as Python `s=2*n+1`.
     pub fn with_max_time(max_time: usize) -> Self {
-        let nodes = max_time.saturating_mul(2).saturating_add(1).max(1);
+        let nodes = sam_node_count(max_time);
         Self {
             trans0: vec![-1; nodes],
             trans1: vec![-1; nodes],
@@ -356,4 +356,102 @@ pub fn exact_bitflip_qkv(
 
 pub fn bit_from_activation(value: f32) -> u8 {
     u8::from(value > 0.0)
+}
+
+/// Node budget of `rosa_qkv_ref`: `s = 2 * T + 1`.
+pub fn sam_node_count(time: usize) -> usize {
+    time.saturating_mul(2).saturating_add(1).max(1)
+}
+
+/// Five i32 SAM arrays (`trans0/1`, `fail`, `maxlen`, `last`) for one layer.
+pub fn sam_workspace_bytes(batch: usize, time: usize, channels: usize) -> Option<usize> {
+    batch
+        .checked_mul(channels)?
+        .checked_mul(sam_node_count(time))?
+        .checked_mul(5)?
+        .checked_mul(size_of::<i32>())
+}
+
+/// Packed Q/K/V bitplanes: `3 * B * T * D / 8` when the product is a multiple of 8.
+pub fn qkv_bitplane_bytes(batch: usize, time: usize, channels: usize) -> Option<usize> {
+    batch
+        .checked_mul(time)?
+        .checked_mul(channels)?
+        .checked_mul(3)?
+        .checked_div(8)
+}
+
+/// Packs 0/1 bits into 32-bit words, LSB = lowest index (same as `ullis_sign_pack_bits`).
+pub fn pack_bitplane(bits: &[u8]) -> Result<Vec<u32>> {
+    if bits.iter().any(|&bit| bit > 1) {
+        bail!("pack_bitplane bits must be 0 or 1");
+    }
+    let mut words = vec![0_u32; bits.len().div_ceil(32)];
+    for (index, &bit) in bits.iter().enumerate() {
+        if bit != 0 {
+            words[index / 32] |= 1 << (index % 32);
+        }
+    }
+    Ok(words)
+}
+
+/// Batched `rosa_qkv_ref` over `[B, T, D]` bit tensors stored row-major.
+pub fn rosa_qkv_batch(
+    q: &[u8],
+    k: &[u8],
+    v: &[u8],
+    batch: usize,
+    time: usize,
+    channels: usize,
+) -> Result<Vec<u8>> {
+    let elements = batch
+        .checked_mul(time)
+        .and_then(|rows| rows.checked_mul(channels))
+        .ok_or_else(|| anyhow::anyhow!("rosa_qkv_batch shape overflow"))?;
+    if q.len() != elements || k.len() != elements || v.len() != elements {
+        bail!("rosa_qkv_batch requires q, k, v of length batch*time*channels");
+    }
+    if batch == 0 || time == 0 || channels == 0 {
+        bail!("rosa_qkv_batch dimensions must be non-zero");
+    }
+    let mut idx = vec![0_u8; elements];
+    for b in 0..batch {
+        for c in 0..channels {
+            let mut q_ch = Vec::with_capacity(time);
+            let mut k_ch = Vec::with_capacity(time);
+            let mut v_ch = Vec::with_capacity(time);
+            for t in 0..time {
+                let index = (b * time + t) * channels + c;
+                q_ch.push(q[index]);
+                k_ch.push(k[index]);
+                v_ch.push(v[index]);
+            }
+            let channel_idx = rosa_qkv_ref(&q_ch, &k_ch, &v_ch)?;
+            for t in 0..time {
+                idx[(b * time + t) * channels + c] = channel_idx[t];
+            }
+        }
+    }
+    Ok(idx)
+}
+
+/// `out[b,t,c] = (2 * idx[b,t,c] - 1) * e[c]`.
+pub fn rosa_qkv_out_batched(idx: &[u8], e: &[f32], batch: usize, time: usize, channels: usize) -> Result<Vec<f32>> {
+    let elements = batch
+        .checked_mul(time)
+        .and_then(|rows| rows.checked_mul(channels))
+        .ok_or_else(|| anyhow::anyhow!("rosa_qkv_out_batched shape overflow"))?;
+    if idx.len() != elements || e.len() != channels {
+        bail!("rosa_qkv_out_batched shape mismatch");
+    }
+    let mut out = vec![0.0; elements];
+    for b in 0..batch {
+        for t in 0..time {
+            for c in 0..channels {
+                let index = (b * time + t) * channels + c;
+                out[index] = (2.0 * f32::from(idx[index]) - 1.0) * e[c];
+            }
+        }
+    }
+    Ok(out)
 }

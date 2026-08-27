@@ -1,5 +1,7 @@
 use ullis::rosa::{
-    BITFLIP_TAU, RosaSam, bit_from_activation, exact_bitflip_qkv, rosa, rosa_qkv_out, rosa_qkv_ref,
+    BITFLIP_TAU, RosaSam, bit_from_activation, exact_bitflip_qkv, pack_bitplane, qkv_bitplane_bytes,
+    rosa, rosa_qkv_batch, rosa_qkv_out, rosa_qkv_out_batched, rosa_qkv_ref, sam_node_count,
+    sam_workspace_bytes,
 };
 
 /// T=5 C=3 fixture from `251014_rosa_1bit_layer.py`.
@@ -131,6 +133,48 @@ fn exact_bitflip_matches_independent_phi() {
             / (2.0 * mag);
         assert!((gv[t] - expected).abs() < 1e-6, "gv[{t}]");
     }
+}
+
+#[test]
+fn pack_bitplane_matches_lsb_word_layout() {
+    let bits = [1_u8, 0, 1, 1, 0, 0, 0, 1];
+    assert_eq!(pack_bitplane(&bits).unwrap(), vec![1 | (1 << 2) | (1 << 3) | (1 << 7)]);
+}
+
+#[test]
+fn batched_qkv_matches_per_channel_ref_and_pm_e() {
+    let mut q = Vec::new();
+    let mut k = Vec::new();
+    let mut v = Vec::new();
+    for t in 0..5 {
+        q.extend(ROSA_T5_C3[t].iter().map(|&x| bit_from_activation(x)));
+        k.extend(ROSA_T5_C3[t].iter().map(|&x| bit_from_activation(x)));
+        v.extend(ROSA_T5_C3[t].iter().map(|&x| bit_from_activation(x)));
+    }
+    let idx = rosa_qkv_batch(&q, &k, &v, 1, 5, 3).unwrap();
+    for channel in 0..3 {
+        let expected: Vec<u8> = ROSA_Y[channel].iter().map(|&y| y.max(0) as u8).collect();
+        let got: Vec<u8> = (0..5).map(|t| idx[t * 3 + channel]).collect();
+        assert_eq!(got, expected, "channel {channel}");
+    }
+    let e = [0.5_f32, 0.25, 1.0];
+    let out = rosa_qkv_out_batched(&idx, &e, 1, 5, 3).unwrap();
+    for channel in 0..3 {
+        for t in 0..5 {
+            let expected = (2.0 * f32::from(idx[t * 3 + channel]) - 1.0) * e[channel];
+            assert!((out[t * 3 + channel] - expected).abs() < 1e-6);
+        }
+    }
+}
+
+#[test]
+fn sam_workspace_and_qkv_bitplanes_match_memory_estimate_formula() {
+    assert_eq!(sam_node_count(2048), 2 * 2048 + 1);
+    assert_eq!(
+        sam_workspace_bytes(1, 2048, 256).unwrap(),
+        5 * 4 * 256 * (2 * 2048 + 1)
+    );
+    assert_eq!(qkv_bitplane_bytes(1, 2048, 256).unwrap(), 3 * 2048 * 256 / 8);
 }
 
 #[test]

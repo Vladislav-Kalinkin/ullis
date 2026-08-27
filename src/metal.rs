@@ -1,7 +1,8 @@
-//! Metal runtime for Heron: LayerNorm, BinaryConnect, FP16 linear, and streamed CE.
+//! Metal runtime for Heron: LayerNorm, BinaryConnect, FP16 linear, streamed CE,
+//! and 1-bit QKV ROSA SAM forward.
 //!
-//! Buffer mapping lives in [`ffi`]. There is no MPS path. ROSA SAM and WKV7
-//! kernels arrive in later PRs. Identity remains a pipeline-smoke entry point.
+//! Buffer mapping lives in [`ffi`]. There is no MPS path. WKV7 kernels arrive
+//! in a later PR. Identity remains a pipeline-smoke entry point.
 
 use anyhow::{Result, bail};
 use objc2::rc::Retained;
@@ -94,6 +95,8 @@ pub const BINARY_LINEAR_LATENT_SGD_KERNEL_NAME: &str = "ullis_binary_linear_late
 pub const FP16_LINEAR_KERNEL_NAME: &str = "ullis_fp16_linear";
 pub const FP16_LINEAR_BWD_KERNEL_NAME: &str = "ullis_fp16_linear_bwd";
 pub const SIGN_PACK_BITS_KERNEL_NAME: &str = "ullis_sign_pack_bits";
+pub const ROSA_QKV_1BIT_FWD_KERNEL_NAME: &str = "ullis_rosa_qkv_1bit_fwd";
+pub const ROSA_QKV_1BIT_BWD_E_KERNEL_NAME: &str = "ullis_rosa_qkv_1bit_bwd_e";
 pub const CMIX_RELU2_KERNEL_NAME: &str = "ullis_cmix_relu2";
 pub const CMIX_RELU2_BACKWARD_KERNEL_NAME: &str = "ullis_cmix_relu2_backward";
 pub const RESIDUAL_ADD_KERNEL_NAME: &str = "ullis_residual_add";
@@ -120,6 +123,9 @@ pub const PR3_KERNEL_NAMES: &[&str] = &[
     STREAMED_CROSS_ENTROPY_FP16_KERNEL_NAME,
     CLIPPED_SGD_FP16_KERNEL_NAME,
 ];
+
+pub const PR4_KERNEL_NAMES: &[&str] = &[ROSA_QKV_1BIT_FWD_KERNEL_NAME];
+pub const PR5_KERNEL_NAMES: &[&str] = &[ROSA_QKV_1BIT_BWD_E_KERNEL_NAME];
 
 /// Compiles the identity entry point and checks its dispatch capacity.
 pub fn validate_metal_pipeline(shape: MetalDispatchShape) -> Result<usize> {
@@ -203,6 +209,13 @@ pub struct Fp16LinearBackward {
     pub weight_gradient: Vec<f32>,
 }
 
+/// Resident 1-bit QKV SAM forward: collapsed idx and `out = (2·idx−1)·e`.
+#[derive(Clone, Debug, PartialEq)]
+pub struct RosaQkvForward {
+    pub idx: Vec<u8>,
+    pub out: Vec<f32>,
+}
+
 /// Next-token streamed CE without a `[rows, vocab]` logit tensor.
 #[derive(Clone, Debug, PartialEq)]
 pub struct StreamedCrossEntropy {
@@ -224,6 +237,8 @@ struct Pipelines {
     fp16_linear: Pipeline,
     fp16_linear_bwd: Pipeline,
     sign_pack_bits: Pipeline,
+    rosa_qkv_1bit_fwd: Pipeline,
+    rosa_qkv_1bit_bwd_e: Pipeline,
     cmix_relu2: Pipeline,
     cmix_relu2_backward: Pipeline,
     residual_add: Pipeline,
@@ -288,6 +303,16 @@ impl MetalRuntime {
             fp16_linear: pipeline_from_library(&device, &library, FP16_LINEAR_KERNEL_NAME)?,
             fp16_linear_bwd: pipeline_from_library(&device, &library, FP16_LINEAR_BWD_KERNEL_NAME)?,
             sign_pack_bits: pipeline_from_library(&device, &library, SIGN_PACK_BITS_KERNEL_NAME)?,
+            rosa_qkv_1bit_fwd: pipeline_from_library(
+                &device,
+                &library,
+                ROSA_QKV_1BIT_FWD_KERNEL_NAME,
+            )?,
+            rosa_qkv_1bit_bwd_e: pipeline_from_library(
+                &device,
+                &library,
+                ROSA_QKV_1BIT_BWD_E_KERNEL_NAME,
+            )?,
             cmix_relu2: pipeline_from_library(&device, &library, CMIX_RELU2_KERNEL_NAME)?,
             cmix_relu2_backward: pipeline_from_library(
                 &device,
@@ -563,6 +588,134 @@ impl MetalRuntime {
         let mut bits = vec![0_u32; words];
         bits_buffer.read_u32(&mut bits)?;
         Ok(bits)
+    }
+
+    /// Metal-resident `rosa_qkv_ref` over packed `[B, T, D]` bitplanes.
+    ///
+    /// One thread owns `(batch, channel)`. SAM arrays live in global i32
+    /// buffers of shape `[B, D, 2T+1]`. `idx` is bit-exact with
+    /// [`crate::rosa::rosa_qkv_batch`]; `out = (2·idx − 1)·e` uses FP16 `e`.
+    pub fn rosa_qkv_1bit_fwd(
+        &self,
+        q_bits: &[u32],
+        k_bits: &[u32],
+        v_bits: &[u32],
+        e: &[f32],
+        batch: usize,
+        time: usize,
+        channels: usize,
+    ) -> Result<RosaQkvForward> {
+        let shape = MetalDispatchShape::new(batch, time, channels)?;
+        if e.len() != channels {
+            bail!("ROSA e must have one scale per channel");
+        }
+        let bit_count = shape.elements();
+        let words = bit_count.div_ceil(32);
+        if q_bits.len() != words || k_bits.len() != words || v_bits.len() != words {
+            bail!("ROSA QKV bitplane word count mismatch");
+        }
+        let nodes = crate::rosa::sam_node_count(time);
+        let sam_len = batch
+            .checked_mul(channels)
+            .and_then(|rows| rows.checked_mul(nodes))
+            .ok_or_else(|| anyhow::anyhow!("ROSA SAM workspace overflow"))?;
+        let sam_bytes = sam_len
+            .checked_mul(size_of::<i32>())
+            .ok_or_else(|| anyhow::anyhow!("ROSA SAM byte count overflow"))?;
+
+        let q_buffer = self.buffer_u32(q_bits)?;
+        let k_buffer = self.buffer_u32(k_bits)?;
+        let v_buffer = self.buffer_u32(v_bits)?;
+        let e_buffer = self.buffer_u16(&fp16_bits(e))?;
+        let trans0 = self.shared_buffer(sam_bytes)?;
+        let trans1 = self.shared_buffer(sam_bytes)?;
+        let fail = self.shared_buffer(sam_bytes)?;
+        let maxlen = self.shared_buffer(sam_bytes)?;
+        let last = self.shared_buffer(sam_bytes)?;
+        let idx_buffer = self.shared_buffer(bit_count)?;
+        let out_buffer = self.zeros_f32(bit_count)?;
+        let threads = batch
+            .checked_mul(channels)
+            .ok_or_else(|| anyhow::anyhow!("ROSA dispatch overflow"))?;
+
+        self.submit(|encoder| {
+            Self::encode_1d(
+                encoder,
+                &self.pipelines.rosa_qkv_1bit_fwd,
+                &[
+                    &q_buffer,
+                    &k_buffer,
+                    &v_buffer,
+                    &e_buffer,
+                    &trans0,
+                    &trans1,
+                    &fail,
+                    &maxlen,
+                    &last,
+                    &idx_buffer,
+                    &out_buffer,
+                ],
+                |encoder| {
+                    Self::set_u32s(
+                        encoder,
+                        11,
+                        &[
+                            as_u32(batch, "batch")?,
+                            as_u32(time, "time")?,
+                            as_u32(channels, "channels")?,
+                        ],
+                    )
+                },
+                threads,
+            )
+        })?;
+
+        let mut idx = vec![0_u8; bit_count];
+        idx_buffer.read_bytes(&mut idx)?;
+        let mut out = vec![0.0_f32; bit_count];
+        out_buffer.read_f32(&mut out)?;
+        Ok(RosaQkvForward { idx, out })
+    }
+
+    /// Exact `g_e[c] = Σ gy · (2·idx − 1)` including unmatched positions.
+    pub fn rosa_qkv_1bit_bwd_e(
+        &self,
+        output_gradient: &[f32],
+        idx: &[u8],
+        batch: usize,
+        time: usize,
+        channels: usize,
+    ) -> Result<Vec<f32>> {
+        let shape = MetalDispatchShape::new(batch, time, channels)?;
+        if output_gradient.len() != shape.elements() || idx.len() != shape.elements() {
+            bail!("ROSA g_e shape mismatch");
+        }
+        let gy_buffer = self.buffer_f32(output_gradient)?;
+        let idx_buffer = self.shared_buffer(idx.len())?;
+        idx_buffer.write_bytes(idx)?;
+        let ge_buffer = self.zeros_f32(channels)?;
+        self.submit(|encoder| {
+            Self::encode_1d(
+                encoder,
+                &self.pipelines.rosa_qkv_1bit_bwd_e,
+                &[&gy_buffer, &idx_buffer, &ge_buffer],
+                |encoder| {
+                    Self::set_u32s(
+                        encoder,
+                        3,
+                        &[
+                            as_u32(batch, "batch")?,
+                            as_u32(time, "time")?,
+                            as_u32(channels, "channels")?,
+                        ],
+                    )
+                },
+                channels,
+            )
+        })?;
+        let mut e_gradient = vec![0.0_f32; channels];
+        ge_buffer.read_f32(&mut e_gradient)?;
+        Ok(e_gradient)
     }
 
     pub fn cmix_relu2(&self, input: &[f32]) -> Result<Vec<f32>> {
@@ -1333,7 +1486,19 @@ mod tests {
                 "missing kernel {name}"
             );
         }
-        assert!(!RWKV8_METAL_SOURCE.contains("ullis_rosa_qkv"));
+        for name in PR4_KERNEL_NAMES {
+            assert!(
+                RWKV8_METAL_SOURCE.contains(&format!("kernel void {name}(")),
+                "missing kernel {name}"
+            );
+        }
+        for name in PR5_KERNEL_NAMES {
+            assert!(
+                RWKV8_METAL_SOURCE.contains(&format!("kernel void {name}(")),
+                "missing kernel {name}"
+            );
+        }
+        assert!(!RWKV8_METAL_SOURCE.contains("ullis_rosa_qkv_1bit_bwd_bits"));
         assert!(!RWKV8_METAL_SOURCE.contains("ullis_wkv7"));
     }
 
@@ -1343,7 +1508,11 @@ mod tests {
             return;
         };
         let shape = MetalDispatchShape::new(1, 8, 16).unwrap();
-        for name in PR3_KERNEL_NAMES {
+        for name in PR3_KERNEL_NAMES
+            .iter()
+            .chain(PR4_KERNEL_NAMES)
+            .chain(PR5_KERNEL_NAMES)
+        {
             let width = validate_metal_kernel(name, shape).unwrap();
             assert!(width > 0, "{name}");
         }

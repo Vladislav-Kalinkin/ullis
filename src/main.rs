@@ -4,8 +4,9 @@ use serde::{Deserialize, Serialize};
 use std::fs::{self, File};
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
-use ullis::tokenizer::{BpeTokenizer, DEFAULT_VOCAB, MIN_VOCAB};
-use ullis::{Architecture, ModelCheckpoint, OptimizerKind, TrainConfig, UllisHeron};
+use std::time::Instant;
+use ullis::tokenizer::{train_bpe, BpeTokenizer, DEFAULT_VOCAB, MIN_VOCAB};
+use ullis::{Architecture, CausalBatcher, ModelCheckpoint, OptimizerKind, TrainConfig, UllisHeron};
 
 #[derive(Debug, Parser)]
 #[command(name = "ullis", version, about = "RWKV-8 Heron / ROSA training tools")]
@@ -268,12 +269,60 @@ fn load_config(path: Option<PathBuf>, overrides: &TrainOverrides) -> Result<Trai
     Ok(cfg)
 }
 
+fn training_text(record: &DatasetRecord) -> String {
+    let mut out = String::new();
+    for message in &record.messages {
+        match message.role.as_str() {
+            "system" => {
+                out.push_str("<system>");
+                out.push_str(&message.content);
+                out.push_str("</system>");
+            }
+            "user" => {
+                out.push_str("<user>");
+                out.push_str(&message.content);
+                out.push_str("</user>");
+            }
+            "assistant" => {
+                out.push_str("<assistant><thinking>");
+                out.push_str(message.thinking.as_deref().unwrap_or(""));
+                out.push_str("</thinking>");
+                out.push_str(&message.content);
+                out.push_str("</assistant>");
+            }
+            "tool" => {
+                out.push_str("<tool>");
+                out.push_str(&message.content);
+                out.push_str("</tool>");
+            }
+            _ => {}
+        }
+    }
+    out
+}
+
+fn cycle_corpus(ids: &[u32], needed: usize) -> Result<Vec<u32>> {
+    if ids.is_empty() {
+        bail!("encoded corpus is empty");
+    }
+    Ok(ids.iter().copied().cycle().take(needed).collect())
+}
+
+fn write_metrics(path: &Path, row: &serde_json::Value) -> Result<()> {
+    let mut file = fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)?;
+    writeln!(file, "{row}")?;
+    Ok(())
+}
+
 fn train(
-    _data: PathBuf,
-    _run: PathBuf,
+    data: PathBuf,
+    run: PathBuf,
     config_path: Option<PathBuf>,
     overrides: TrainOverrides,
-    _resume: Option<PathBuf>,
+    resume: Option<PathBuf>,
     steps: usize,
     learning_rate: f32,
     checkpoint_every: usize,
@@ -283,12 +332,134 @@ fn train(
     if steps == 0 || checkpoint_every == 0 || !learning_rate.is_finite() || learning_rate <= 0.0 {
         bail!("steps, checkpoint-every, and learning-rate must be positive");
     }
-    let cfg = load_config(config_path, &overrides)?;
+    let mut cfg = load_config(config_path, &overrides)?;
     cfg.validate()?;
-    bail!(
-        "Heron train not wired (backend {backend:?}, architecture {:?})",
-        cfg.architecture
-    )
+    if matches!(cfg.architecture, Architecture::RosaRwkv7) {
+        bail!("rosa_rwkv7 train is not wired");
+    }
+    cfg.optimizer.require_train_step()?;
+    let records = load_dataset(&data)?;
+    let texts: Vec<String> = records.iter().map(training_text).collect();
+    fs::create_dir_all(&run)?;
+    let (mut model, mut tokenizer) = if let Some(path) = resume {
+        load_model(&path)?
+    } else {
+        let tokenizer = train_bpe(&texts, cfg.vocab_size as u32, cfg.seed)?;
+        cfg = cfg.with_tokenizer(&tokenizer)?;
+        (UllisHeron::new(cfg)?, tokenizer)
+    };
+    tokenizer.save(run.join("tokenizer.json"))?;
+    fs::write(
+        run.join("config.json"),
+        serde_json::to_string_pretty(&model.cfg)?,
+    )?;
+
+    let mut corpus = Vec::new();
+    for text in &texts {
+        corpus.extend(tokenizer.encode(text, true, true));
+    }
+    let needed = steps
+        .saturating_mul(model.cfg.batch_size)
+        .saturating_mul(model.cfg.context_len);
+    let stream = cycle_corpus(&corpus, needed)?;
+    let batcher = CausalBatcher::from_config(&stream, &model.cfg, model.cfg.context_len)?;
+
+    #[cfg(target_os = "macos")]
+    let metal = match backend {
+        Backend::Metal => Some(ullis::metal::MetalRuntime::new()?),
+        Backend::Cpu => None,
+    };
+    #[cfg(not(target_os = "macos"))]
+    if matches!(backend, Backend::Metal) {
+        bail!("Metal backend requires macOS on Apple Silicon");
+    }
+
+    let metrics_path = run.join("metrics.jsonl");
+    let mut loss_ema = None;
+    let ln_v = (model.cfg.vocab_size as f32).ln();
+    let mut still_random = true;
+    for (step_index, batch) in batcher.enumerate() {
+        if step_index >= steps {
+            break;
+        }
+        let started = Instant::now();
+        #[cfg(target_os = "macos")]
+        let loss = if let Some(runtime) = &metal {
+            model.train_step_metal(
+                runtime,
+                batch.tokens(),
+                batch.batch_size(),
+                batch.time(),
+                learning_rate,
+            )?
+        } else {
+            model.train_step(
+                batch.tokens(),
+                batch.batch_size(),
+                batch.time(),
+                learning_rate,
+            )?
+        };
+        #[cfg(not(target_os = "macos"))]
+        let loss = model.train_step(
+            batch.tokens(),
+            batch.batch_size(),
+            batch.time(),
+            learning_rate,
+        )?;
+        let elapsed = started.elapsed();
+        let step = step_index + 1;
+        let ema = match loss_ema {
+            None => loss.next_token,
+            Some(prev) => 0.9 * prev + 0.1 * loss.next_token,
+        };
+        let delta = loss_ema.map(|prev| loss.next_token - prev).unwrap_or(0.0);
+        loss_ema = Some(ema);
+        if (ema - ln_v).abs() > 0.2 {
+            still_random = false;
+        }
+        let millis = elapsed.as_secs_f64() * 1_000.0;
+        let tokens = batch.tokens().len();
+        let tps = if elapsed.as_secs_f64() > 0.0 {
+            tokens as f64 / elapsed.as_secs_f64()
+        } else {
+            0.0
+        };
+        let row = serde_json::json!({
+            "step": step,
+            "tokens": tokens,
+            "batch_tokens": tokens,
+            "supervised_tokens": loss.next_token_count,
+            "step_millis": millis,
+            "step_tokens_per_second": tps,
+            "tokens_per_second": tps,
+            "loss": loss.next_token,
+            "loss_ema": ema,
+            "loss_delta": delta,
+            "learning_rate": learning_rate,
+            "architecture": "heron",
+            "rosa_bits": model.cfg.rosa_bits,
+            "rosa_grad": "stop_grad_bits",
+            "binary_flip_count": loss.binary_flip_count,
+        });
+        write_metrics(&metrics_path, &row)?;
+        println!(
+            "step {step}/{steps} loss={:.4} ema={:.4} rosa_grad=stop_grad_bits flips={}",
+            loss.next_token, ema, loss.binary_flip_count
+        );
+        if step.is_multiple_of(checkpoint_every) || step == steps {
+            fs::write(
+                run.join("checkpoint.json"),
+                serde_json::to_string(&model.checkpoint())?,
+            )?;
+        }
+        if step == 100 && still_random {
+            eprintln!(
+                "hint: not learning; check rosa_grad and lr (loss_ema stayed near ln(V)={ln_v:.3})"
+            );
+        }
+    }
+    Ok(())
 }
 
 fn load_model(checkpoint: &Path) -> Result<(UllisHeron, BpeTokenizer)> {
@@ -321,7 +492,11 @@ fn generate(checkpoint: PathBuf, _prompt: String, max_tokens: usize) -> Result<(
 
 fn smoke() -> Result<()> {
     let cfg = smoke_config(MIN_VOCAB as usize);
-    let model = UllisHeron::new(cfg.clone())?;
+    let mut model = UllisHeron::new(cfg.clone())?;
+    let tokens: Vec<u32> = (0..cfg.context_len)
+        .map(|i| 4 + (i as u32 % 8))
+        .collect();
+    let ln_v = (cfg.vocab_size as f32).ln();
     println!(
         "heron smoke | architecture {:?} | d {} | layers {} | context {} | vocab {} | rosa_grad {:?}",
         model.cfg.architecture,
@@ -332,12 +507,22 @@ fn smoke() -> Result<()> {
         model.cfg.rosa_grad,
     );
     #[cfg(target_os = "macos")]
-    {
-        match ullis::metal::identity_forward(&[1.0, -2.0, 0.5]) {
-            Ok(output) => println!("metal identity: {output:?}"),
-            Err(error) => println!("metal identity skipped: {error}"),
+    let loss = match ullis::metal::MetalRuntime::new() {
+        Ok(runtime) => {
+            println!("metal runtime ready; running stop_grad_bits train_step");
+            model.train_step_metal(&runtime, &tokens, 1, cfg.context_len, 1e-3)?
         }
-    }
+        Err(error) => {
+            println!("metal unavailable ({error}); CPU train_step");
+            model.train_step(&tokens, 1, cfg.context_len, 1e-3)?
+        }
+    };
+    #[cfg(not(target_os = "macos"))]
+    let loss = model.train_step(&tokens, 1, cfg.context_len, 1e-3)?;
+    println!(
+        "smoke loss={:.4} ln(V)={:.4} supervised={} flips={} rosa_grad=stop_grad_bits",
+        loss.next_token, ln_v, loss.next_token_count, loss.binary_flip_count
+    );
     Ok(())
 }
 

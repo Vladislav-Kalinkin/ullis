@@ -480,3 +480,185 @@ kernel void ullis_streamed_cross_entropy_fp16(
         atomic_add_f32(scale_gradient + token, gy_logit * signed_dot);
     }
 }
+
+inline uint rosa_bit_index(uint batch, uint time, uint channel, uint times, uint channels) {
+    return (batch * times + time) * channels + channel;
+}
+
+inline uint rosa_extract_bit(device const uint *bits, uint index) {
+    return (bits[index >> 5] >> (index & 31u)) & 1u;
+}
+
+inline int rosa_child(
+    device const int *trans0,
+    device const int *trans1,
+    uint base,
+    int node,
+    uint bit) {
+    if (node < 0) {
+        return -1;
+    }
+    const uint index = base + uint(node);
+    return bit == 0u ? trans0[index] : trans1[index];
+}
+
+inline void rosa_set_child(
+    device int *trans0,
+    device int *trans1,
+    uint base,
+    int node,
+    uint bit,
+    int to) {
+    if (node < 0) {
+        return;
+    }
+    const uint index = base + uint(node);
+    if (bit == 0u) {
+        trans0[index] = to;
+    } else {
+        trans1[index] = to;
+    }
+}
+
+// 1-bit QKV SAM. One thread owns (batch, channel); time is serial in-thread.
+// Global trans0/1, fail, maxlen, last are [B, D, 2T+1] i32. Missing child is -1.
+kernel void ullis_rosa_qkv_1bit_fwd(
+    device const uint *q_bits [[buffer(0)]],
+    device const uint *k_bits [[buffer(1)]],
+    device const uint *v_bits [[buffer(2)]],
+    device const half *scale_e [[buffer(3)]],
+    device int *trans0 [[buffer(4)]],
+    device int *trans1 [[buffer(5)]],
+    device int *fail [[buffer(6)]],
+    device int *maxlen [[buffer(7)]],
+    device int *last [[buffer(8)]],
+    device uchar *idx [[buffer(9)]],
+    device float *out [[buffer(10)]],
+    constant uint &batch [[buffer(11)]],
+    constant uint &time [[buffer(12)]],
+    constant uint &channels [[buffer(13)]],
+    uint thread_id [[thread_position_in_grid]]) {
+    const uint threads = batch * channels;
+    if (thread_id >= threads || time == 0u) {
+        return;
+    }
+    const uint b = thread_id / channels;
+    const uint c = thread_id % channels;
+    const uint nodes = 2u * time + 1u;
+    const uint base = thread_id * nodes;
+    for (uint node = 0u; node < nodes; ++node) {
+        trans0[base + node] = -1;
+        trans1[base + node] = -1;
+        fail[base + node] = -1;
+        maxlen[base + node] = 0;
+        last[base + node] = -1;
+    }
+
+    int u = 1;
+    int g = 0;
+    int w = 0;
+    int h = 0;
+    const float e_c = float(scale_e[c]);
+    for (uint t = 0u; t < time; ++t) {
+        const uint q = rosa_extract_bit(q_bits, rosa_bit_index(b, t, c, time, channels));
+        const uint k = rosa_extract_bit(k_bits, rosa_bit_index(b, t, c, time, channels));
+        const int i = int(t);
+
+        int p = w;
+        int x = h;
+        while (p != -1 && rosa_child(trans0, trans1, base, p, q) < 0) {
+            const int mp = maxlen[base + uint(p)];
+            if (x > mp) {
+                x = mp;
+            }
+            p = fail[base + uint(p)];
+        }
+        if (p == -1) {
+            p = 0;
+            x = 0;
+        } else {
+            p = rosa_child(trans0, trans1, base, p, q);
+            x += 1;
+        }
+
+        int v = p;
+        while (fail[base + uint(v)] != -1 && maxlen[base + uint(fail[base + uint(v)])] >= x) {
+            v = fail[base + uint(v)];
+        }
+        while (v != -1 && (maxlen[base + uint(v)] <= 0 || last[base + uint(v)] < 0)) {
+            v = fail[base + uint(v)];
+        }
+
+        uchar collapsed = 0;
+        if (v != -1) {
+            const uint pos = uint(last[base + uint(v)] + 1);
+            collapsed = uchar(rosa_extract_bit(
+                v_bits,
+                rosa_bit_index(b, pos, c, time, channels)));
+        }
+        const uint out_index = rosa_bit_index(b, t, c, time, channels);
+        idx[out_index] = collapsed;
+        out[out_index] = (2.0f * float(collapsed) - 1.0f) * e_c;
+        w = p;
+        h = x;
+
+        const int j = u;
+        u += 1;
+        maxlen[base + uint(j)] = maxlen[base + uint(g)] + 1;
+        p = g;
+        while (p != -1 && rosa_child(trans0, trans1, base, p, k) < 0) {
+            rosa_set_child(trans0, trans1, base, p, k, j);
+            p = fail[base + uint(p)];
+        }
+        if (p == -1) {
+            fail[base + uint(j)] = 0;
+        } else {
+            const int d = rosa_child(trans0, trans1, base, p, k);
+            if (maxlen[base + uint(p)] + 1 == maxlen[base + uint(d)]) {
+                fail[base + uint(j)] = d;
+            } else {
+                const int clone = u;
+                u += 1;
+                trans0[base + uint(clone)] = trans0[base + uint(d)];
+                trans1[base + uint(clone)] = trans1[base + uint(d)];
+                maxlen[base + uint(clone)] = maxlen[base + uint(p)] + 1;
+                fail[base + uint(clone)] = fail[base + uint(d)];
+                last[base + uint(clone)] = last[base + uint(d)];
+                fail[base + uint(d)] = clone;
+                fail[base + uint(j)] = clone;
+                while (p != -1 && rosa_child(trans0, trans1, base, p, k) == d) {
+                    rosa_set_child(trans0, trans1, base, p, k, clone);
+                    p = fail[base + uint(p)];
+                }
+            }
+        }
+        v = j;
+        g = j;
+        while (v != -1 && last[base + uint(v)] < i) {
+            last[base + uint(v)] = i;
+            v = fail[base + uint(v)];
+        }
+    }
+}
+
+// g_e[c] = Σ_{b,t} gy[b,t,c] * (2 * idx[b,t,c] - 1). No match mask.
+kernel void ullis_rosa_qkv_1bit_bwd_e(
+    device const float *output_gradient [[buffer(0)]],
+    device const uchar *idx [[buffer(1)]],
+    device float *e_gradient [[buffer(2)]],
+    constant uint &batch [[buffer(3)]],
+    constant uint &time [[buffer(4)]],
+    constant uint &channels [[buffer(5)]],
+    uint c [[thread_position_in_grid]]) {
+    if (c >= channels) {
+        return;
+    }
+    float acc = 0.0f;
+    for (uint b = 0u; b < batch; ++b) {
+        for (uint t = 0u; t < time; ++t) {
+            const uint index = (b * time + t) * channels + c;
+            acc += output_gradient[index] * (2.0f * float(idx[index]) - 1.0f);
+        }
+    }
+    e_gradient[c] = acc;
+}

@@ -19,6 +19,16 @@ pub enum OptimizerKind {
 }
 
 impl OptimizerKind {
+    /// Heron 0.10 train is clipped SGD on FP16 tensors and BinaryConnect latents.
+    pub fn require_train_step(self) -> Result<()> {
+        match self {
+            Self::StatelessSgd => Ok(()),
+            Self::LionFp16 => {
+                bail!("Heron train uses stateless clipped SGD; lion_fp16 is not wired")
+            }
+        }
+    }
+
     pub(crate) fn state_bytes(
         self,
         parameter_count: usize,
@@ -136,6 +146,12 @@ mod tests {
         lion.step(&mut parameters, &[2.0, -3.0]).unwrap();
         assert_eq!(parameters, [0.9, -0.9]);
         assert!(lion.step(&mut parameters, &[f32::NAN, 0.0]).is_err());
+    }
+
+    #[test]
+    fn train_step_rejects_lion_until_wired() {
+        assert!(OptimizerKind::StatelessSgd.require_train_step().is_ok());
+        assert!(OptimizerKind::LionFp16.require_train_step().is_err());
     }
 
     #[test]
