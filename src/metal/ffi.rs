@@ -70,22 +70,44 @@ impl MetalBuffer {
     }
 
     pub fn write_f32(&self, values: &[f32]) -> Result<()> {
-        let byte_len = values
-            .len()
-            .checked_mul(size_of::<f32>())
-            .ok_or_else(|| anyhow::anyhow!("Metal f32 write size overflow"))?;
-        let mut mapped = self.map_mut(byte_len)?;
-        mapped.as_mut_slice().copy_from_slice(f32_as_bytes(values));
-        Ok(())
+        self.write_bytes(f32_as_bytes(values))
     }
 
     pub fn read_f32(&self, values: &mut [f32]) -> Result<()> {
-        let byte_len = values
-            .len()
-            .checked_mul(size_of::<f32>())
-            .ok_or_else(|| anyhow::anyhow!("Metal f32 read size overflow"))?;
-        let mapped = self.map(byte_len)?;
-        f32_as_bytes_mut(values).copy_from_slice(mapped.as_slice());
+        self.read_bytes(f32_as_bytes_mut(values))
+    }
+
+    pub fn write_u16(&self, values: &[u16]) -> Result<()> {
+        self.write_bytes(u16_as_bytes(values))
+    }
+
+    pub fn read_u16(&self, values: &mut [u16]) -> Result<()> {
+        self.read_bytes(u16_as_bytes_mut(values))
+    }
+
+    pub fn write_u32(&self, values: &[u32]) -> Result<()> {
+        self.write_bytes(u32_as_bytes(values))
+    }
+
+    pub fn read_u32(&self, values: &mut [u32]) -> Result<()> {
+        self.read_bytes(u32_as_bytes_mut(values))
+    }
+
+    pub fn write_bytes(&self, values: &[u8]) -> Result<()> {
+        let mut mapped = self.map_mut(values.len())?;
+        mapped.as_mut_slice().copy_from_slice(values);
+        Ok(())
+    }
+
+    pub fn read_bytes(&self, values: &mut [u8]) -> Result<()> {
+        let mapped = self.map(values.len())?;
+        values.copy_from_slice(mapped.as_slice());
+        Ok(())
+    }
+
+    pub fn zero(&self) -> Result<()> {
+        let mut mapped = self.map_mut(self.len)?;
+        mapped.as_mut_slice().fill(0);
         Ok(())
     }
 
@@ -122,30 +144,62 @@ impl MappedBytes<'_> {
 }
 
 pub fn set_bytes_u32(encoder: &ComputeEncoder, index: usize, values: &[u32]) -> Result<()> {
-    if values.is_empty() {
-        bail!("set_bytes_u32 requires at least one value");
+    set_bytes(encoder, index, u32_as_bytes(values), "set_bytes_u32")
+}
+
+pub fn set_bytes_f32(encoder: &ComputeEncoder, index: usize, values: &[f32]) -> Result<()> {
+    set_bytes(encoder, index, f32_as_bytes(values), "set_bytes_f32")
+}
+
+fn set_bytes(encoder: &ComputeEncoder, index: usize, bytes: &[u8], name: &str) -> Result<()> {
+    if bytes.is_empty() {
+        bail!("{name} requires at least one value");
     }
-    let bytes = values
-        .len()
-        .checked_mul(size_of::<u32>())
-        .ok_or_else(|| anyhow::anyhow!("set_bytes_u32 length overflow"))?;
-    // SAFETY: `setBytes` copies `bytes` synchronously from `values`, which
+    // SAFETY: `setBytes` copies `bytes` synchronously from `bytes`, which
     // stays live for the duration of the call. `index` is the MSL buffer slot.
     unsafe {
-        encoder.setBytes_length_atIndex(NonNull::from(&values[0]).cast::<c_void>(), bytes, index);
+        encoder.setBytes_length_atIndex(
+            NonNull::from(&bytes[0]).cast::<c_void>(),
+            bytes.len(),
+            index,
+        );
     }
     Ok(())
 }
 
 fn f32_as_bytes(values: &[f32]) -> &[u8] {
-    let len = values.len().saturating_mul(size_of::<f32>());
-    // SAFETY: `values` is a live `[f32]` occupying `len` bytes.
-    unsafe { core::slice::from_raw_parts(values.as_ptr().cast::<u8>(), len) }
+    as_bytes(values)
 }
 
 fn f32_as_bytes_mut(values: &mut [f32]) -> &mut [u8] {
-    let len = values.len().saturating_mul(size_of::<f32>());
-    // SAFETY: `values` is a live exclusive `[f32]` occupying `len` bytes.
+    as_bytes_mut(values)
+}
+
+fn u16_as_bytes(values: &[u16]) -> &[u8] {
+    as_bytes(values)
+}
+
+fn u16_as_bytes_mut(values: &mut [u16]) -> &mut [u8] {
+    as_bytes_mut(values)
+}
+
+fn u32_as_bytes(values: &[u32]) -> &[u8] {
+    as_bytes(values)
+}
+
+fn u32_as_bytes_mut(values: &mut [u32]) -> &mut [u8] {
+    as_bytes_mut(values)
+}
+
+fn as_bytes<T: Copy>(values: &[T]) -> &[u8] {
+    let len = values.len().saturating_mul(size_of::<T>());
+    // SAFETY: `values` is a live `[T]` occupying `len` bytes.
+    unsafe { core::slice::from_raw_parts(values.as_ptr().cast::<u8>(), len) }
+}
+
+fn as_bytes_mut<T: Copy>(values: &mut [T]) -> &mut [u8] {
+    let len = values.len().saturating_mul(size_of::<T>());
+    // SAFETY: `values` is a live exclusive `[T]` occupying `len` bytes.
     unsafe { core::slice::from_raw_parts_mut(values.as_mut_ptr().cast::<u8>(), len) }
 }
 

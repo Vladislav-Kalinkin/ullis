@@ -4,6 +4,7 @@ pub mod config;
 pub mod model;
 pub mod optimizer;
 pub mod precision;
+pub mod rosa;
 pub mod tokenizer;
 #[cfg(target_os = "macos")]
 pub mod metal;
