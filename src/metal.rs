@@ -1,8 +1,8 @@
 //! Metal runtime for Heron: LayerNorm, BinaryConnect, FP16 linear, streamed CE,
-//! and 1-bit QKV ROSA SAM forward.
+//! 1-bit QKV ROSA SAM, and WKV7.
 //!
-//! Buffer mapping lives in [`ffi`]. There is no MPS path. WKV7 kernels arrive
-//! in a later PR. Identity remains a pipeline-smoke entry point.
+//! Buffer mapping lives in [`ffi`]. There is no MPS path. Identity remains a
+//! pipeline-smoke entry point.
 
 use anyhow::{Result, bail};
 use objc2::rc::Retained;
@@ -102,6 +102,8 @@ pub const CMIX_RELU2_BACKWARD_KERNEL_NAME: &str = "ullis_cmix_relu2_backward";
 pub const RESIDUAL_ADD_KERNEL_NAME: &str = "ullis_residual_add";
 pub const STREAMED_CROSS_ENTROPY_FP16_KERNEL_NAME: &str = "ullis_streamed_cross_entropy_fp16";
 pub const CLIPPED_SGD_FP16_KERNEL_NAME: &str = "ullis_clipped_sgd_fp16";
+pub const WKV7_FORWARD_KERNEL_NAME: &str = "ullis_wkv7_forward";
+pub const WKV7_BACKWARD_KERNEL_NAME: &str = "ullis_wkv7_backward";
 
 pub const RWKV8_METAL_SOURCE: &str = include_str!("metal/rwkv8.metal");
 
@@ -126,6 +128,7 @@ pub const PR3_KERNEL_NAMES: &[&str] = &[
 
 pub const PR4_KERNEL_NAMES: &[&str] = &[ROSA_QKV_1BIT_FWD_KERNEL_NAME];
 pub const PR5_KERNEL_NAMES: &[&str] = &[ROSA_QKV_1BIT_BWD_E_KERNEL_NAME];
+pub const PR8_KERNEL_NAMES: &[&str] = &[WKV7_FORWARD_KERNEL_NAME, WKV7_BACKWARD_KERNEL_NAME];
 
 /// Compiles the identity entry point and checks its dispatch capacity.
 pub fn validate_metal_pipeline(shape: MetalDispatchShape) -> Result<usize> {
@@ -244,6 +247,8 @@ struct Pipelines {
     residual_add: Pipeline,
     streamed_cross_entropy_fp16: Pipeline,
     clipped_sgd_fp16: Pipeline,
+    wkv7_forward: Pipeline,
+    wkv7_backward: Pipeline,
 }
 
 /// Reusable Metal objects for resident Heron kernels. No MPS GEMM.
@@ -330,6 +335,8 @@ impl MetalRuntime {
                 &library,
                 CLIPPED_SGD_FP16_KERNEL_NAME,
             )?,
+            wkv7_forward: pipeline_from_library(&device, &library, WKV7_FORWARD_KERNEL_NAME)?,
+            wkv7_backward: pipeline_from_library(&device, &library, WKV7_BACKWARD_KERNEL_NAME)?,
         };
         let queue = device
             .newCommandQueue()
@@ -481,6 +488,168 @@ impl MetalRuntime {
             },
         );
         Ok(())
+    }
+
+    fn encode_wkv7(
+        encoder: &ffi::ComputeEncoder,
+        pipeline: &Pipeline,
+        buffers: &[&MetalBuffer],
+        time: u32,
+        heads: u32,
+        batch: u32,
+        constant_start: usize,
+    ) -> Result<()> {
+        use objc2_metal::{MTLComputeCommandEncoder, MTLSize};
+
+        encoder.setComputePipelineState(pipeline);
+        for (slot, buffer) in buffers.iter().enumerate() {
+            set_buffer(encoder, buffer, slot);
+        }
+        set_bytes_u32(encoder, constant_start, &[time])?;
+        set_bytes_u32(encoder, constant_start + 1, &[heads])?;
+        encoder.dispatchThreadgroups_threadsPerThreadgroup(
+            MTLSize {
+                width: usize::try_from(heads).unwrap_or(0),
+                height: usize::try_from(batch).unwrap_or(0),
+                depth: 1,
+            },
+            MTLSize {
+                width: crate::wkv7::HEAD_SIZE,
+                height: 1,
+                depth: 1,
+            },
+        );
+        Ok(())
+    }
+
+    /// Metal-resident CUDA `forward_kernel`. `T` must be a multiple of 16.
+    pub fn wkv7_forward(
+        &self,
+        w: &[f32],
+        q: &[f32],
+        k: &[f32],
+        v: &[f32],
+        a: &[f32],
+        b: &[f32],
+        batch: usize,
+        time: usize,
+        heads: usize,
+    ) -> Result<crate::wkv7::Wkv7Forward> {
+        crate::wkv7::wkv7_forward(w, q, k, v, a, b, batch, time, heads)?;
+        let len = batch
+            .saturating_mul(time)
+            .saturating_mul(heads)
+            .saturating_mul(crate::wkv7::HEAD_SIZE);
+        let s_len = batch
+            .saturating_mul(heads)
+            .saturating_mul(time / crate::wkv7::CHUNK_LEN)
+            .saturating_mul(crate::wkv7::HEAD_SIZE)
+            .saturating_mul(crate::wkv7::HEAD_SIZE);
+        let w_b = self.buffer_f32(w)?;
+        let q_b = self.buffer_f32(q)?;
+        let k_b = self.buffer_f32(k)?;
+        let v_b = self.buffer_f32(v)?;
+        let a_b = self.buffer_f32(a)?;
+        let b_b = self.buffer_f32(b)?;
+        let y_b = self.zeros_f32(len)?;
+        let s_b = self.zeros_f32(s_len.max(1))?;
+        let sa_b = self.zeros_f32(len)?;
+        let t = as_u32(time, "WKV7 time")?;
+        let h = as_u32(heads, "WKV7 heads")?;
+        let bb = as_u32(batch, "WKV7 batch")?;
+        self.submit(|encoder| {
+            Self::encode_wkv7(
+                encoder,
+                &self.pipelines.wkv7_forward,
+                &[&w_b, &q_b, &k_b, &v_b, &a_b, &b_b, &y_b, &s_b, &sa_b],
+                t,
+                h,
+                bb,
+                9,
+            )
+        })?;
+        let mut y = vec![0.0; len];
+        let mut s = vec![0.0; s_len];
+        let mut sa = vec![0.0; len];
+        y_b.read_f32(&mut y)?;
+        s_b.read_f32(&mut s)?;
+        sa_b.read_f32(&mut sa)?;
+        Ok(crate::wkv7::Wkv7Forward { y, s, sa })
+    }
+
+    /// Metal-resident CUDA `backward_kernel`.
+    pub fn wkv7_backward(
+        &self,
+        w: &[f32],
+        q: &[f32],
+        k: &[f32],
+        v: &[f32],
+        a: &[f32],
+        b: &[f32],
+        dy: &[f32],
+        s: &[f32],
+        sa: &[f32],
+        batch: usize,
+        time: usize,
+        heads: usize,
+    ) -> Result<crate::wkv7::Wkv7Backward> {
+        crate::wkv7::wkv7_backward(w, q, k, v, a, b, dy, s, sa, batch, time, heads)?;
+        let len = batch
+            .saturating_mul(time)
+            .saturating_mul(heads)
+            .saturating_mul(crate::wkv7::HEAD_SIZE);
+        let w_b = self.buffer_f32(w)?;
+        let q_b = self.buffer_f32(q)?;
+        let k_b = self.buffer_f32(k)?;
+        let v_b = self.buffer_f32(v)?;
+        let a_b = self.buffer_f32(a)?;
+        let b_b = self.buffer_f32(b)?;
+        let dy_b = self.buffer_f32(dy)?;
+        let s_b = self.buffer_f32(s)?;
+        let sa_b = self.buffer_f32(sa)?;
+        let dw_b = self.zeros_f32(len)?;
+        let dq_b = self.zeros_f32(len)?;
+        let dk_b = self.zeros_f32(len)?;
+        let dv_b = self.zeros_f32(len)?;
+        let da_b = self.zeros_f32(len)?;
+        let db_b = self.zeros_f32(len)?;
+        let t = as_u32(time, "WKV7 time")?;
+        let h = as_u32(heads, "WKV7 heads")?;
+        let bb = as_u32(batch, "WKV7 batch")?;
+        self.submit(|encoder| {
+            Self::encode_wkv7(
+                encoder,
+                &self.pipelines.wkv7_backward,
+                &[
+                    &w_b, &q_b, &k_b, &v_b, &a_b, &b_b, &dy_b, &s_b, &sa_b, &dw_b, &dq_b, &dk_b,
+                    &dv_b, &da_b, &db_b,
+                ],
+                t,
+                h,
+                bb,
+                15,
+            )
+        })?;
+        let mut dw = vec![0.0; len];
+        let mut dq = vec![0.0; len];
+        let mut dk = vec![0.0; len];
+        let mut dv = vec![0.0; len];
+        let mut da = vec![0.0; len];
+        let mut db = vec![0.0; len];
+        dw_b.read_f32(&mut dw)?;
+        dq_b.read_f32(&mut dq)?;
+        dk_b.read_f32(&mut dk)?;
+        dv_b.read_f32(&mut dv)?;
+        da_b.read_f32(&mut da)?;
+        db_b.read_f32(&mut db)?;
+        Ok(crate::wkv7::Wkv7Backward {
+            dw,
+            dq,
+            dk,
+            dv,
+            da,
+            db,
+        })
     }
 
     pub fn identity(&self, input: &[f32]) -> Result<Vec<f32>> {
@@ -1498,8 +1667,13 @@ mod tests {
                 "missing kernel {name}"
             );
         }
+        for name in PR8_KERNEL_NAMES {
+            assert!(
+                RWKV8_METAL_SOURCE.contains(&format!("kernel void {name}(")),
+                "missing kernel {name}"
+            );
+        }
         assert!(!RWKV8_METAL_SOURCE.contains("ullis_rosa_qkv_1bit_bwd_bits"));
-        assert!(!RWKV8_METAL_SOURCE.contains("ullis_wkv7"));
     }
 
     #[test]
@@ -1512,6 +1686,7 @@ mod tests {
             .iter()
             .chain(PR4_KERNEL_NAMES)
             .chain(PR5_KERNEL_NAMES)
+            .chain(PR8_KERNEL_NAMES)
         {
             let width = validate_metal_kernel(name, shape).unwrap();
             assert!(width > 0, "{name}");

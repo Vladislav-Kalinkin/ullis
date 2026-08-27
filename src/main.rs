@@ -1,11 +1,12 @@
 use anyhow::{Context, Result, bail};
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use serde::{Deserialize, Serialize};
-use std::fs::{self, File};
-use std::io::{BufRead, BufReader, Write};
+use std::fmt::Display;
+use std::fs::{self, File, OpenOptions};
+use std::io::{self, BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::time::Instant;
-use ullis::tokenizer::{train_bpe, BpeTokenizer, DEFAULT_VOCAB, MIN_VOCAB};
+use ullis::tokenizer::{BpeTokenizer, DEFAULT_VOCAB, MIN_VOCAB, train_bpe};
 use ullis::{Architecture, CausalBatcher, ModelCheckpoint, OptimizerKind, TrainConfig, UllisHeron};
 
 #[derive(Debug, Parser)]
@@ -67,6 +68,14 @@ enum Command {
         #[arg(long, default_value_t = 64)]
         max_tokens: usize,
     },
+    EvalDigits {
+        #[arg(long)]
+        checkpoint: PathBuf,
+        #[arg(long, value_enum)]
+        task: DigitTask,
+        #[arg(long, default_value_t = 8)]
+        max_digits: usize,
+    },
 }
 
 #[derive(Clone, Debug, Args, Default)]
@@ -117,6 +126,12 @@ enum ThinkingLevel {
 enum Backend {
     Metal,
     Cpu,
+}
+
+#[derive(Clone, Copy, Debug, ValueEnum)]
+enum DigitTask {
+    Reverse,
+    Plusminus,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -309,10 +324,7 @@ fn cycle_corpus(ids: &[u32], needed: usize) -> Result<Vec<u32>> {
 }
 
 fn write_metrics(path: &Path, row: &serde_json::Value) -> Result<()> {
-    let mut file = fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(path)?;
+    let mut file = OpenOptions::new().create(true).append(true).open(path)?;
     writeln!(file, "{row}")?;
     Ok(())
 }
@@ -332,22 +344,32 @@ fn train(
     if steps == 0 || checkpoint_every == 0 || !learning_rate.is_finite() || learning_rate <= 0.0 {
         bail!("steps, checkpoint-every, and learning-rate must be positive");
     }
-    let mut cfg = load_config(config_path, &overrides)?;
-    cfg.validate()?;
-    if matches!(cfg.architecture, Architecture::RosaRwkv7) {
-        bail!("rosa_rwkv7 train is not wired");
-    }
-    cfg.optimizer.require_train_step()?;
     let records = load_dataset(&data)?;
     let texts: Vec<String> = records.iter().map(training_text).collect();
-    fs::create_dir_all(&run)?;
     let (mut model, mut tokenizer) = if let Some(path) = resume {
-        load_model(&path)?
+        let (model, tokenizer) = load_model(&path)?;
+        reject_resume_overrides(&model.cfg, &overrides)?;
+        if let Some(path) = config_path {
+            let file_cfg = load_config(Some(path), &TrainOverrides::default())?;
+            reject_resume_file_config(&model.cfg, &file_cfg)?;
+        }
+        (model, tokenizer)
     } else {
+        let mut cfg = load_config(config_path, &overrides)?;
+        cfg.validate()?;
+        if matches!(cfg.architecture, Architecture::RosaRwkv7) {
+            bail!("rosa_rwkv7 train is not wired");
+        }
+        cfg.optimizer.require_train_step()?;
         let tokenizer = train_bpe(&texts, cfg.vocab_size as u32, cfg.seed)?;
         cfg = cfg.with_tokenizer(&tokenizer)?;
         (UllisHeron::new(cfg)?, tokenizer)
     };
+    if matches!(model.cfg.architecture, Architecture::RosaRwkv7) {
+        bail!("rosa_rwkv7 train is not wired");
+    }
+    model.cfg.optimizer.require_train_step()?;
+    fs::create_dir_all(&run)?;
     tokenizer.save(run.join("tokenizer.json"))?;
     fs::write(
         run.join("config.json"),
@@ -448,6 +470,7 @@ fn train(
             loss.next_token, ema, loss.binary_flip_count
         );
         if step.is_multiple_of(checkpoint_every) || step == steps {
+            // Snapshot only on a checkpoint boundary: bits+scale+bias, never RAM latents.
             fs::write(
                 run.join("checkpoint.json"),
                 serde_json::to_string(&model.checkpoint())?,
@@ -462,9 +485,14 @@ fn train(
     Ok(())
 }
 
+fn load_checkpoint(path: &Path) -> Result<ModelCheckpoint> {
+    let bytes = fs::read(path).with_context(|| format!("read checkpoint {}", path.display()))?;
+    ModelCheckpoint::from_json_bytes(&bytes)
+        .with_context(|| format!("parse checkpoint {}", path.display()))
+}
+
 fn load_model(checkpoint: &Path) -> Result<(UllisHeron, BpeTokenizer)> {
-    let checkpoint_data: ModelCheckpoint = serde_json::from_slice(&fs::read(checkpoint)?)
-        .with_context(|| format!("parse checkpoint {}", checkpoint.display()))?;
+    let checkpoint_data = load_checkpoint(checkpoint)?;
     let model = UllisHeron::from_checkpoint(checkpoint_data)?;
     let tokenizer_path = checkpoint
         .parent()
@@ -477,25 +505,347 @@ fn load_model(checkpoint: &Path) -> Result<(UllisHeron, BpeTokenizer)> {
     Ok((model, tokenizer))
 }
 
-fn chat(checkpoint: PathBuf, _session: PathBuf, _thinking: ThinkingLevel) -> Result<()> {
-    let _ = load_model(&checkpoint)?;
-    bail!("Heron chat not wired")
+fn reject_resume_overrides(cfg: &TrainConfig, overrides: &TrainOverrides) -> Result<()> {
+    if let Some(architecture) = overrides.architecture {
+        let architecture = match architecture {
+            ArchitectureArg::Heron => Architecture::Heron,
+            ArchitectureArg::RosaRwkv7 => Architecture::RosaRwkv7,
+        };
+        if architecture != cfg.architecture {
+            bail!(
+                "--resume cannot change architecture (checkpoint {:?}, override {architecture:?})",
+                cfg.architecture
+            );
+        }
+    }
+    reject_resume_field("d-model", overrides.d_model, cfg.d_model)?;
+    reject_resume_field("layers", overrides.n_layers, cfg.n_layers)?;
+    reject_resume_field("context-len", overrides.context_len, cfg.context_len)?;
+    reject_resume_field("batch-size", overrides.batch_size, cfg.batch_size)?;
+    reject_resume_field("vocab-size", overrides.vocab_size, cfg.vocab_size)?;
+    reject_resume_field("seed", overrides.seed, cfg.seed)?;
+    if let Some(mib) = overrides.memory_budget_mib {
+        let bytes = mib
+            .checked_mul(1024 * 1024)
+            .ok_or_else(|| anyhow::anyhow!("memory-budget-mib overflows bytes"))?;
+        if bytes != cfg.memory_budget_bytes {
+            bail!(
+                "--resume cannot change memory-budget-mib (checkpoint {}, override {mib})",
+                cfg.memory_budget_bytes / (1024 * 1024)
+            );
+        }
+    }
+    if let Some(optimizer) = overrides.optimizer {
+        let optimizer = match optimizer {
+            OptimizerArg::StatelessSgd => OptimizerKind::StatelessSgd,
+            OptimizerArg::LionFp16 => OptimizerKind::LionFp16,
+        };
+        if optimizer != cfg.optimizer {
+            bail!(
+                "--resume cannot change optimizer (checkpoint {:?}, override {optimizer:?})",
+                cfg.optimizer
+            );
+        }
+    }
+    Ok(())
 }
 
-fn generate(checkpoint: PathBuf, _prompt: String, max_tokens: usize) -> Result<()> {
+fn reject_resume_field<T: Copy + PartialEq + Display>(
+    name: &str,
+    requested: Option<T>,
+    current: T,
+) -> Result<()> {
+    if let Some(value) = requested
+        && value != current
+    {
+        bail!("--resume cannot change {name} (checkpoint {current}, override {value})");
+    }
+    Ok(())
+}
+
+fn reject_resume_file_config(checkpoint: &TrainConfig, file: &TrainConfig) -> Result<()> {
+    if checkpoint.architecture != file.architecture
+        || checkpoint.d_model != file.d_model
+        || checkpoint.n_layers != file.n_layers
+        || checkpoint.vocab_size != file.vocab_size
+        || checkpoint.context_len != file.context_len
+        || checkpoint.batch_size != file.batch_size
+        || checkpoint.resolved_dim_ffn() != file.resolved_dim_ffn()
+        || checkpoint.rosa_bits != file.rosa_bits
+    {
+        bail!("--config does not match the resumed checkpoint; omit --config when using --resume");
+    }
+    Ok(())
+}
+
+fn inspect_run(run: &Path) -> Result<()> {
+    let checkpoint = load_checkpoint(&run.join("checkpoint.json"))?;
+    let report = checkpoint.inspect()?;
+    println!("{}", serde_json::to_string_pretty(&report)?);
+    Ok(())
+}
+
+fn greedy_token(logits: &[f32], tokenizer: &BpeTokenizer) -> u32 {
+    logits
+        .iter()
+        .enumerate()
+        .filter(|(id, _)| *id as u32 != tokenizer.pad_id && *id as u32 != tokenizer.bos_id)
+        .max_by(|(_, a), (_, b)| a.total_cmp(b))
+        .map(|(id, _)| id as u32)
+        .expect("non-empty vocabulary")
+}
+
+fn greedy_generate(
+    model: &UllisHeron,
+    tokenizer: &mut BpeTokenizer,
+    prompt: &str,
+    max_tokens: usize,
+) -> Result<String> {
     if max_tokens == 0 {
         bail!("max-tokens must be positive");
     }
-    let _ = load_model(&checkpoint)?;
-    bail!("Heron generate not wired")
+    let mut ids = tokenizer.encode(prompt, true, false);
+    if ids.is_empty() {
+        ids.push(tokenizer.bos_id);
+    }
+    if ids.len() > model.cfg.context_len {
+        bail!(
+            "prompt is longer than context_len ({})",
+            model.cfg.context_len
+        );
+    }
+    let mut state = model.generate_state()?;
+    let mut logits = Vec::new();
+    for &id in &ids {
+        logits = model.generate_step(&mut state, id)?;
+    }
+    let mut produced = Vec::with_capacity(max_tokens);
+    for _ in 0..max_tokens {
+        let next = greedy_token(&logits, tokenizer);
+        if next == tokenizer.eos_id {
+            break;
+        }
+        if state.time() >= model.cfg.context_len {
+            break;
+        }
+        produced.push(next);
+        logits = model.generate_step(&mut state, next)?;
+    }
+    Ok(tokenizer.decode(&produced))
+}
+
+fn chat(checkpoint: PathBuf, session: PathBuf, mut thinking: ThinkingLevel) -> Result<()> {
+    let (model, mut tokenizer) = load_model(&checkpoint)?;
+    if let Some(parent) = session.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let mut history = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&session)?;
+    println!("Ullis chat. /think low|medium|high|xhigh|off, /save, /quit");
+    for line in io::stdin().lock().lines() {
+        let line = line?;
+        if line == "/quit" {
+            break;
+        }
+        if line == "/save" {
+            history.flush()?;
+            println!("saved {}", session.display());
+            continue;
+        }
+        if let Some(level) = line.strip_prefix("/think ") {
+            thinking = match level {
+                "low" => ThinkingLevel::Low,
+                "medium" => ThinkingLevel::Medium,
+                "high" => ThinkingLevel::High,
+                "xhigh" => ThinkingLevel::Xhigh,
+                "off" => ThinkingLevel::Off,
+                _ => {
+                    println!("unknown thinking level");
+                    continue;
+                }
+            };
+            println!("thinking: {thinking:?}");
+            continue;
+        }
+        let user = DatasetMessage {
+            role: "user".into(),
+            content: line.clone(),
+            thinking: None,
+            tool_calls: None,
+            tool_call_id: None,
+        };
+        writeln!(history, "{}", serde_json::to_string(&user)?)?;
+        let prompt = format!("<user>{line}\n<assistant><thinking level=\"{thinking:?}\">");
+        let reply = greedy_generate(&model, &mut tokenizer, &prompt, 64)?;
+        let assistant = DatasetMessage {
+            role: "assistant".into(),
+            content: reply.clone(),
+            thinking: Some(format!("requested:{thinking:?}")),
+            tool_calls: None,
+            tool_call_id: None,
+        };
+        writeln!(history, "{}", serde_json::to_string(&assistant)?)?;
+        println!("{reply}");
+    }
+    Ok(())
+}
+
+fn generate(checkpoint: PathBuf, prompt: String, max_tokens: usize) -> Result<()> {
+    if max_tokens == 0 {
+        bail!("max-tokens must be positive");
+    }
+    let (model, mut tokenizer) = load_model(&checkpoint)?;
+    println!(
+        "{}",
+        greedy_generate(&model, &mut tokenizer, &prompt, max_tokens)?
+    );
+    Ok(())
+}
+
+fn splitmix(state: &mut u64) -> u64 {
+    *state = state.wrapping_add(0x9E37_79B9_7F4A_7C15);
+    let mut z = *state;
+    z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+    z ^ (z >> 31)
+}
+
+fn get_randint(digits: usize, rng: &mut u64) -> u64 {
+    let lo = if digits <= 1 {
+        0
+    } else {
+        10_u64.pow((digits - 1) as u32)
+    };
+    let hi = 10_u64.pow(digits as u32) - 1;
+    lo + splitmix(rng) % (hi - lo + 1)
+}
+
+fn wkv_pad_len(script_t: usize) -> usize {
+    script_t.div_ceil(16) * 16
+}
+
+fn eval_digits(checkpoint: PathBuf, task: DigitTask, max_digits: usize) -> Result<()> {
+    if max_digits == 0 {
+        bail!("max-digits must be positive");
+    }
+    let model = UllisHeron::from_checkpoint(load_checkpoint(&checkpoint)?)?;
+    if !matches!(model.cfg.architecture, Architecture::RosaRwkv7) {
+        bail!("eval-digits requires a rosa_rwkv7 checkpoint");
+    }
+    let (script_t, pad, alphabet, vocab) = match task {
+        DigitTask::Reverse => (129_usize, b'#' as u32, "0123456789,#", 12_usize),
+        DigitTask::Plusminus => (129_usize, b'=' as u32, "0123456789+-=", 13_usize),
+    };
+    if model.cfg.vocab_size < vocab {
+        bail!("checkpoint vocab is smaller than the {task:?} alphabet");
+    }
+    let t_wkv = wkv_pad_len(script_t);
+    if model.cfg.context_len < t_wkv {
+        bail!(
+            "checkpoint context_len {} cannot hold padded T_wkv {t_wkv}",
+            model.cfg.context_len
+        );
+    }
+    let mut rng = model.cfg.seed | 1;
+    let mut n_good = 0_usize;
+    let mut n_all = 0_usize;
+    for digits in 1..=max_digits {
+        let sequences: Vec<Vec<u32>> = match task {
+            DigitTask::Reverse => (0..10)
+                .map(|_| {
+                    let raw = get_randint(digits, &mut rng).to_string();
+                    let body = format!("{raw},{}", raw.chars().rev().collect::<String>());
+                    encode_digit_line(&body, alphabet, pad, t_wkv)
+                })
+                .collect(),
+            DigitTask::Plusminus => {
+                let mut out = Vec::new();
+                for ii in 1..2 * digits {
+                    let (aa, bb) = if ii <= digits {
+                        (ii, digits)
+                    } else {
+                        (digits, 2 * digits - ii)
+                    };
+                    let a = get_randint(aa, &mut rng) as i64;
+                    let b = get_randint(bb, &mut rng) as i64;
+                    let plus = splitmix(&mut rng) & 1 == 0;
+                    let result = if plus { a + b } else { a - b };
+                    let op = if plus { '+' } else { '-' };
+                    let body = format!("{a}{op}{b}={result}");
+                    out.push(encode_digit_line(&body, alphabet, pad, t_wkv));
+                }
+                out
+            }
+        };
+        for src in sequences {
+            let input = &src[..t_wkv];
+            let logits = model.logits(input, 1, t_wkv)?;
+            let vocab_size = model.cfg.vocab_size;
+            let predicted: Vec<u32> = (0..t_wkv)
+                .map(|t| {
+                    let row = &logits[t * vocab_size..(t + 1) * vocab_size];
+                    row.iter()
+                        .take(vocab)
+                        .enumerate()
+                        .max_by(|(_, a), (_, b)| a.total_cmp(b))
+                        .map(|(id, _)| id as u32)
+                        .unwrap_or(0)
+                })
+                .collect();
+            let xx: String = input
+                .iter()
+                .map(|&id| {
+                    alphabet
+                        .as_bytes()
+                        .get(id as usize)
+                        .copied()
+                        .unwrap_or(b'?') as char
+                })
+                .collect();
+            let (p1, p2) = match task {
+                DigitTask::Reverse => {
+                    let p1 = xx.find(',').unwrap_or(0);
+                    let p2 = xx.find('#').unwrap_or_else(|| xx.len().saturating_sub(1));
+                    (p1, p2)
+                }
+                DigitTask::Plusminus => {
+                    let p1 = xx.find('=').unwrap_or(0);
+                    let rest = &xx[p1 + 1..];
+                    let p2 = p1 + 1 + rest.find('=').unwrap_or(0);
+                    (p1, p2)
+                }
+            };
+            if p2 <= p1 {
+                continue;
+            }
+            n_all += p2 - p1;
+            for offset in 0..(p2 - p1) {
+                if predicted[p1 + offset] == src[p1 + 1 + offset] {
+                    n_good += 1;
+                }
+            }
+        }
+        println!("digits {digits} running {n_good}/{n_all}");
+    }
+    println!("eval-digits {task:?} correct {n_good} / {n_all} (unpadded span, T_wkv={t_wkv})");
+    Ok(())
+}
+
+fn encode_digit_line(body: &str, alphabet: &str, pad: u32, t_wkv: usize) -> Vec<u32> {
+    let mut ids: Vec<u32> = body
+        .chars()
+        .map(|ch| alphabet.find(ch).map(|i| i as u32).unwrap_or(pad))
+        .collect();
+    ids.resize(t_wkv, pad);
+    ids
 }
 
 fn smoke() -> Result<()> {
     let cfg = smoke_config(MIN_VOCAB as usize);
     let mut model = UllisHeron::new(cfg.clone())?;
-    let tokens: Vec<u32> = (0..cfg.context_len)
-        .map(|i| 4 + (i as u32 % 8))
-        .collect();
+    let tokens: Vec<u32> = (0..cfg.context_len).map(|i| 4 + (i as u32 % 8)).collect();
     let ln_v = (cfg.vocab_size as f32).ln();
     println!(
         "heron smoke | architecture {:?} | d {} | layers {} | context {} | vocab {} | rosa_grad {:?}",
@@ -566,10 +916,7 @@ fn main() -> Result<()> {
             }
             Ok(())
         }
-        Some(Command::Inspect { run }) => {
-            println!("{}", fs::read_to_string(run.join("config.json"))?);
-            Ok(())
-        }
+        Some(Command::Inspect { run }) => inspect_run(&run),
         Some(Command::Chat {
             checkpoint,
             session,
@@ -580,6 +927,11 @@ fn main() -> Result<()> {
             prompt,
             max_tokens,
         }) => generate(checkpoint, prompt, max_tokens),
+        Some(Command::EvalDigits {
+            checkpoint,
+            task,
+            max_digits,
+        }) => eval_digits(checkpoint, task, max_digits),
         None => {
             println!("Run `ullis --help` for training, dataset, and chat commands.");
             Ok(())

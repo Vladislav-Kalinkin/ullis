@@ -4,11 +4,14 @@
 //! Checkpoints store bits, learned scales, and bias only.
 
 use crate::config::{Architecture, RosaGradMode, TrainConfig};
-use crate::precision::{Fp16, Fp16Storage};
-use crate::rosa::{RosaSam, bit_from_activation};
+#[cfg(test)]
+use crate::precision::Fp16;
+use crate::precision::Fp16Storage;
 #[cfg(target_os = "macos")]
 use crate::rosa::pack_bitplane;
-use anyhow::{Result, bail};
+use crate::rosa::{RosaSam, bit_from_activation, sam_workspace_bytes};
+use crate::wkv7::{self, CHUNK_LEN, HEAD_SIZE};
+use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 
 pub const CHECKPOINT_FORMAT_VERSION: u32 = 2;
@@ -88,6 +91,22 @@ fn time_shift_delta(x: &[f32], batch: usize, time: usize, channels: usize) -> Re
                 };
             }
         }
+    }
+    Ok(xx)
+}
+
+fn time_shift_one(x: &[f32], prev: Option<&[f32]>) -> Result<Vec<f32>> {
+    if let Some(prev) = prev
+        && prev.len() != x.len()
+    {
+        bail!("time-shift prev length mismatch");
+    }
+    let mut xx = vec![0.0; x.len()];
+    for c in 0..x.len() {
+        xx[c] = match prev {
+            None => -x[c],
+            Some(prev) => prev[c] - x[c],
+        };
     }
     Ok(xx)
 }
@@ -598,6 +617,21 @@ impl RwkvCMixX070 {
         self.value.forward(&relu2, rows)
     }
 
+    fn forward_one(&self, x: &[f32], prev: Option<&[f32]>) -> Result<Vec<f32>> {
+        let d = self.x_k.len();
+        if x.len() != d {
+            bail!("CMix generate shape mismatch");
+        }
+        let xx = time_shift_one(x, prev)?;
+        let mut shifted = vec![0.0; d];
+        for c in 0..d {
+            shifted[c] = x[c] + xx[c] * self.x_k.get(c);
+        }
+        let key = self.key.forward(&shifted, 1)?;
+        let relu2: Vec<f32> = key.iter().map(|v| v.max(0.0) * v.max(0.0)).collect();
+        self.value.forward(&relu2, 1)
+    }
+
     fn forward_tape(&self, x: &[f32], batch: usize, time: usize) -> Result<CmixTape> {
         let d = self.x_k.len();
         let xx = time_shift_delta(x, batch, time, d)?;
@@ -637,7 +671,11 @@ impl RwkvCMixX070 {
         self.value.apply_clipped_sgd(&g_value, learning_rate)?;
         let mut g_key = vec![0.0; tape.key.len()];
         for (g, (key, g_relu)) in g_key.iter_mut().zip(tape.key.iter().zip(&g_relu2)) {
-            *g = if *key > 0.0 { 2.0 * *key * *g_relu } else { 0.0 };
+            *g = if *key > 0.0 {
+                2.0 * *key * *g_relu
+            } else {
+                0.0
+            };
         }
         let key_weights = self.key.out_features.saturating_mul(self.key.in_features);
         g_w[..key_weights].fill(0.0);
@@ -652,11 +690,13 @@ impl RwkvCMixX070 {
             &mut g_scale,
             None,
         )?;
-        let flips = self
-            .key
-            .flip_count_after(&g_w[..key_weights], &g_scale, None, learning_rate)?;
+        let flips =
+            self.key
+                .flip_count_after(&g_w[..key_weights], &g_scale, None, learning_rate)?;
         let mut g_mix = vec![0.0; d];
-        lerp_shift_backward(&tape.xx, &self.x_k, &g_shifted, batch, time, d, g_x, &mut g_mix);
+        lerp_shift_backward(
+            &tape.xx, &self.x_k, &g_shifted, batch, time, d, g_x, &mut g_mix,
+        );
         for c in 0..d {
             self.x_k.apply_clipped_sgd(c, g_mix[c], learning_rate);
         }
@@ -769,6 +809,40 @@ impl RwkvRosaQkv1Bit {
         self.o.forward(&y, rows)
     }
 
+    fn forward_one(
+        &self,
+        x: &[f32],
+        prev: Option<&[f32]>,
+        sams: &mut [RosaSam],
+    ) -> Result<Vec<f32>> {
+        let d = self.e.len();
+        if x.len() != d || sams.len() != d {
+            bail!("ROSA generate shape mismatch");
+        }
+        let xx = time_shift_one(x, prev)?;
+        let mut q_in = vec![0.0; d];
+        let mut k_in = vec![0.0; d];
+        let mut v_in = vec![0.0; d];
+        for c in 0..d {
+            q_in[c] = x[c] + xx[c] * self.x_q.get(c);
+            k_in[c] = x[c] + xx[c] * self.x_k.get(c);
+            v_in[c] = x[c] + xx[c] * self.x_v.get(c);
+        }
+        let q = self.q.forward(&q_in, 1)?;
+        let k = self.k.forward(&k_in, 1)?;
+        let v = self.v.forward(&v_in, 1)?;
+        let mut y = vec![0.0; d];
+        for (c, sam) in sams.iter_mut().enumerate() {
+            let idx = sam.push(
+                bit_from_activation(q[c]),
+                bit_from_activation(k[c]),
+                bit_from_activation(v[c]),
+            );
+            y[c] = (2.0 * f32::from(idx) - 1.0) * self.e.get(c);
+        }
+        self.o.forward(&y, 1)
+    }
+
     fn forward_tape(
         &self,
         x: &[f32],
@@ -822,12 +896,9 @@ impl RwkvRosaQkv1Bit {
             &mut g_scale,
             Some(&mut g_bias),
         )?;
-        let flips = self.o.flip_count_after(
-            &g_w[..weights],
-            &g_scale,
-            Some(&g_bias),
-            learning_rate,
-        )?;
+        let flips =
+            self.o
+                .flip_count_after(&g_w[..weights], &g_scale, Some(&g_bias), learning_rate)?;
         let g_e = rosa_e_grad(&g_y, &tape.idx, d, metal)?;
         for c in 0..d {
             self.e.apply_clipped_sgd(c, g_e[c], learning_rate);
@@ -861,9 +932,21 @@ fn rosa_qkv_y(
 ) -> Result<(Vec<u8>, Vec<f32>)> {
     #[cfg(target_os = "macos")]
     if let Some(device) = metal {
-        let q_bits = q.iter().copied().map(bit_from_activation).collect::<Vec<_>>();
-        let k_bits = k.iter().copied().map(bit_from_activation).collect::<Vec<_>>();
-        let v_bits = v.iter().copied().map(bit_from_activation).collect::<Vec<_>>();
+        let q_bits = q
+            .iter()
+            .copied()
+            .map(bit_from_activation)
+            .collect::<Vec<_>>();
+        let k_bits = k
+            .iter()
+            .copied()
+            .map(bit_from_activation)
+            .collect::<Vec<_>>();
+        let v_bits = v
+            .iter()
+            .copied()
+            .map(bit_from_activation)
+            .collect::<Vec<_>>();
         let e_vec: Vec<f32> = (0..d).map(|c| e.get(c)).collect();
         let fwd = device.runtime.rosa_qkv_1bit_fwd(
             &pack_bitplane(&q_bits)?,
@@ -926,6 +1009,584 @@ fn rosa_e_grad(
     Ok(g_e)
 }
 
+const GROUP_NORM_EPS: f32 = 64e-5;
+
+fn sigmoid(x: f32) -> f32 {
+    1.0 / (1.0 + (-x).exp())
+}
+
+fn softplus(x: f32) -> f32 {
+    if x > 20.0 { x } else { x.exp().ln_1p() }
+}
+
+fn gemm_right(
+    x: &[f32],
+    w: &Fp16Storage,
+    rows: usize,
+    inner: usize,
+    out: usize,
+) -> Result<Vec<f32>> {
+    if rows.checked_mul(inner) != Some(x.len()) || w.len() != inner.saturating_mul(out) {
+        bail!("LoRA gemm shape mismatch");
+    }
+    let mut y = vec![0.0; rows.saturating_mul(out)];
+    for row in 0..rows {
+        let x_row = &x[row * inner..(row + 1) * inner];
+        for o in 0..out {
+            let mut sum = 0.0;
+            for i in 0..inner {
+                sum += x_row[i] * w.get(i * out + o);
+            }
+            y[row * out + o] = sum;
+        }
+    }
+    Ok(y)
+}
+
+fn group_norm(
+    x: &[f32],
+    weight: &Fp16Storage,
+    bias: &Fp16Storage,
+    rows: usize,
+    channels: usize,
+    groups: usize,
+) -> Result<Vec<f32>> {
+    if rows.checked_mul(channels) != Some(x.len())
+        || weight.len() != channels
+        || bias.len() != channels
+        || groups == 0
+        || !channels.is_multiple_of(groups)
+    {
+        bail!("GroupNorm shape mismatch");
+    }
+    let group_size = channels / groups;
+    let mut y = vec![0.0; x.len()];
+    for row in 0..rows {
+        for g in 0..groups {
+            let start = row * channels + g * group_size;
+            let slice = &x[start..start + group_size];
+            let mean = slice.iter().sum::<f32>() / group_size as f32;
+            let var =
+                slice.iter().map(|v| (v - mean) * (v - mean)).sum::<f32>() / group_size as f32;
+            let inv = (var + GROUP_NORM_EPS).sqrt().recip();
+            for c in 0..group_size {
+                let index = start + c;
+                let channel = g * group_size + c;
+                y[index] = (x[index] - mean) * inv * weight.get(channel) + bias.get(channel);
+            }
+        }
+    }
+    Ok(y)
+}
+
+fn uniform_fp16(len: usize, lo: f32, hi: f32, seed: u64) -> Fp16Storage {
+    let mut state = seed | 1;
+    let span = hi - lo;
+    Fp16Storage::from_f32((0..len).map(|_| {
+        let unit = (splitmix64(&mut state) >> 11) as f32 / ((1_u64 << 53) as f32);
+        lo + span * unit
+    }))
+}
+
+fn fp16_to_f32(values: &Fp16Storage) -> Vec<f32> {
+    (0..values.len()).map(|i| values.get(i)).collect()
+}
+
+fn ortho_fp16(rows: usize, cols: usize, scale: f32, seed: u64) -> Fp16Storage {
+    let gain = if rows > cols {
+        (rows as f32 / cols as f32).sqrt()
+    } else {
+        1.0
+    } * scale;
+    let mut state = seed | 1;
+    let mut m = vec![0.0; rows.saturating_mul(cols)];
+    for value in &mut m {
+        let unit = (splitmix64(&mut state) >> 11) as f32 / ((1_u64 << 53) as f32);
+        *value = unit * 2.0 - 1.0;
+    }
+    let k = cols.min(rows);
+    for c in 0..k {
+        let mut n2 = 0.0;
+        for r in 0..rows {
+            n2 += m[r * cols + c] * m[r * cols + c];
+        }
+        let n = n2.sqrt().max(1e-8);
+        for r in 0..rows {
+            m[r * cols + c] /= n;
+        }
+        for c2 in (c + 1)..cols {
+            let mut dot = 0.0;
+            for r in 0..rows {
+                dot += m[r * cols + c] * m[r * cols + c2];
+            }
+            for r in 0..rows {
+                m[r * cols + c2] -= dot * m[r * cols + c];
+            }
+        }
+    }
+    for value in &mut m {
+        *value *= gain;
+    }
+    Fp16Storage::from_f32(m)
+}
+
+/// Full `RWKV_Tmix_x070` wrapper. Weights are FP16; WKV7 itself is FP32.
+#[derive(Clone, Debug)]
+pub(crate) struct RwkvTmixX070 {
+    layer_id: usize,
+    n_head: usize,
+    x_r: Fp16Storage,
+    x_w: Fp16Storage,
+    x_k: Fp16Storage,
+    x_v: Fp16Storage,
+    x_a: Fp16Storage,
+    x_g: Fp16Storage,
+    w1: Fp16Storage,
+    a1: Fp16Storage,
+    v1: Fp16Storage,
+    g1: Fp16Storage,
+    w2: Fp16Storage,
+    a2: Fp16Storage,
+    v2: Fp16Storage,
+    g2: Fp16Storage,
+    w0: Fp16Storage,
+    a0: Fp16Storage,
+    v0: Fp16Storage,
+    k_k: Fp16Storage,
+    k_a: Fp16Storage,
+    r_k: Fp16Storage,
+    receptance: Fp16Linear,
+    key: Fp16Linear,
+    value: Fp16Linear,
+    output: Fp16Linear,
+    ln_x_weight: Fp16Storage,
+    ln_x_bias: Fp16Storage,
+}
+
+impl RwkvTmixX070 {
+    fn seeded(
+        d_model: usize,
+        n_layers: usize,
+        layer_id: usize,
+        rank: usize,
+        seed: u64,
+    ) -> Result<Self> {
+        if d_model == 0 || !d_model.is_multiple_of(HEAD_SIZE) {
+            bail!("Tmix d_model must be a multiple of {HEAD_SIZE}");
+        }
+        let n_head = d_model / HEAD_SIZE;
+        let n = HEAD_SIZE as f32;
+        let c = d_model as f32;
+        let ratio_0_to_1 = if n_layers <= 1 {
+            0.0
+        } else {
+            layer_id as f32 / (n_layers - 1) as f32
+        };
+        let ratio_1_to_almost0 = 1.0 - (layer_id as f32 / n_layers.max(1) as f32);
+        let mut x_r = Vec::with_capacity(d_model);
+        let mut x_w = Vec::with_capacity(d_model);
+        let mut x_k = Vec::with_capacity(d_model);
+        let mut x_v = Vec::with_capacity(d_model);
+        let mut x_a = Vec::with_capacity(d_model);
+        let mut x_g = Vec::with_capacity(d_model);
+        let mut w0 = Vec::with_capacity(d_model);
+        let mut a0 = Vec::with_capacity(d_model);
+        let mut v0 = Vec::with_capacity(d_model);
+        let mut k_k = Vec::with_capacity(d_model);
+        let mut k_a = Vec::with_capacity(d_model);
+        for i in 0..d_model {
+            let ddd = i as f32 / c;
+            x_r.push(1.0 - ddd.powf(0.2 * ratio_1_to_almost0));
+            x_w.push(1.0 - ddd.powf(0.9 * ratio_1_to_almost0));
+            x_k.push(1.0 - ddd.powf(0.7 * ratio_1_to_almost0));
+            x_v.push(1.0 - ddd.powf(0.7 * ratio_1_to_almost0));
+            x_a.push(1.0 - ddd.powf(0.9 * ratio_1_to_almost0));
+            x_g.push(1.0 - ddd.powf(0.2 * ratio_1_to_almost0));
+            let linear = i as f32 / (c - 1.0).max(1.0) - 0.5;
+            let mut zigzag = ((i as f32 % n) - ((n - 1.0) / 2.0)) / ((n - 1.0) / 2.0);
+            zigzag *= zigzag.abs();
+            let www =
+                -6.0 + 6.0 * (i as f32 / (c - 1.0).max(1.0)).powf(1.0 + ratio_0_to_1.powf(0.3));
+            w0.push(www + 0.5 + zigzag * 2.5);
+            a0.push(-0.19 + zigzag * 0.3 + linear * 0.4);
+            v0.push(0.73 - linear * 0.4);
+            k_k.push(0.71 - linear * 0.1);
+            k_a.push(1.02);
+        }
+        let scale = (d_model as f32).sqrt().recip();
+        Ok(Self {
+            layer_id,
+            n_head,
+            x_r: Fp16Storage::from_f32(x_r),
+            x_w: Fp16Storage::from_f32(x_w),
+            x_k: Fp16Storage::from_f32(x_k),
+            x_v: Fp16Storage::from_f32(x_v),
+            x_a: Fp16Storage::from_f32(x_a),
+            x_g: Fp16Storage::from_f32(x_g),
+            w1: Fp16Storage::zeros(d_model.saturating_mul(rank)),
+            a1: Fp16Storage::zeros(d_model.saturating_mul(rank)),
+            v1: Fp16Storage::zeros(d_model.saturating_mul(rank)),
+            g1: Fp16Storage::zeros(d_model.saturating_mul(rank)),
+            w2: ortho_fp16(rank, d_model, 0.1, seed ^ 0xA1),
+            a2: ortho_fp16(rank, d_model, 0.1, seed ^ 0xA2),
+            v2: ortho_fp16(rank, d_model, 0.1, seed ^ 0xA3),
+            g2: ortho_fp16(rank, d_model, 0.1, seed ^ 0xA4),
+            w0: Fp16Storage::from_f32(w0),
+            a0: Fp16Storage::from_f32(a0),
+            v0: Fp16Storage::from_f32(v0),
+            k_k: Fp16Storage::from_f32(k_k),
+            k_a: Fp16Storage::from_f32(k_a),
+            r_k: Fp16Storage::from_f32((0..d_model).map(|_| -0.04)),
+            receptance: Fp16Linear::from_f32(
+                d_model,
+                d_model,
+                &fp16_to_f32(&uniform_fp16(
+                    d_model * d_model,
+                    -0.5 * scale,
+                    0.5 * scale,
+                    seed ^ 0xB1,
+                )),
+            )?,
+            key: Fp16Linear::from_f32(
+                d_model,
+                d_model,
+                &fp16_to_f32(&uniform_fp16(
+                    d_model * d_model,
+                    -0.05 * scale,
+                    0.05 * scale,
+                    seed ^ 0xB2,
+                )),
+            )?,
+            value: Fp16Linear::from_f32(
+                d_model,
+                d_model,
+                &fp16_to_f32(&uniform_fp16(
+                    d_model * d_model,
+                    -0.5 * scale,
+                    0.5 * scale,
+                    seed ^ 0xB3,
+                )),
+            )?,
+            output: Fp16Linear::zeros(d_model, d_model)?,
+            ln_x_weight: Fp16Storage::from_f32((0..d_model).map(|_| 1.0)),
+            ln_x_bias: Fp16Storage::zeros(d_model),
+        })
+    }
+
+    fn mix_decay(
+        &self,
+        xw: &[f32],
+        xa: &[f32],
+        xv: &[f32],
+        xg: &[f32],
+        rows: usize,
+        d: usize,
+        rank: usize,
+    ) -> Result<(Vec<f32>, Vec<f32>, Vec<f32>, Vec<f32>)> {
+        let w_lora = gemm_right(xw, &self.w1, rows, d, rank)?;
+        let w_lora: Vec<f32> = w_lora.iter().map(|v| v.tanh()).collect();
+        let w_lora = gemm_right(&w_lora, &self.w2, rows, rank, d)?;
+        let a_lora = gemm_right(xa, &self.a1, rows, d, rank)?;
+        let a_lora = gemm_right(&a_lora, &self.a2, rows, rank, d)?;
+        let v_lora = gemm_right(xv, &self.v1, rows, d, rank)?;
+        let v_lora = gemm_right(&v_lora, &self.v2, rows, rank, d)?;
+        let g_lora = gemm_right(xg, &self.g1, rows, d, rank)?;
+        let g_sig: Vec<f32> = g_lora.iter().copied().map(sigmoid).collect();
+        let g = gemm_right(&g_sig, &self.g2, rows, rank, d)?;
+        let mut w = vec![0.0; rows * d];
+        let mut a = vec![0.0; rows * d];
+        let mut vmix = vec![0.0; rows * d];
+        for row in 0..rows {
+            for c in 0..d {
+                let index = row * d + c;
+                w[index] = -softplus(-(self.w0.get(c) + w_lora[index])) - 0.5;
+                a[index] = sigmoid(self.a0.get(c) + a_lora[index]);
+                vmix[index] = sigmoid(self.v0.get(c) + v_lora[index]);
+            }
+        }
+        Ok((w, a, vmix, g))
+    }
+
+    fn apply_value_residual(
+        &self,
+        v: &mut [f32],
+        v_mix: &[f32],
+        v_first: Option<&[f32]>,
+    ) -> Result<Vec<f32>> {
+        if self.layer_id == 0 {
+            return Ok(v.to_vec());
+        }
+        let first = v_first.ok_or_else(|| anyhow::anyhow!("Tmix v_first missing after layer 0"))?;
+        if first.len() != v.len() || v_mix.len() != v.len() {
+            bail!("Tmix value residual shape mismatch");
+        }
+        for i in 0..v.len() {
+            v[i] += (first[i] - v[i]) * v_mix[i];
+        }
+        Ok(first.to_vec())
+    }
+
+    fn run_wkv(
+        &self,
+        r: &[f32],
+        w: &[f32],
+        k: &[f32],
+        v: &[f32],
+        a: &[f32],
+        batch: usize,
+        time: usize,
+        d: usize,
+    ) -> Result<Vec<f32>> {
+        let heads = self.n_head;
+        let mut kk = vec![0.0; r.len()];
+        for b in 0..batch {
+            for t in 0..time {
+                for h in 0..heads {
+                    let mut n2 = 0.0;
+                    let mut buf = [0.0; HEAD_SIZE];
+                    for n in 0..HEAD_SIZE {
+                        let index = ((b * time + t) * d) + h * HEAD_SIZE + n;
+                        buf[n] = k[index] * self.k_k.get(h * HEAD_SIZE + n);
+                        n2 += buf[n] * buf[n];
+                    }
+                    let inv = n2.max(1e-12).sqrt().recip();
+                    for n in 0..HEAD_SIZE {
+                        let index = ((b * time + t) * d) + h * HEAD_SIZE + n;
+                        kk[index] = buf[n] * inv;
+                    }
+                }
+            }
+        }
+        let mut k_scaled = k.to_vec();
+        for i in 0..k.len() {
+            let c = i % d;
+            k_scaled[i] *= 1.0 + (a[i] - 1.0) * self.k_a.get(c);
+        }
+        let mut wkv_a = vec![0.0; r.len()];
+        let mut wkv_b = vec![0.0; r.len()];
+        for i in 0..r.len() {
+            wkv_a[i] = -kk[i];
+            wkv_b[i] = kk[i] * a[i];
+        }
+        let fwd = wkv7::wkv7_forward(w, r, &k_scaled, v, &wkv_a, &wkv_b, batch, time, heads)?;
+        let x = group_norm(
+            &fwd.y,
+            &self.ln_x_weight,
+            &self.ln_x_bias,
+            batch.saturating_mul(time),
+            d,
+            heads,
+        )?;
+        let mut extra = vec![0.0; x.len()];
+        for b in 0..batch {
+            for t in 0..time {
+                for h in 0..heads {
+                    let mut rk = 0.0;
+                    for n in 0..HEAD_SIZE {
+                        let index = ((b * time + t) * d) + h * HEAD_SIZE + n;
+                        rk += r[index] * k_scaled[index] * self.r_k.get(h * HEAD_SIZE + n);
+                    }
+                    for n in 0..HEAD_SIZE {
+                        let index = ((b * time + t) * d) + h * HEAD_SIZE + n;
+                        extra[index] = rk * v[index];
+                    }
+                }
+            }
+        }
+        add_inplace(&mut extra, &x);
+        Ok(extra)
+    }
+
+    fn lerp_streams(
+        &self,
+        x: &[f32],
+        batch: usize,
+        time: usize,
+        prev: Option<&[f32]>,
+    ) -> Result<(Vec<f32>, Vec<f32>, Vec<f32>, Vec<f32>, Vec<f32>, Vec<f32>)> {
+        let d = self.x_r.len();
+        let rows = batch.saturating_mul(time);
+        let xx = if time == 1 {
+            time_shift_one(x, prev)?
+        } else {
+            time_shift_delta(x, batch, time, d)?
+        };
+        let mut xr = vec![0.0; x.len()];
+        let mut xw = vec![0.0; x.len()];
+        let mut xk = vec![0.0; x.len()];
+        let mut xv = vec![0.0; x.len()];
+        let mut xa = vec![0.0; x.len()];
+        let mut xg = vec![0.0; x.len()];
+        for i in 0..rows {
+            for c in 0..d {
+                let index = i * d + c;
+                xr[index] = x[index] + xx[index] * self.x_r.get(c);
+                xw[index] = x[index] + xx[index] * self.x_w.get(c);
+                xk[index] = x[index] + xx[index] * self.x_k.get(c);
+                xv[index] = x[index] + xx[index] * self.x_v.get(c);
+                xa[index] = x[index] + xx[index] * self.x_a.get(c);
+                xg[index] = x[index] + xx[index] * self.x_g.get(c);
+            }
+        }
+        Ok((xr, xw, xk, xv, xa, xg))
+    }
+
+    fn finish(&self, x: &[f32], g: &[f32], rows: usize) -> Result<Vec<f32>> {
+        let mut gated = vec![0.0; x.len()];
+        for (dst, (xx, gg)) in gated.iter_mut().zip(x.iter().zip(g)) {
+            *dst = *xx * *gg;
+        }
+        self.output.forward(&gated, rows)
+    }
+
+    fn forward(
+        &self,
+        x: &[f32],
+        v_first: Option<&[f32]>,
+        batch: usize,
+        time: usize,
+    ) -> Result<(Vec<f32>, Vec<f32>)> {
+        let d = self.x_r.len();
+        let rows = batch.saturating_mul(time);
+        let rank = self.w1.len().checked_div(d).unwrap_or(8);
+        let (xr, xw, xk, xv, xa, xg) = self.lerp_streams(x, batch, time, None)?;
+        let r = self.receptance.forward(&xr, rows)?;
+        let (w, a, v_mix, g) = self.mix_decay(&xw, &xa, &xv, &xg, rows, d, rank)?;
+        let k = self.key.forward(&xk, rows)?;
+        let mut v = self.value.forward(&xv, rows)?;
+        let new_v_first = self.apply_value_residual(&mut v, &v_mix, v_first)?;
+        let mut x_wkv = self.run_wkv(&r, &w, &k, &v, &a, batch, time, d)?;
+        x_wkv = self.finish(&x_wkv, &g, rows)?;
+        Ok((x_wkv, new_v_first))
+    }
+
+    fn forward_one(
+        &self,
+        x: &[f32],
+        prev: Option<&[f32]>,
+        v_first: Option<&[f32]>,
+        wkv_state: &mut [f32],
+    ) -> Result<(Vec<f32>, Vec<f32>)> {
+        let d = self.x_r.len();
+        let rank = self.w1.len().checked_div(d).unwrap_or(8);
+        let (xr, xw, xk, xv, xa, xg) = self.lerp_streams(x, 1, 1, prev)?;
+        let r = self.receptance.forward(&xr, 1)?;
+        let (w, a, v_mix, g) = self.mix_decay(&xw, &xa, &xv, &xg, 1, d, rank)?;
+        let mut k = self.key.forward(&xk, 1)?;
+        let mut v = self.value.forward(&xv, 1)?;
+        let new_v_first = self.apply_value_residual(&mut v, &v_mix, v_first)?;
+        let heads = self.n_head;
+        let mut kk = vec![0.0; d];
+        for h in 0..heads {
+            let mut n2 = 0.0;
+            let mut buf = [0.0; HEAD_SIZE];
+            for n in 0..HEAD_SIZE {
+                let index = h * HEAD_SIZE + n;
+                buf[n] = k[index] * self.k_k.get(index);
+                n2 += buf[n] * buf[n];
+            }
+            let inv = n2.max(1e-12).sqrt().recip();
+            for n in 0..HEAD_SIZE {
+                kk[h * HEAD_SIZE + n] = buf[n] * inv;
+            }
+        }
+        for i in 0..d {
+            k[i] *= 1.0 + (a[i] - 1.0) * self.k_a.get(i);
+        }
+        let mut wkv_a = vec![0.0; d];
+        let mut wkv_b = vec![0.0; d];
+        for i in 0..d {
+            wkv_a[i] = -kk[i];
+            wkv_b[i] = kk[i] * a[i];
+        }
+        let y = wkv7::wkv7_step(&w, &r, &k, &v, &wkv_a, &wkv_b, wkv_state, heads)?;
+        let x_n = group_norm(&y, &self.ln_x_weight, &self.ln_x_bias, 1, d, heads)?;
+        let mut extra = vec![0.0; d];
+        for h in 0..heads {
+            let mut rk = 0.0;
+            for n in 0..HEAD_SIZE {
+                let index = h * HEAD_SIZE + n;
+                rk += r[index] * k[index] * self.r_k.get(index);
+            }
+            for n in 0..HEAD_SIZE {
+                let index = h * HEAD_SIZE + n;
+                extra[index] = rk * v[index];
+            }
+        }
+        add_inplace(&mut extra, &x_n);
+        let out = self.finish(&extra, &g, 1)?;
+        Ok((out, new_v_first))
+    }
+}
+
+#[derive(Clone, Debug)]
+struct HybridBlock {
+    ln_a: LayerNorm,
+    ln_b: LayerNorm,
+    ln_c: LayerNorm,
+    tmix: RwkvTmixX070,
+    rosa: RwkvRosaQkv1Bit,
+    ffn: RwkvCMixX070,
+}
+
+impl HybridBlock {
+    fn forward(
+        &self,
+        x: &[f32],
+        v_first: Option<&[f32]>,
+        batch: usize,
+        time: usize,
+    ) -> Result<(Vec<f32>, Vec<f32>)> {
+        let rows = batch.saturating_mul(time);
+        let xr = self
+            .rosa
+            .forward(&self.ln_c.forward(x, rows)?, batch, time)?;
+        let (xx, v_first) =
+            self.tmix
+                .forward(&self.ln_a.forward(x, rows)?, v_first, batch, time)?;
+        let mut h = x.to_vec();
+        add_inplace(&mut h, &xx);
+        add_inplace(&mut h, &xr);
+        let ffn = self
+            .ffn
+            .forward(&self.ln_b.forward(&h, rows)?, batch, time)?;
+        add_inplace(&mut h, &ffn);
+        Ok((h, v_first))
+    }
+
+    fn forward_one(
+        &self,
+        x: &[f32],
+        layer: &mut HeronLayerGenerateState,
+        v_first: Option<&[f32]>,
+    ) -> Result<(Vec<f32>, Vec<f32>)> {
+        let rosa_in = self.ln_c.forward(x, 1)?;
+        let xr = self
+            .rosa
+            .forward_one(&rosa_in, layer.rosa_x_prev.as_deref(), &mut layer.sams)?;
+        layer.rosa_x_prev = Some(rosa_in);
+        let tmix_in = self.ln_a.forward(x, 1)?;
+        let state = layer
+            .wkv_state
+            .as_mut()
+            .ok_or_else(|| anyhow::anyhow!("hybrid generate is missing WKV state"))?;
+        let (xx, v_first) =
+            self.tmix
+                .forward_one(&tmix_in, layer.tmix_x_prev.as_deref(), v_first, state)?;
+        layer.tmix_x_prev = Some(tmix_in);
+        let mut h = x.to_vec();
+        add_inplace(&mut h, &xx);
+        add_inplace(&mut h, &xr);
+        let ffn_in = self.ln_b.forward(&h, 1)?;
+        let ffn = self
+            .ffn
+            .forward_one(&ffn_in, layer.cmix_x_prev.as_deref())?;
+        layer.cmix_x_prev = Some(ffn_in);
+        add_inplace(&mut h, &ffn);
+        Ok((h, v_first))
+    }
+}
+
 #[derive(Clone, Debug)]
 pub(crate) struct HeronBlock {
     ln0: Option<LayerNorm>,
@@ -952,6 +1613,27 @@ impl HeronBlock {
         for (dst, src) in h.iter_mut().zip(&ffn_out) {
             *dst += *src;
         }
+        Ok(h)
+    }
+
+    fn forward_one(&self, x: &[f32], layer: &mut HeronLayerGenerateState) -> Result<Vec<f32>> {
+        let mut h = if let Some(ln0) = &self.ln0 {
+            ln0.forward(x, 1)?
+        } else {
+            x.to_vec()
+        };
+        let rosa_in = self.ln3.forward(&h, 1)?;
+        let rosa_out =
+            self.rosa
+                .forward_one(&rosa_in, layer.rosa_x_prev.as_deref(), &mut layer.sams)?;
+        layer.rosa_x_prev = Some(rosa_in);
+        add_inplace(&mut h, &rosa_out);
+        let ffn_in = self.ln2.forward(&h, 1)?;
+        let ffn_out = self
+            .ffn
+            .forward_one(&ffn_in, layer.cmix_x_prev.as_deref())?;
+        layer.cmix_x_prev = Some(ffn_in);
+        add_inplace(&mut h, &ffn_out);
         Ok(h)
     }
 }
@@ -1055,10 +1737,75 @@ pub struct ModelCheckpoint {
     embedding_bits: Vec<u16>,
     ln_out: LayerNormBits,
     head: PackedBinaryCheckpoint,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     blocks: Vec<HeronBlockCheckpoint>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     hybrid_blocks: Vec<HybridBlockCheckpoint>,
+}
+
+/// Persistent-parameter census for `ullis inspect`. Counts are elements, not bytes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ParamCounts {
+    pub embedding: usize,
+    pub packed_bits: usize,
+    pub fp16_matrices: usize,
+    pub layer_norm: usize,
+    pub rosa_e: usize,
+    /// Time-shift / LoRA-side vectors that are FP16 but not dense matrices.
+    pub fp16_vectors: usize,
+}
+
+/// Generate-time working set besides weights: one SAM per layer plus last-token shift.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct InferenceStateBytes {
+    pub sam_bytes: usize,
+    pub time_shift_bytes: usize,
+}
+
+/// Structured `ullis inspect` payload: config, param split, checkpoint version, SAM+shift.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct CheckpointInspect {
+    pub format_version: u32,
+    pub architecture: Architecture,
+    pub config: TrainConfig,
+    pub param_counts: ParamCounts,
+    pub inference_state: InferenceStateBytes,
+}
+
+fn hyena_unloadable(version: u64) -> anyhow::Error {
+    anyhow::anyhow!(
+        "Hyena checkpoints (v1) are intentionally unloadable after the RWKV-8 cut (got format_version {version})"
+    )
+}
+
+fn require_v2(version: u64) -> Result<()> {
+    if version != u64::from(CHECKPOINT_FORMAT_VERSION) {
+        return Err(hyena_unloadable(version));
+    }
+    Ok(())
+}
+
+/// Online generate/chat state: one SAM per channel per layer, plus time-shift
+/// inputs. Hybrid layers also keep WKV state `[H,N,N]` FP32.
+#[derive(Clone, Debug)]
+pub struct HeronGenerateState {
+    layers: Vec<HeronLayerGenerateState>,
+    time: usize,
+}
+
+#[derive(Clone, Debug)]
+struct HeronLayerGenerateState {
+    sams: Vec<RosaSam>,
+    rosa_x_prev: Option<Vec<f32>>,
+    cmix_x_prev: Option<Vec<f32>>,
+    tmix_x_prev: Option<Vec<f32>>,
+    wkv_state: Option<Vec<f32>>,
+}
+
+impl HeronGenerateState {
+    pub fn time(&self) -> usize {
+        self.time
+    }
 }
 
 /// Product model. Packed BinaryConnect latents live in RAM; checkpoints omit them.
@@ -1067,10 +1814,10 @@ pub struct UllisHeron {
     pub cfg: TrainConfig,
     embedding: Fp16Storage,
     pub(crate) blocks: Vec<HeronBlock>,
+    hybrid_blocks: Vec<HybridBlock>,
     ln_out: LayerNorm,
     pub(crate) head: PackedBinaryLinear,
     g_w: Vec<f32>,
-    hybrid_checkpoint: Option<ModelCheckpoint>,
 }
 
 impl UllisHeron {
@@ -1078,18 +1825,7 @@ impl UllisHeron {
         cfg.validate()?;
         match cfg.architecture {
             Architecture::Heron => Self::new_heron(cfg),
-            Architecture::RosaRwkv7 => {
-                let checkpoint = skeleton_checkpoint(&cfg)?;
-                Ok(Self {
-                    cfg,
-                    embedding: Fp16Storage::zeros(1),
-                    blocks: Vec::new(),
-                    ln_out: LayerNorm::new(1),
-                    head: PackedBinaryLinear::seeded(1, 1, false, 1)?,
-                    g_w: vec![0.0; 1],
-                    hybrid_checkpoint: Some(checkpoint),
-                })
-            }
+            Architecture::RosaRwkv7 => Self::new_hybrid(cfg),
         }
     }
 
@@ -1122,10 +1858,54 @@ impl UllisHeron {
             cfg,
             embedding,
             blocks,
+            hybrid_blocks: Vec::new(),
             ln_out: LayerNorm::new(d),
             head,
             g_w: vec![0.0; max_matrix],
-            hybrid_checkpoint: None,
+        })
+    }
+
+    fn new_hybrid(cfg: TrainConfig) -> Result<Self> {
+        let d = cfg.d_model;
+        let v = cfg.vocab_size;
+        let dim_ffn = cfg.resolved_dim_ffn();
+        let rank = cfg.resolved_tmix_lora_rank();
+        let embedding = seeded_embedding(v.saturating_mul(d), d, cfg.seed);
+        let hybrid_blocks = (0..cfg.n_layers)
+            .map(|layer| {
+                Ok(HybridBlock {
+                    ln_a: LayerNorm::new(d),
+                    ln_b: LayerNorm::new(d),
+                    ln_c: LayerNorm::new(d),
+                    tmix: RwkvTmixX070::seeded(
+                        d,
+                        cfg.n_layers,
+                        layer,
+                        rank,
+                        cfg.seed.wrapping_add(layer as u64 + 3),
+                    )?,
+                    rosa: RwkvRosaQkv1Bit::seeded(d, cfg.seed.wrapping_add(layer as u64 + 1))?,
+                    ffn: RwkvCMixX070::seeded(
+                        d,
+                        dim_ffn,
+                        cfg.seed.wrapping_add(layer as u64 + 17),
+                    )?,
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let head = PackedBinaryLinear::seeded(v, d, false, cfg.seed ^ 0x9E37)?;
+        let max_matrix = d
+            .saturating_mul(d)
+            .max(d.saturating_mul(dim_ffn))
+            .max(v.saturating_mul(d));
+        Ok(Self {
+            cfg,
+            embedding,
+            blocks: Vec::new(),
+            hybrid_blocks,
+            ln_out: LayerNorm::new(d),
+            head,
+            g_w: vec![0.0; max_matrix],
         })
     }
 
@@ -1134,9 +1914,6 @@ impl UllisHeron {
     }
 
     pub fn checkpoint(&self) -> ModelCheckpoint {
-        if let Some(hybrid) = &self.hybrid_checkpoint {
-            return hybrid.clone();
-        }
         ModelCheckpoint {
             format_version: CHECKPOINT_FORMAT_VERSION,
             config: self.cfg.clone(),
@@ -1162,57 +1939,45 @@ impl UllisHeron {
                         weight: block.ln3.weight.as_bits().to_vec(),
                         bias: block.ln3.bias.as_bits().to_vec(),
                     },
-                    rosa: RosaCheckpoint {
-                        x_q: Fp16Vec(block.rosa.x_q.as_bits().to_vec()),
-                        x_k: Fp16Vec(block.rosa.x_k.as_bits().to_vec()),
-                        x_v: Fp16Vec(block.rosa.x_v.as_bits().to_vec()),
-                        e: Fp16Vec(block.rosa.e.as_bits().to_vec()),
-                        q: packed_to_checkpoint(&block.rosa.q),
-                        k: packed_to_checkpoint(&block.rosa.k),
-                        v: packed_to_checkpoint(&block.rosa.v),
-                        o: packed_to_checkpoint(&block.rosa.o),
-                    },
-                    ffn: CmixCheckpoint {
-                        x_k: Fp16Vec(block.ffn.x_k.as_bits().to_vec()),
-                        key: packed_to_checkpoint(&block.ffn.key),
-                        value_bits: Fp16Vec(block.ffn.value.weight.as_bits().to_vec()),
-                    },
+                    rosa: rosa_live_checkpoint(&block.rosa),
+                    ffn: cmix_live_checkpoint(&block.ffn),
                 })
                 .collect(),
-            hybrid_blocks: Vec::new(),
+            hybrid_blocks: self
+                .hybrid_blocks
+                .iter()
+                .map(|block| HybridBlockCheckpoint {
+                    ln_a: LayerNormBits {
+                        weight: block.ln_a.weight.as_bits().to_vec(),
+                        bias: block.ln_a.bias.as_bits().to_vec(),
+                    },
+                    ln_b: LayerNormBits {
+                        weight: block.ln_b.weight.as_bits().to_vec(),
+                        bias: block.ln_b.bias.as_bits().to_vec(),
+                    },
+                    ln_c: LayerNormBits {
+                        weight: block.ln_c.weight.as_bits().to_vec(),
+                        bias: block.ln_c.bias.as_bits().to_vec(),
+                    },
+                    tmix: tmix_live_checkpoint(&block.tmix),
+                    rosa: rosa_live_checkpoint(&block.rosa),
+                    ffn: cmix_live_checkpoint(&block.ffn),
+                })
+                .collect(),
         }
     }
 
     pub fn from_checkpoint(checkpoint: ModelCheckpoint) -> Result<Self> {
-        if checkpoint.format_version != CHECKPOINT_FORMAT_VERSION {
-            bail!(
-                "Hyena checkpoints (v1) are intentionally unloadable after the RWKV-8 cut (got format_version {})",
-                checkpoint.format_version
-            );
-        }
+        require_v2(u64::from(checkpoint.format_version))?;
         checkpoint.config.validate()?;
         validate_checkpoint_shapes(&checkpoint)?;
         match checkpoint.config.architecture {
-            Architecture::RosaRwkv7 => {
-                let cfg = checkpoint.config.clone();
-                Ok(Self {
-                    cfg,
-                    embedding: Fp16Storage::zeros(1),
-                    blocks: Vec::new(),
-                    ln_out: LayerNorm::new(1),
-                    head: PackedBinaryLinear::seeded(1, 1, false, 1)?,
-                    g_w: vec![0.0; 1],
-                    hybrid_checkpoint: Some(checkpoint),
-                })
-            }
+            Architecture::RosaRwkv7 => hybrid_from_checkpoint(checkpoint),
             Architecture::Heron => heron_from_checkpoint(checkpoint),
         }
     }
 
     pub fn hidden(&self, ids: &[u32], batch: usize, time: usize) -> Result<Vec<f32>> {
-        if self.hybrid_checkpoint.is_some() {
-            bail!("rosa_rwkv7 CPU hidden is not wired in this PR");
-        }
         let d = self.cfg.d_model;
         let rows = batch
             .checked_mul(time)
@@ -1225,6 +1990,9 @@ impl UllisHeron {
         {
             bail!("token shape or context length is invalid");
         }
+        if !self.hybrid_blocks.is_empty() && !time.is_multiple_of(CHUNK_LEN) {
+            bail!("rosa_rwkv7 hidden requires time multiple of {CHUNK_LEN}");
+        }
         let mut x = vec![0.0; rows.saturating_mul(d)];
         for (row, &id) in ids.iter().enumerate() {
             if id as usize >= self.cfg.vocab_size {
@@ -1235,10 +2003,89 @@ impl UllisHeron {
                 x[row * d + c] = self.embedding.get(offset + c);
             }
         }
-        for block in &self.blocks {
-            x = block.forward(&x, batch, time)?;
+        if self.hybrid_blocks.is_empty() {
+            for block in &self.blocks {
+                x = block.forward(&x, batch, time)?;
+            }
+        } else {
+            let mut v_first: Option<Vec<f32>> = None;
+            for block in &self.hybrid_blocks {
+                let (h, vf) = block.forward(&x, v_first.as_deref(), batch, time)?;
+                x = h;
+                v_first = Some(vf);
+            }
         }
         self.ln_out.forward(&x, rows)
+    }
+
+    pub fn logits(&self, ids: &[u32], batch: usize, time: usize) -> Result<Vec<f32>> {
+        let hidden = self.hidden(ids, batch, time)?;
+        self.head.forward(&hidden, batch.saturating_mul(time))
+    }
+
+    /// Empty SAM (`trans*=-1`, `fail[0]=-1`) and no time-shift history.
+    pub fn generate_state(&self) -> Result<HeronGenerateState> {
+        let d = self.cfg.d_model;
+        let max_time = self.cfg.context_len;
+        let n_layers = if self.hybrid_blocks.is_empty() {
+            self.blocks.len()
+        } else {
+            self.hybrid_blocks.len()
+        };
+        let heads = d / self.cfg.head_size.max(1);
+        Ok(HeronGenerateState {
+            layers: (0..n_layers)
+                .map(|_| HeronLayerGenerateState {
+                    sams: (0..d).map(|_| RosaSam::with_max_time(max_time)).collect(),
+                    rosa_x_prev: None,
+                    cmix_x_prev: None,
+                    tmix_x_prev: None,
+                    wkv_state: (!self.hybrid_blocks.is_empty()).then(|| {
+                        vec![0.0; heads.saturating_mul(HEAD_SIZE).saturating_mul(HEAD_SIZE)]
+                    }),
+                })
+                .collect(),
+            time: 0,
+        })
+    }
+
+    /// One token: same `RosaSam::push` as train, greedy-ready last-token logits.
+    pub fn generate_step(&self, state: &mut HeronGenerateState, token: u32) -> Result<Vec<f32>> {
+        if token as usize >= self.cfg.vocab_size {
+            bail!("token id exceeds vocabulary");
+        }
+        if state.time >= self.cfg.context_len {
+            bail!("generate exceeded context_len ({})", self.cfg.context_len);
+        }
+        let n_layers = if self.hybrid_blocks.is_empty() {
+            self.blocks.len()
+        } else {
+            self.hybrid_blocks.len()
+        };
+        if state.layers.len() != n_layers {
+            bail!("generate state does not match this model");
+        }
+        let d = self.cfg.d_model;
+        let mut x = vec![0.0; d];
+        let offset = token as usize * d;
+        for c in 0..d {
+            x[c] = self.embedding.get(offset + c);
+        }
+        if self.hybrid_blocks.is_empty() {
+            for (block, layer) in self.blocks.iter().zip(&mut state.layers) {
+                x = block.forward_one(&x, layer)?;
+            }
+        } else {
+            let mut v_first: Option<Vec<f32>> = None;
+            for (block, layer) in self.hybrid_blocks.iter().zip(&mut state.layers) {
+                let (h, vf) = block.forward_one(&x, layer, v_first.as_deref())?;
+                x = h;
+                v_first = Some(vf);
+            }
+        }
+        let hidden = self.ln_out.forward(&x, 1)?;
+        state.time += 1;
+        self.head.forward(&hidden, 1)
     }
 
     pub fn train_step(
@@ -1281,7 +2128,7 @@ impl UllisHeron {
         if !matches!(self.cfg.rosa_grad, RosaGradMode::StopGradBits) {
             bail!("only rosa_grad=stop_grad_bits is wired");
         }
-        if self.hybrid_checkpoint.is_some() {
+        if !self.hybrid_blocks.is_empty() {
             bail!("rosa_rwkv7 train is not wired");
         }
         if !learning_rate.is_finite() || learning_rate <= 0.0 || time < 2 {
@@ -1295,9 +2142,7 @@ impl UllisHeron {
             || batch > self.cfg.batch_size
             || tokens.len() != rows
             || time > self.cfg.context_len
-            || tokens
-                .iter()
-                .any(|&id| id as usize >= self.cfg.vocab_size)
+            || tokens.iter().any(|&id| id as usize >= self.cfg.vocab_size)
         {
             bail!("token shape or context length is invalid");
         }
@@ -1317,7 +2162,9 @@ impl UllisHeron {
                 x = ln0.forward(&x, rows)?;
             }
             let rosa_in = block.ln3.forward(&x, rows)?;
-            let rosa = block.rosa.forward_tape(&rosa_in, batch, time, metal.as_ref())?;
+            let rosa = block
+                .rosa
+                .forward_tape(&rosa_in, batch, time, metal.as_ref())?;
             add_inplace(&mut x, &rosa.out);
             let after_rosa = x.clone();
             let ln2_out = block.ln2.forward(&x, rows)?;
@@ -1378,11 +2225,8 @@ impl UllisHeron {
         for (row, &id) in tokens.iter().enumerate() {
             let offset = id as usize * d;
             for c in 0..d {
-                self.embedding.apply_clipped_sgd(
-                    offset + c,
-                    g_x[row * d + c],
-                    learning_rate,
-                );
+                self.embedding
+                    .apply_clipped_sgd(offset + c, g_x[row * d + c], learning_rate);
             }
         }
 
@@ -1448,12 +2292,9 @@ impl UllisHeron {
                 None,
             )?;
         }
-        let flips = self.head.flip_count_after(
-            &self.g_w[..weights],
-            &g_scale,
-            None,
-            learning_rate,
-        )?;
+        let flips =
+            self.head
+                .flip_count_after(&self.g_w[..weights], &g_scale, None, learning_rate)?;
         let mean = if n_valid == 0 {
             0.0
         } else {
@@ -1474,6 +2315,238 @@ struct BlockTape {
     rosa: RosaTape,
     after_rosa: Vec<f32>,
     cmix: CmixTape,
+}
+
+impl ModelCheckpoint {
+    /// Parse a JSON snapshot, hard-failing any `format_version` other than 2
+    /// before the v2 payload schema is applied.
+    pub fn from_json_bytes(bytes: &[u8]) -> Result<Self> {
+        let value: serde_json::Value =
+            serde_json::from_slice(bytes).context("checkpoint is not JSON")?;
+        let version = value
+            .get("format_version")
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(0);
+        require_v2(version)?;
+        let checkpoint: Self =
+            serde_json::from_value(value).context("parse checkpoint v2 payload")?;
+        validate_checkpoint_shapes(&checkpoint)?;
+        Ok(checkpoint)
+    }
+
+    pub fn inspect(&self) -> Result<CheckpointInspect> {
+        validate_checkpoint_shapes(self)?;
+        let cfg = &self.config;
+        let d = cfg.d_model;
+        let v = cfg.vocab_size;
+        let layers = cfg.n_layers;
+        let dim_ffn = cfg.resolved_dim_ffn();
+        let rank = cfg.resolved_tmix_lora_rank();
+        let embedding = mul_count(v, d)?;
+        let d2 = mul_count(d, d)?;
+        let qkvo = mul_count(4, d2)?;
+        let cmix_key = mul_count(dim_ffn, d)?;
+        let cmix_value = mul_count(d, dim_ffn)?;
+        let packed_layer = add_count(qkvo, cmix_key)?;
+        let packed_bits = add_count(mul_count(v, d)?, mul_count(layers, packed_layer)?)?;
+        let rosa_e = mul_count(layers, d)?;
+        let (fp16_matrices, layer_norm, fp16_vectors) = match cfg.architecture {
+            Architecture::Heron => {
+                let mut layer_norm =
+                    add_count(mul_count(2, d)?, mul_count(layers, mul_count(4, d)?)?)?;
+                if layers > 0 {
+                    layer_norm = add_count(layer_norm, mul_count(2, d)?)?;
+                }
+                (
+                    mul_count(layers, cmix_value)?,
+                    layer_norm,
+                    mul_count(layers, mul_count(4, d)?)?,
+                )
+            }
+            Architecture::RosaRwkv7 => {
+                let lora = mul_count(8, mul_count(d, rank)?)?;
+                let tmix_dense = mul_count(4, d2)?;
+                (
+                    mul_count(layers, add_count(cmix_value, add_count(tmix_dense, lora)?)?)?,
+                    add_count(mul_count(2, d)?, mul_count(layers, mul_count(8, d)?)?)?,
+                    mul_count(layers, mul_count(16, d)?)?,
+                )
+            }
+        };
+        let sam_one = sam_workspace_bytes(1, cfg.context_len, d)
+            .ok_or_else(|| anyhow::anyhow!("SAM inference state overflow"))?;
+        let sam_bytes = mul_count(layers, sam_one)?;
+        let time_shift_bytes = mul_count(mul_count(layers, d)?, size_of::<f32>())?;
+        Ok(CheckpointInspect {
+            format_version: self.format_version,
+            architecture: cfg.architecture,
+            config: cfg.clone(),
+            param_counts: ParamCounts {
+                embedding,
+                packed_bits,
+                fp16_matrices,
+                layer_norm,
+                rosa_e,
+                fp16_vectors,
+            },
+            inference_state: InferenceStateBytes {
+                sam_bytes,
+                time_shift_bytes,
+            },
+        })
+    }
+}
+
+fn mul_count(a: usize, b: usize) -> Result<usize> {
+    a.checked_mul(b)
+        .ok_or_else(|| anyhow::anyhow!("parameter count overflow"))
+}
+
+fn add_count(a: usize, b: usize) -> Result<usize> {
+    a.checked_add(b)
+        .ok_or_else(|| anyhow::anyhow!("parameter count overflow"))
+}
+
+fn rosa_live_checkpoint(rosa: &RwkvRosaQkv1Bit) -> RosaCheckpoint {
+    RosaCheckpoint {
+        x_q: Fp16Vec(rosa.x_q.as_bits().to_vec()),
+        x_k: Fp16Vec(rosa.x_k.as_bits().to_vec()),
+        x_v: Fp16Vec(rosa.x_v.as_bits().to_vec()),
+        e: Fp16Vec(rosa.e.as_bits().to_vec()),
+        q: packed_to_checkpoint(&rosa.q),
+        k: packed_to_checkpoint(&rosa.k),
+        v: packed_to_checkpoint(&rosa.v),
+        o: packed_to_checkpoint(&rosa.o),
+    }
+}
+
+fn cmix_live_checkpoint(ffn: &RwkvCMixX070) -> CmixCheckpoint {
+    CmixCheckpoint {
+        x_k: Fp16Vec(ffn.x_k.as_bits().to_vec()),
+        key: packed_to_checkpoint(&ffn.key),
+        value_bits: Fp16Vec(ffn.value.weight.as_bits().to_vec()),
+    }
+}
+
+fn tmix_live_checkpoint(tmix: &RwkvTmixX070) -> TmixCheckpoint {
+    TmixCheckpoint {
+        x_r: Fp16Vec(tmix.x_r.as_bits().to_vec()),
+        x_w: Fp16Vec(tmix.x_w.as_bits().to_vec()),
+        x_k: Fp16Vec(tmix.x_k.as_bits().to_vec()),
+        x_v: Fp16Vec(tmix.x_v.as_bits().to_vec()),
+        x_a: Fp16Vec(tmix.x_a.as_bits().to_vec()),
+        x_g: Fp16Vec(tmix.x_g.as_bits().to_vec()),
+        w1: Fp16Vec(tmix.w1.as_bits().to_vec()),
+        a1: Fp16Vec(tmix.a1.as_bits().to_vec()),
+        v1: Fp16Vec(tmix.v1.as_bits().to_vec()),
+        g1: Fp16Vec(tmix.g1.as_bits().to_vec()),
+        w2: Fp16Vec(tmix.w2.as_bits().to_vec()),
+        a2: Fp16Vec(tmix.a2.as_bits().to_vec()),
+        v2: Fp16Vec(tmix.v2.as_bits().to_vec()),
+        g2: Fp16Vec(tmix.g2.as_bits().to_vec()),
+        w0: Fp16Vec(tmix.w0.as_bits().to_vec()),
+        a0: Fp16Vec(tmix.a0.as_bits().to_vec()),
+        v0: Fp16Vec(tmix.v0.as_bits().to_vec()),
+        k_k: Fp16Vec(tmix.k_k.as_bits().to_vec()),
+        k_a: Fp16Vec(tmix.k_a.as_bits().to_vec()),
+        r_k: Fp16Vec(tmix.r_k.as_bits().to_vec()),
+        receptance: Fp16Vec(tmix.receptance.weight.as_bits().to_vec()),
+        key: Fp16Vec(tmix.key.weight.as_bits().to_vec()),
+        value: Fp16Vec(tmix.value.weight.as_bits().to_vec()),
+        output: Fp16Vec(tmix.output.weight.as_bits().to_vec()),
+        ln_x_weight: Fp16Vec(tmix.ln_x_weight.as_bits().to_vec()),
+        ln_x_bias: Fp16Vec(tmix.ln_x_bias.as_bits().to_vec()),
+    }
+}
+
+fn tmix_from_checkpoint(
+    tmix: TmixCheckpoint,
+    d: usize,
+    _rank: usize,
+    layer_id: usize,
+) -> Result<RwkvTmixX070> {
+    Ok(RwkvTmixX070 {
+        layer_id,
+        n_head: d / HEAD_SIZE,
+        x_r: Fp16Storage::from_bits(tmix.x_r.0),
+        x_w: Fp16Storage::from_bits(tmix.x_w.0),
+        x_k: Fp16Storage::from_bits(tmix.x_k.0),
+        x_v: Fp16Storage::from_bits(tmix.x_v.0),
+        x_a: Fp16Storage::from_bits(tmix.x_a.0),
+        x_g: Fp16Storage::from_bits(tmix.x_g.0),
+        w1: Fp16Storage::from_bits(tmix.w1.0),
+        a1: Fp16Storage::from_bits(tmix.a1.0),
+        v1: Fp16Storage::from_bits(tmix.v1.0),
+        g1: Fp16Storage::from_bits(tmix.g1.0),
+        w2: Fp16Storage::from_bits(tmix.w2.0),
+        a2: Fp16Storage::from_bits(tmix.a2.0),
+        v2: Fp16Storage::from_bits(tmix.v2.0),
+        g2: Fp16Storage::from_bits(tmix.g2.0),
+        w0: Fp16Storage::from_bits(tmix.w0.0),
+        a0: Fp16Storage::from_bits(tmix.a0.0),
+        v0: Fp16Storage::from_bits(tmix.v0.0),
+        k_k: Fp16Storage::from_bits(tmix.k_k.0),
+        k_a: Fp16Storage::from_bits(tmix.k_a.0),
+        r_k: Fp16Storage::from_bits(tmix.r_k.0),
+        receptance: Fp16Linear::from_bits(d, d, tmix.receptance.0)?,
+        key: Fp16Linear::from_bits(d, d, tmix.key.0)?,
+        value: Fp16Linear::from_bits(d, d, tmix.value.0)?,
+        output: Fp16Linear::from_bits(d, d, tmix.output.0)?,
+        ln_x_weight: Fp16Storage::from_bits(tmix.ln_x_weight.0),
+        ln_x_bias: Fp16Storage::from_bits(tmix.ln_x_bias.0),
+    })
+}
+
+fn hybrid_from_checkpoint(checkpoint: ModelCheckpoint) -> Result<UllisHeron> {
+    let cfg = checkpoint.config.clone();
+    let d = cfg.d_model;
+    let v = cfg.vocab_size;
+    let dim_ffn = cfg.resolved_dim_ffn();
+    let rank = cfg.resolved_tmix_lora_rank();
+    let embedding = Fp16Storage::from_bits(checkpoint.embedding_bits);
+    let ln_out = LayerNorm::from_bits(checkpoint.ln_out.weight, checkpoint.ln_out.bias)?;
+    let head = packed_from_checkpoint(checkpoint.head, v, d, false)?;
+    let hybrid_blocks = checkpoint
+        .hybrid_blocks
+        .into_iter()
+        .enumerate()
+        .map(|(layer, block)| {
+            Ok(HybridBlock {
+                ln_a: LayerNorm::from_bits(block.ln_a.weight, block.ln_a.bias)?,
+                ln_b: LayerNorm::from_bits(block.ln_b.weight, block.ln_b.bias)?,
+                ln_c: LayerNorm::from_bits(block.ln_c.weight, block.ln_c.bias)?,
+                tmix: tmix_from_checkpoint(block.tmix, d, rank, layer)?,
+                rosa: RwkvRosaQkv1Bit {
+                    x_q: Fp16Storage::from_bits(block.rosa.x_q.0),
+                    x_k: Fp16Storage::from_bits(block.rosa.x_k.0),
+                    x_v: Fp16Storage::from_bits(block.rosa.x_v.0),
+                    e: Fp16Storage::from_bits(block.rosa.e.0),
+                    q: packed_from_checkpoint(block.rosa.q, d, d, true)?,
+                    k: packed_from_checkpoint(block.rosa.k, d, d, true)?,
+                    v: packed_from_checkpoint(block.rosa.v, d, d, true)?,
+                    o: packed_from_checkpoint(block.rosa.o, d, d, true)?,
+                },
+                ffn: RwkvCMixX070 {
+                    x_k: Fp16Storage::from_bits(block.ffn.x_k.0),
+                    key: packed_from_checkpoint(block.ffn.key, dim_ffn, d, false)?,
+                    value: Fp16Linear::from_bits(d, dim_ffn, block.ffn.value_bits.0)?,
+                },
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let max_matrix = d
+        .saturating_mul(d)
+        .max(d.saturating_mul(dim_ffn))
+        .max(v.saturating_mul(d));
+    Ok(UllisHeron {
+        cfg,
+        embedding,
+        blocks: Vec::new(),
+        hybrid_blocks,
+        ln_out,
+        head,
+        g_w: vec![0.0; max_matrix],
+    })
 }
 
 fn packed_to_checkpoint(linear: &PackedBinaryLinear) -> PackedBinaryCheckpoint {
@@ -1560,18 +2633,21 @@ fn heron_from_checkpoint(checkpoint: ModelCheckpoint) -> Result<UllisHeron> {
         ln_out,
         head,
         g_w: vec![0.0; max_matrix],
-        hybrid_checkpoint: None,
+        hybrid_blocks: Vec::new(),
     })
 }
 
+#[cfg(test)]
 fn ones(len: usize) -> Vec<u16> {
     vec![Fp16::from_f32(1.0).to_bits(); len]
 }
 
+#[cfg(test)]
 fn zeros(len: usize) -> Vec<u16> {
     vec![0; len]
 }
 
+#[cfg(test)]
 fn packed_linear(out: usize, in_features: usize, bias: bool, scale: f32) -> PackedBinaryCheckpoint {
     let weights = out.saturating_mul(in_features);
     let words = weights.div_ceil(32);
@@ -1582,80 +2658,12 @@ fn packed_linear(out: usize, in_features: usize, bias: bool, scale: f32) -> Pack
     }
 }
 
+#[cfg(test)]
 fn layer_norm(d: usize) -> LayerNormBits {
     LayerNormBits {
         weight: ones(d),
         bias: zeros(d),
     }
-}
-
-fn fp16_zeros(len: usize) -> Fp16Vec {
-    Fp16Vec(zeros(len))
-}
-
-fn fp16_ones(len: usize) -> Fp16Vec {
-    Fp16Vec(ones(len))
-}
-
-fn rosa_checkpoint(d: usize) -> RosaCheckpoint {
-    let scale = (d as f32).sqrt().recip();
-    RosaCheckpoint {
-        x_q: fp16_zeros(d),
-        x_k: fp16_zeros(d),
-        x_v: fp16_zeros(d),
-        e: fp16_ones(d),
-        q: packed_linear(d, d, true, scale),
-        k: packed_linear(d, d, true, scale),
-        v: packed_linear(d, d, true, scale),
-        o: packed_linear(d, d, true, scale),
-    }
-}
-
-fn cmix_checkpoint(d: usize, dim_ffn: usize) -> CmixCheckpoint {
-    let key_scale = (d as f32).sqrt().recip();
-    CmixCheckpoint {
-        x_k: fp16_zeros(d),
-        key: packed_linear(dim_ffn, d, false, key_scale),
-        value_bits: fp16_zeros(dim_ffn.saturating_mul(d)),
-    }
-}
-
-fn tmix_checkpoint(cfg: &TrainConfig) -> TmixCheckpoint {
-    let d = cfg.d_model;
-    let rank = cfg.resolved_tmix_lora_rank();
-    let heads = d / cfg.head_size.max(1);
-    TmixCheckpoint {
-        x_r: fp16_zeros(d),
-        x_w: fp16_zeros(d),
-        x_k: fp16_zeros(d),
-        x_v: fp16_zeros(d),
-        x_a: fp16_zeros(d),
-        x_g: fp16_zeros(d),
-        w1: fp16_zeros(d.saturating_mul(rank)),
-        a1: fp16_zeros(d.saturating_mul(rank)),
-        v1: fp16_zeros(d.saturating_mul(rank)),
-        g1: fp16_zeros(d.saturating_mul(rank)),
-        w2: fp16_zeros(rank.saturating_mul(d)),
-        a2: fp16_zeros(rank.saturating_mul(d)),
-        v2: fp16_zeros(rank.saturating_mul(d)),
-        g2: fp16_zeros(rank.saturating_mul(d)),
-        w0: fp16_zeros(d),
-        a0: fp16_zeros(d),
-        v0: fp16_zeros(d),
-        k_k: fp16_zeros(d),
-        k_a: fp16_zeros(d),
-        r_k: fp16_zeros(heads.saturating_mul(cfg.head_size)),
-        receptance: fp16_zeros(d.saturating_mul(d)),
-        key: fp16_zeros(d.saturating_mul(d)),
-        value: fp16_zeros(d.saturating_mul(d)),
-        output: fp16_zeros(d.saturating_mul(d)),
-        ln_x_weight: ones_vec(d),
-        ln_x_bias: fp16_zeros(d),
-    }
-}
-
-fn ones_vec(len: usize) -> Fp16Vec {
-    Fp16Vec(ones(len))
 }
 
 fn packed_words(out: usize, in_features: usize) -> usize {
@@ -1760,51 +2768,6 @@ fn validate_checkpoint_shapes(checkpoint: &ModelCheckpoint) -> Result<()> {
         }
     }
     Ok(())
-}
-
-fn skeleton_checkpoint(cfg: &TrainConfig) -> Result<ModelCheckpoint> {
-    let d = cfg.d_model;
-    let v = cfg.vocab_size;
-    let dim_ffn = cfg.resolved_dim_ffn();
-    let head_scale = (d as f32).sqrt().recip();
-    let (blocks, hybrid_blocks) = match cfg.architecture {
-        Architecture::Heron => {
-            let blocks = (0..cfg.n_layers)
-                .map(|layer| HeronBlockCheckpoint {
-                    ln0: (layer == 0).then(|| layer_norm(d)),
-                    ln2: layer_norm(d),
-                    ln3: layer_norm(d),
-                    rosa: rosa_checkpoint(d),
-                    ffn: cmix_checkpoint(d, dim_ffn),
-                })
-                .collect();
-            (blocks, Vec::new())
-        }
-        Architecture::RosaRwkv7 => {
-            let hybrid = (0..cfg.n_layers)
-                .map(|_| HybridBlockCheckpoint {
-                    ln_a: layer_norm(d),
-                    ln_b: layer_norm(d),
-                    ln_c: layer_norm(d),
-                    tmix: tmix_checkpoint(cfg),
-                    rosa: rosa_checkpoint(d),
-                    ffn: cmix_checkpoint(d, dim_ffn),
-                })
-                .collect();
-            (Vec::new(), hybrid)
-        }
-    };
-    let checkpoint = ModelCheckpoint {
-        format_version: CHECKPOINT_FORMAT_VERSION,
-        config: cfg.clone(),
-        embedding_bits: zeros(v.saturating_mul(d)),
-        ln_out: layer_norm(d),
-        head: packed_linear(v, d, false, head_scale),
-        blocks,
-        hybrid_blocks,
-    };
-    validate_checkpoint_shapes(&checkpoint)?;
-    Ok(checkpoint)
 }
 
 #[cfg(test)]
@@ -1916,7 +2879,10 @@ mod tests {
         let mut cfg = tiny_train_cfg();
         cfg.rosa_grad = RosaGradMode::ExactBitflip;
         let mut model = UllisHeron::new(cfg).unwrap();
-        let err = model.train_step(&[4, 5], 1, 2, 1e-3).unwrap_err().to_string();
+        let err = model
+            .train_step(&[4, 5], 1, 2, 1e-3)
+            .unwrap_err()
+            .to_string();
         assert!(err.contains("stop_grad_bits"));
     }
 
@@ -1937,5 +2903,205 @@ mod tests {
         assert!(checkpoint.blocks.is_empty());
         assert_eq!(checkpoint.hybrid_blocks.len(), 2);
         UllisHeron::from_checkpoint(checkpoint).unwrap();
+    }
+
+    #[test]
+    fn hybrid_roundtrip_preserves_hidden() {
+        let model = UllisHeron::new(TrainConfig {
+            architecture: Architecture::RosaRwkv7,
+            vocab_size: 12,
+            d_model: 32,
+            n_layers: 2,
+            dim_ffn: 128,
+            context_len: 144,
+            tmix_lora_rank: 8,
+            ..Default::default()
+        })
+        .unwrap();
+        let tokens: Vec<u32> = (0..16).map(|i| i % 12).collect();
+        let hidden = model.hidden(&tokens, 1, 16).unwrap();
+        let restored = UllisHeron::from_checkpoint(model.checkpoint()).unwrap();
+        let hidden_restored = restored.hidden(&tokens, 1, 16).unwrap();
+        assert_eq!(hidden, hidden_restored);
+    }
+
+    #[test]
+    fn checkpoint_json_matches_v2_schema_and_omits_latents() {
+        let model = UllisHeron::new(tiny_train_cfg()).unwrap();
+        let json = serde_json::to_value(model.checkpoint()).unwrap();
+        assert_eq!(json["format_version"], 2);
+        assert_eq!(json["config"]["architecture"], "heron");
+        assert_eq!(json["config"]["d_model"], 16);
+        assert_eq!(json["config"]["n_layers"], 1);
+        assert_eq!(json["config"]["vocab_size"], MIN_VOCAB);
+        assert_eq!(json["config"]["context_len"], 32);
+        assert_eq!(json["config"]["dim_ffn"], 64);
+        assert_eq!(json["config"]["rosa_bits"], 1);
+        assert_eq!(json["config"]["rosa_grad"], "stop_grad_bits");
+        assert_eq!(json["config"]["optimizer"], "stateless_sgd");
+        assert!(json["head"]["bias_bits"].is_null());
+        assert!(json["head"]["bits"].is_array());
+        assert!(json["head"]["scale_bits"].is_array());
+        assert!(json["ln_out"]["weight"].is_array());
+        let block = &json["blocks"][0];
+        assert!(block["ln0"]["weight"].is_array());
+        assert!(block["rosa"]["q"]["bias_bits"].is_array());
+        assert!(block["rosa"]["e"].is_array());
+        assert!(block["ffn"]["key"]["bias_bits"].is_null());
+        assert!(block["ffn"]["value_bits"].is_array());
+        let dump = json.to_string();
+        assert!(!dump.contains("latent"));
+        assert!(!dump.contains("master_bits"));
+        assert!(!dump.contains("hyena"));
+        assert!(!json.as_object().unwrap().contains_key("hybrid_blocks"));
+    }
+
+    #[test]
+    fn checkpoint_roundtrip_after_train_preserves_forward() {
+        let mut model = UllisHeron::new(tiny_train_cfg()).unwrap();
+        let tokens: Vec<u32> = (0..32).map(|i| 4 + (i % 8) as u32).collect();
+        model.train_step(&tokens, 1, 32, 0.05).unwrap();
+        let hidden = model.hidden(&tokens, 1, 32).unwrap();
+        let bytes = serde_json::to_vec(&model.checkpoint()).unwrap();
+        assert!(!String::from_utf8_lossy(&bytes).contains("latent"));
+        let restored =
+            UllisHeron::from_checkpoint(ModelCheckpoint::from_json_bytes(&bytes).unwrap()).unwrap();
+        let hidden_restored = restored.hidden(&tokens, 1, 32).unwrap();
+        assert_eq!(hidden, hidden_restored);
+        assert_eq!(
+            restored.blocks[0].rosa.e.as_bits(),
+            model.blocks[0].rosa.e.as_bits()
+        );
+        assert_eq!(restored.head.bits(), model.head.bits());
+        assert_eq!(
+            restored.head.scale().as_bits(),
+            model.head.scale().as_bits()
+        );
+    }
+
+    #[test]
+    fn json_v1_payload_is_rejected_before_v2_schema() {
+        let error = ModelCheckpoint::from_json_bytes(
+            br#"{"format_version":1,"config":{"d_model":256},"embedding_bits":[]}"#,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("Hyena checkpoints (v1)"));
+        assert!(error.contains("format_version 1"));
+    }
+
+    #[test]
+    fn json_without_version_is_rejected_as_hyena() {
+        let error = ModelCheckpoint::from_json_bytes(br#"{"embedding_bits":[]}"#)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("Hyena checkpoints (v1)"));
+        assert!(error.contains("format_version 0"));
+    }
+
+    #[test]
+    fn inspect_splits_param_counts_and_inference_state() {
+        let model = UllisHeron::new(tiny_train_cfg()).unwrap();
+        let report = model.checkpoint().inspect().unwrap();
+        assert_eq!(report.format_version, 2);
+        assert_eq!(report.architecture, Architecture::Heron);
+        let d = 16_usize;
+        let v = MIN_VOCAB as usize;
+        let ffn = 64_usize;
+        assert_eq!(report.param_counts.embedding, v * d);
+        assert_eq!(report.param_counts.packed_bits, v * d + 4 * d * d + ffn * d);
+        assert_eq!(report.param_counts.fp16_matrices, d * ffn);
+        assert_eq!(report.param_counts.layer_norm, 8 * d);
+        assert_eq!(report.param_counts.rosa_e, d);
+        assert_eq!(report.param_counts.fp16_vectors, 4 * d);
+        assert_eq!(
+            report.inference_state.sam_bytes,
+            sam_workspace_bytes(1, 32, d).unwrap()
+        );
+        assert_eq!(
+            report.inference_state.time_shift_bytes,
+            d * size_of::<f32>()
+        );
+    }
+
+    #[test]
+    fn generate_step_logits_match_one_shot_hidden() {
+        let model = UllisHeron::new(tiny_train_cfg()).unwrap();
+        let tokens: Vec<u32> = (0..8).map(|i| 4 + (i % 8) as u32).collect();
+        let d = model.cfg.d_model;
+        let hidden = model.hidden(&tokens, 1, tokens.len()).unwrap();
+        let mut state = model.generate_state().unwrap();
+        assert_eq!(state.time(), 0);
+        for (t, &id) in tokens.iter().enumerate() {
+            let logits = model.generate_step(&mut state, id).unwrap();
+            let expected = model.head.forward(&hidden[t * d..(t + 1) * d], 1).unwrap();
+            assert_eq!(logits, expected);
+            assert_eq!(state.time(), t + 1);
+        }
+    }
+
+    #[test]
+    fn rosa_forward_one_matches_oneshot_and_reuses_push() {
+        let model = UllisHeron::new(tiny_train_cfg()).unwrap();
+        let tokens: Vec<u32> = (0..8).map(|i| 4 + i as u32).collect();
+        let d = model.cfg.d_model;
+        let mut x = vec![0.0; tokens.len() * d];
+        for (row, &id) in tokens.iter().enumerate() {
+            let offset = id as usize * d;
+            for c in 0..d {
+                x[row * d + c] = model.embedding.get(offset + c);
+            }
+        }
+        let block = &model.blocks[0];
+        let h = block
+            .ln0
+            .as_ref()
+            .unwrap()
+            .forward(&x, tokens.len())
+            .unwrap();
+        let rosa_in = block.ln3.forward(&h, tokens.len()).unwrap();
+        let one_shot = block.rosa.forward(&rosa_in, 1, tokens.len()).unwrap();
+        let mut sams: Vec<RosaSam> = (0..d)
+            .map(|_| RosaSam::with_max_time(tokens.len()))
+            .collect();
+        let mut prev = None;
+        let mut incremental = Vec::new();
+        for t in 0..tokens.len() {
+            let row = &rosa_in[t * d..(t + 1) * d];
+            let out = block
+                .rosa
+                .forward_one(row, prev.as_deref(), &mut sams)
+                .unwrap();
+            incremental.extend_from_slice(&out);
+            prev = Some(row.to_vec());
+        }
+        assert_eq!(incremental, one_shot);
+    }
+
+    #[test]
+    fn generate_step_rejects_past_context_len() {
+        let model = UllisHeron::new(tiny_train_cfg()).unwrap();
+        let mut state = model.generate_state().unwrap();
+        for i in 0..model.cfg.context_len {
+            model.generate_step(&mut state, 4 + (i as u32 % 8)).unwrap();
+        }
+        let err = model.generate_step(&mut state, 4).unwrap_err().to_string();
+        assert!(err.contains("context_len"));
+    }
+
+    #[test]
+    fn generate_step_matches_one_shot_after_train() {
+        let mut model = UllisHeron::new(tiny_train_cfg()).unwrap();
+        let tokens: Vec<u32> = (0..32).map(|i| 4 + (i % 8) as u32).collect();
+        model.train_step(&tokens, 1, 32, 0.05).unwrap();
+        let prefix = &tokens[..8];
+        let d = model.cfg.d_model;
+        let hidden = model.hidden(prefix, 1, prefix.len()).unwrap();
+        let mut state = model.generate_state().unwrap();
+        for (t, &id) in prefix.iter().enumerate() {
+            let logits = model.generate_step(&mut state, id).unwrap();
+            let expected = model.head.forward(&hidden[t * d..(t + 1) * d], 1).unwrap();
+            assert_eq!(logits, expected);
+        }
     }
 }

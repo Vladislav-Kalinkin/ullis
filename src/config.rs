@@ -153,8 +153,16 @@ impl TrainConfig {
     }
 
     pub fn validate(&self) -> Result<()> {
-        if self.d_model == 0 || self.n_layers == 0 || self.vocab_size < MIN_VOCAB as usize {
-            bail!("d_model, n_layers, and vocab_size must be non-zero (vocab >= {MIN_VOCAB})");
+        if self.d_model == 0 || self.n_layers == 0 {
+            bail!("d_model and n_layers must be non-zero");
+        }
+        let min_vocab = if matches!(self.architecture, Architecture::RosaRwkv7) {
+            12
+        } else {
+            MIN_VOCAB as usize
+        };
+        if self.vocab_size < min_vocab {
+            bail!("vocab_size must be at least {min_vocab}");
         }
         if self.context_len == 0 || self.context_len > MAX_CONTEXT_LEN {
             bail!("context_len must be in 1..={MAX_CONTEXT_LEN}");

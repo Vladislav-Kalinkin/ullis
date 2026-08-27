@@ -662,3 +662,181 @@ kernel void ullis_rosa_qkv_1bit_bwd_e(
     }
     e_gradient[c] = acc;
 }
+
+constant uint ULLIS_WKV7_N = 16u;
+constant uint ULLIS_WKV7_CHUNK = 16u;
+
+// Transcription of cuda/wkv7_cuda.cu::forward_kernel. Thread i is head channel.
+kernel void ullis_wkv7_forward(
+    device const float *w_ [[buffer(0)]],
+    device const float *q_ [[buffer(1)]],
+    device const float *k_ [[buffer(2)]],
+    device const float *v_ [[buffer(3)]],
+    device const float *a_ [[buffer(4)]],
+    device const float *b_ [[buffer(5)]],
+    device float *y_ [[buffer(6)]],
+    device float *s_ [[buffer(7)]],
+    device float *sa_ [[buffer(8)]],
+    constant uint &T [[buffer(9)]],
+    constant uint &H [[buffer(10)]],
+    uint i [[thread_position_in_threadgroup]],
+    uint2 tg [[threadgroup_position_in_grid]]) {
+    const uint hh = tg.x;
+    const uint bb = tg.y;
+    const uint n = ULLIS_WKV7_N;
+    if (i >= n || T == 0u || H == 0u || (T % ULLIS_WKV7_CHUNK) != 0u) {
+        return;
+    }
+    float state[16];
+    for (uint j = 0u; j < n; ++j) {
+        state[j] = 0.0f;
+    }
+    threadgroup float q[16];
+    threadgroup float k[16];
+    threadgroup float w[16];
+    threadgroup float a[16];
+    threadgroup float b[16];
+    const uint nchunks = T / ULLIS_WKV7_CHUNK;
+    for (uint t = 0u; t < T; ++t) {
+        const uint ind = ((bb * T + t) * H + hh) * n + i;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        q[i] = q_[ind];
+        w[i] = exp(-exp(w_[ind]));
+        k[i] = k_[ind];
+        a[i] = a_[ind];
+        b[i] = b_[ind];
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        float sa = 0.0f;
+        for (uint j = 0u; j < n; ++j) {
+            sa += a[j] * state[j];
+        }
+        sa_[ind] = sa;
+        const float vv = v_[ind];
+        float y = 0.0f;
+        for (uint j = 0u; j < n; ++j) {
+            state[j] = state[j] * w[j] + sa * b[j] + k[j] * vv;
+            y += state[j] * q[j];
+        }
+        y_[ind] = y;
+        if ((t + 1u) % ULLIS_WKV7_CHUNK == 0u) {
+            const uint base = ((bb * H + hh) * nchunks + (t / ULLIS_WKV7_CHUNK)) * n * n + i;
+            for (uint j = 0u; j < n; ++j) {
+                s_[base + j * n] = state[j];
+            }
+        }
+    }
+}
+
+// Transcription of cuda/wkv7_cuda.cu::backward_kernel.
+kernel void ullis_wkv7_backward(
+    device const float *w_ [[buffer(0)]],
+    device const float *q_ [[buffer(1)]],
+    device const float *k_ [[buffer(2)]],
+    device const float *v_ [[buffer(3)]],
+    device const float *a_ [[buffer(4)]],
+    device const float *b_ [[buffer(5)]],
+    device const float *dy_ [[buffer(6)]],
+    device const float *s_ [[buffer(7)]],
+    device const float *sa_ [[buffer(8)]],
+    device float *dw_ [[buffer(9)]],
+    device float *dq_ [[buffer(10)]],
+    device float *dk_ [[buffer(11)]],
+    device float *dv_ [[buffer(12)]],
+    device float *da_ [[buffer(13)]],
+    device float *db_ [[buffer(14)]],
+    constant uint &T [[buffer(15)]],
+    constant uint &H [[buffer(16)]],
+    uint i [[thread_position_in_threadgroup]],
+    uint2 tg [[threadgroup_position_in_grid]]) {
+    const uint hh = tg.x;
+    const uint bb = tg.y;
+    const uint n = ULLIS_WKV7_N;
+    if (i >= n || T == 0u || H == 0u || (T % ULLIS_WKV7_CHUNK) != 0u) {
+        return;
+    }
+    float stateT[16];
+    float dstate[16];
+    float dstateT[16];
+    for (uint j = 0u; j < n; ++j) {
+        stateT[j] = 0.0f;
+        dstate[j] = 0.0f;
+        dstateT[j] = 0.0f;
+    }
+    threadgroup float w[16];
+    threadgroup float q[16];
+    threadgroup float k[16];
+    threadgroup float v[16];
+    threadgroup float a[16];
+    threadgroup float b[16];
+    threadgroup float dy[16];
+    threadgroup float sa[16];
+    threadgroup float dSb_shared[16];
+    const uint nchunks = T / ULLIS_WKV7_CHUNK;
+    for (uint tstep = 0u; tstep < T; ++tstep) {
+        const uint t = T - 1u - tstep;
+        const uint ind = ((bb * T + t) * H + hh) * n + i;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        q[i] = q_[ind];
+        const float wi_fac = -exp(w_[ind]);
+        const float wi = exp(wi_fac);
+        w[i] = wi;
+        k[i] = k_[ind];
+        a[i] = a_[ind];
+        b[i] = b_[ind];
+        v[i] = v_[ind];
+        dy[i] = dy_[ind];
+        sa[i] = sa_[ind];
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if ((t + 1u) % ULLIS_WKV7_CHUNK == 0u) {
+            const uint base =
+                ((bb * H + hh) * nchunks + (t / ULLIS_WKV7_CHUNK)) * n * n + i * n;
+            for (uint j = 0u; j < n; ++j) {
+                stateT[j] = s_[base + j];
+            }
+        }
+        float dq = 0.0f;
+        for (uint j = 0u; j < n; ++j) {
+            dq += stateT[j] * dy[j];
+        }
+        dq_[ind] = dq;
+        const float qi = q[i];
+        const float ki = k[i];
+        const float ai = a[i];
+        const float bi = b[i];
+        const float dyi = dy[i];
+        const float iwi = 1.0f / wi;
+        for (uint j = 0u; j < n; ++j) {
+            stateT[j] = (stateT[j] - ki * v[j] - bi * sa[j]) * iwi;
+            dstate[j] += dyi * q[j];
+            dstateT[j] += qi * dy[j];
+        }
+        float dw = 0.0f;
+        float dk = 0.0f;
+        float dv = 0.0f;
+        float db = 0.0f;
+        float dSb = 0.0f;
+        for (uint j = 0u; j < n; ++j) {
+            dw += dstateT[j] * stateT[j];
+            dk += dstateT[j] * v[j];
+            dv += dstate[j] * k[j];
+            dSb += dstate[j] * b[j];
+            db += dstateT[j] * sa[j];
+        }
+        dw_[ind] = dw * wi * wi_fac;
+        dk_[ind] = dk;
+        dv_[ind] = dv;
+        db_[ind] = db;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        dSb_shared[i] = dSb;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        float da = 0.0f;
+        for (uint j = 0u; j < n; ++j) {
+            da += stateT[j] * dSb_shared[j];
+        }
+        da_[ind] = da;
+        for (uint j = 0u; j < n; ++j) {
+            dstate[j] = dstate[j] * w[j] + dSb * a[j];
+            dstateT[j] = dstateT[j] * wi + ai * dSb_shared[j];
+        }
+    }
+}
