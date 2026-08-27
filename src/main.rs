@@ -208,6 +208,74 @@ fn load_dataset(path: &Path) -> Result<Vec<DatasetRecord>> {
         .collect()
 }
 
+fn log_status(message: impl Display) {
+    eprintln!("ullis: {message}");
+    let _ = io::stderr().flush();
+}
+
+/// Stream JSONL into training strings, stopping once `max_bytes` of text is in hand.
+fn load_training_texts(path: &Path, max_bytes: usize) -> Result<(Vec<String>, usize, usize)> {
+    let file = File::open(path).with_context(|| format!("open dataset {}", path.display()))?;
+    let mut texts = Vec::new();
+    let mut records = 0_usize;
+    let mut text_bytes = 0_usize;
+    for (index, line) in BufReader::new(file).lines().enumerate() {
+        let line = line.with_context(|| format!("read dataset line {}", index + 1))?;
+        if line.trim().is_empty() {
+            continue;
+        }
+        let record: DatasetRecord = serde_json::from_str(&line)
+            .with_context(|| format!("parse dataset line {}", index + 1))?;
+        validate_record(&record).with_context(|| format!("validate dataset line {}", index + 1))?;
+        let text = training_text(&record);
+        text_bytes = text_bytes.saturating_add(text.len());
+        texts.push(text);
+        records += 1;
+        if text_bytes >= max_bytes {
+            break;
+        }
+    }
+    if texts.is_empty() {
+        bail!("dataset {} has no training records", path.display());
+    }
+    Ok((texts, records, text_bytes))
+}
+
+fn cap_texts_bytes(texts: &[String], max_bytes: usize) -> Vec<String> {
+    if max_bytes == usize::MAX {
+        return texts.to_vec();
+    }
+    let mut out = Vec::new();
+    let mut used = 0_usize;
+    for text in texts {
+        if used >= max_bytes && !out.is_empty() {
+            break;
+        }
+        used = used.saturating_add(text.len());
+        out.push(text.clone());
+    }
+    out
+}
+
+fn encode_training_stream(
+    texts: &[String],
+    tokenizer: &mut BpeTokenizer,
+    needed: usize,
+) -> Result<Vec<u32>> {
+    if needed == 0 {
+        bail!("encoded corpus is empty");
+    }
+    let mut corpus = Vec::with_capacity(needed);
+    for text in texts {
+        corpus.extend(tokenizer.encode(text, true, true));
+        if corpus.len() >= needed {
+            corpus.truncate(needed);
+            return Ok(corpus);
+        }
+    }
+    cycle_corpus(&corpus, needed)
+}
+
 fn default_train_config(vocab_size: usize) -> TrainConfig {
     TrainConfig {
         vocab_size,
@@ -339,14 +407,62 @@ fn train(
     learning_rate: f32,
     checkpoint_every: usize,
     backend: Backend,
-    _bpe_train_mib: usize,
+    bpe_train_mib: usize,
 ) -> Result<()> {
     if steps == 0 || checkpoint_every == 0 || !learning_rate.is_finite() || learning_rate <= 0.0 {
         bail!("steps, checkpoint-every, and learning-rate must be positive");
     }
-    let records = load_dataset(&data)?;
-    let texts: Vec<String> = records.iter().map(training_text).collect();
+    let started_all = Instant::now();
+    log_status(format!(
+        "train start steps={steps} data={} run={} backend={backend:?}",
+        data.display(),
+        run.display()
+    ));
+
+    let cfg_for_budget = if resume.is_some() {
+        None
+    } else {
+        Some(load_config(config_path.clone(), &overrides)?)
+    };
+    if let Some(cfg) = &cfg_for_budget {
+        cfg.validate()?;
+        if matches!(cfg.architecture, Architecture::RosaRwkv7) {
+            bail!("rosa_rwkv7 train is not wired");
+        }
+        cfg.optimizer.require_train_step()?;
+    }
+    let context_hint = cfg_for_budget
+        .as_ref()
+        .map_or(2048, |cfg| cfg.context_len);
+    let batch_hint = cfg_for_budget.as_ref().map_or(1, |cfg| cfg.batch_size);
+    let needed = steps
+        .saturating_mul(batch_hint)
+        .saturating_mul(context_hint);
+    let bpe_bytes = bpe_train_mib.saturating_mul(1024 * 1024);
+    let text_budget = if bpe_bytes == 0 {
+        usize::MAX
+    } else {
+        bpe_bytes.max(needed)
+    };
+
+    let load_started = Instant::now();
+    log_status(format!(
+        "loading dataset {} (text budget {} bytes, bpe-train-mib={bpe_train_mib})",
+        data.display(),
+        if text_budget == usize::MAX {
+            "unlimited".into()
+        } else {
+            text_budget.to_string()
+        }
+    ));
+    let (texts, records, text_bytes) = load_training_texts(&data, text_budget)?;
+    log_status(format!(
+        "loaded {records} records, {text_bytes} bytes of training text in {:.1}s",
+        load_started.elapsed().as_secs_f64()
+    ));
+
     let (mut model, mut tokenizer) = if let Some(path) = resume {
+        log_status(format!("resuming {}", path.display()));
         let (model, tokenizer) = load_model(&path)?;
         reject_resume_overrides(&model.cfg, &overrides)?;
         if let Some(path) = config_path {
@@ -355,15 +471,45 @@ fn train(
         }
         (model, tokenizer)
     } else {
-        let mut cfg = load_config(config_path, &overrides)?;
-        cfg.validate()?;
-        if matches!(cfg.architecture, Architecture::RosaRwkv7) {
-            bail!("rosa_rwkv7 train is not wired");
-        }
-        cfg.optimizer.require_train_step()?;
-        let tokenizer = train_bpe(&texts, cfg.vocab_size as u32, cfg.seed)?;
+        let mut cfg = cfg_for_budget
+            .ok_or_else(|| anyhow::anyhow!("fresh train is missing a resolved config"))?;
+        fs::create_dir_all(&run)?;
+        let tokenizer_path = run.join("tokenizer.json");
+        let tokenizer = if tokenizer_path.is_file() {
+            log_status(format!(
+                "reusing {} (delete it to retrain BPE)",
+                tokenizer_path.display()
+            ));
+            BpeTokenizer::load(&tokenizer_path)?
+        } else {
+            let bpe_started = Instant::now();
+            let bpe_texts = cap_texts_bytes(&texts, if bpe_bytes == 0 { usize::MAX } else { bpe_bytes });
+            let bpe_text_bytes: usize = bpe_texts.iter().map(String::len).sum();
+            log_status(format!(
+                "training BPE vocab_ceiling={} on {bpe_text_bytes} bytes",
+                cfg.vocab_size
+            ));
+            let tokenizer = train_bpe(&bpe_texts, cfg.vocab_size as u32, cfg.seed)?;
+            log_status(format!(
+                "BPE finished vocab={} merges={} in {:.1}s",
+                tokenizer.vocab_size(),
+                tokenizer.merges.len(),
+                bpe_started.elapsed().as_secs_f64()
+            ));
+            tokenizer
+        };
         cfg = cfg.with_tokenizer(&tokenizer)?;
-        (UllisHeron::new(cfg)?, tokenizer)
+        let model_started = Instant::now();
+        log_status(format!(
+            "initializing heron d={} layers={} vocab={} context={}",
+            cfg.d_model, cfg.n_layers, cfg.vocab_size, cfg.context_len
+        ));
+        let model = UllisHeron::new(cfg)?;
+        log_status(format!(
+            "model ready in {:.1}s",
+            model_started.elapsed().as_secs_f64()
+        ));
+        (model, tokenizer)
     };
     if matches!(model.cfg.architecture, Architecture::RosaRwkv7) {
         bail!("rosa_rwkv7 train is not wired");
@@ -376,26 +522,53 @@ fn train(
         serde_json::to_string_pretty(&model.cfg)?,
     )?;
 
-    let mut corpus = Vec::new();
-    for text in &texts {
-        corpus.extend(tokenizer.encode(text, true, true));
-    }
     let needed = steps
         .saturating_mul(model.cfg.batch_size)
         .saturating_mul(model.cfg.context_len);
-    let stream = cycle_corpus(&corpus, needed)?;
+    let encode_started = Instant::now();
+    log_status(format!("encoding {needed} training tokens"));
+    let stream = encode_training_stream(&texts, &mut tokenizer, needed)?;
+    log_status(format!(
+        "encoded {} tokens in {:.1}s",
+        stream.len(),
+        encode_started.elapsed().as_secs_f64()
+    ));
     let batcher = CausalBatcher::from_config(&stream, &model.cfg, model.cfg.context_len)?;
 
     #[cfg(target_os = "macos")]
     let metal = match backend {
-        Backend::Metal => Some(ullis::metal::MetalRuntime::new()?),
-        Backend::Cpu => None,
+        Backend::Metal => {
+            let metal_started = Instant::now();
+            log_status("compiling Metal shaders");
+            let runtime = ullis::metal::MetalRuntime::new()?;
+            log_status(format!(
+                "Metal ready in {:.1}s",
+                metal_started.elapsed().as_secs_f64()
+            ));
+            let rows = model.cfg.batch_size.saturating_mul(model.cfg.context_len);
+            let rosa_readback = rows
+                .saturating_mul(model.cfg.d_model)
+                .saturating_mul(model.cfg.n_layers)
+                .saturating_mul(size_of::<f32>().saturating_mul(2).saturating_add(1));
+            log_status(format!(
+                "Metal train: LN/QKV/CMix/head on GPU; ROSA SAM on CPU (~{rosa_readback} bytes idx+y+out/step)"
+            ));
+            Some(runtime)
+        }
+        Backend::Cpu => {
+            log_status("CPU backend; no Metal kernels");
+            None
+        }
     };
     #[cfg(not(target_os = "macos"))]
     if matches!(backend, Backend::Metal) {
         bail!("Metal backend requires macOS on Apple Silicon");
     }
 
+    log_status(format!(
+        "starting loop after {:.1}s of setup",
+        started_all.elapsed().as_secs_f64()
+    ));
     let metrics_path = run.join("metrics.jsonl");
     let mut loss_ema = None;
     let ln_v = (model.cfg.vocab_size as f32).ln();
@@ -447,6 +620,13 @@ fn train(
         } else {
             0.0
         };
+        let phases = model.last_step_profile().map(|profile| {
+            profile
+                .phases_ms
+                .iter()
+                .map(|(name, ms)| (name.clone(), serde_json::json!(ms)))
+                .collect::<serde_json::Map<_, _>>()
+        });
         let row = serde_json::json!({
             "step": step,
             "tokens": tokens,
@@ -463,12 +643,17 @@ fn train(
             "rosa_bits": model.cfg.rosa_bits,
             "rosa_grad": "stop_grad_bits",
             "binary_flip_count": loss.binary_flip_count,
+            "phases_ms": phases,
         });
         write_metrics(&metrics_path, &row)?;
         println!(
-            "step {step}/{steps} loss={:.4} ema={:.4} rosa_grad=stop_grad_bits flips={}",
+            "step {step}/{steps} loss={:.4} ema={:.4} rosa_grad=stop_grad_bits flips={} {millis:.0}ms {tps:.0} tok/s",
             loss.next_token, ema, loss.binary_flip_count
         );
+        if let Some(profile) = model.last_step_profile() {
+            log_status(format!("step {step} phases {}", profile.line()));
+        }
+        let _ = io::stdout().flush();
         if step.is_multiple_of(checkpoint_every) || step == steps {
             // Snapshot only on a checkpoint boundary: bits+scale+bias, never RAM latents.
             fs::write(

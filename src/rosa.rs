@@ -395,6 +395,21 @@ pub fn pack_bitplane(bits: &[u8]) -> Result<Vec<u32>> {
     Ok(words)
 }
 
+fn packed_bit_at(words: &[u32], index: usize) -> u8 {
+    ((words[index / 32] >> (index % 32)) & 1) as u8
+}
+
+fn rosa_jobs(batch: usize, channels: usize) -> usize {
+    batch.saturating_mul(channels)
+}
+
+fn sam_thread_count(jobs: usize) -> usize {
+    std::thread::available_parallelism()
+        .map(std::num::NonZero::get)
+        .unwrap_or(1)
+        .clamp(1, jobs.max(1))
+}
+
 /// Batched `rosa_qkv_ref` over `[B, T, D]` bit tensors stored row-major.
 pub fn rosa_qkv_batch(
     q: &[u8],
@@ -414,21 +429,83 @@ pub fn rosa_qkv_batch(
     if batch == 0 || time == 0 || channels == 0 {
         bail!("rosa_qkv_batch dimensions must be non-zero");
     }
-    let mut idx = vec![0_u8; elements];
+    rosa_qkv_jobs(batch, time, channels, |index| q[index], |index| k[index], |index| v[index])
+}
+
+/// Same as [`rosa_qkv_batch`], reading LSB-packed bitplanes from `ullis_sign_pack_bits`.
+pub fn rosa_qkv_batch_packed(
+    q_bits: &[u32],
+    k_bits: &[u32],
+    v_bits: &[u32],
+    batch: usize,
+    time: usize,
+    channels: usize,
+) -> Result<Vec<u8>> {
+    let elements = batch
+        .checked_mul(time)
+        .and_then(|rows| rows.checked_mul(channels))
+        .ok_or_else(|| anyhow::anyhow!("rosa_qkv_batch_packed shape overflow"))?;
+    let words = elements.div_ceil(32);
+    if q_bits.len() != words || k_bits.len() != words || v_bits.len() != words {
+        bail!("rosa_qkv_batch_packed word count mismatch");
+    }
+    if batch == 0 || time == 0 || channels == 0 {
+        bail!("rosa_qkv_batch_packed dimensions must be non-zero");
+    }
+    rosa_qkv_jobs(
+        batch,
+        time,
+        channels,
+        |index| packed_bit_at(q_bits, index),
+        |index| packed_bit_at(k_bits, index),
+        |index| packed_bit_at(v_bits, index),
+    )
+}
+
+fn rosa_qkv_jobs(
+    batch: usize,
+    time: usize,
+    channels: usize,
+    q_at: impl Fn(usize) -> u8 + Sync,
+    k_at: impl Fn(usize) -> u8 + Sync,
+    v_at: impl Fn(usize) -> u8 + Sync,
+) -> Result<Vec<u8>> {
+    let jobs = rosa_jobs(batch, channels);
+    let mut idx_bct = vec![0_u8; jobs.saturating_mul(time)];
+    let threads = sam_thread_count(jobs);
+    let jobs_per_thread = jobs.div_ceil(threads);
+    std::thread::scope(|scope| {
+        let mut rest = idx_bct.as_mut_slice();
+        for thread_id in 0..threads {
+            let job_start = thread_id * jobs_per_thread;
+            let job_count = jobs_per_thread.min(jobs.saturating_sub(job_start));
+            let take = job_count.saturating_mul(time);
+            let (slice, tail) = rest.split_at_mut(take);
+            rest = tail;
+            let q_at = &q_at;
+            let k_at = &k_at;
+            let v_at = &v_at;
+            scope.spawn(move || {
+                for local in 0..job_count {
+                    let job = job_start + local;
+                    let b = job / channels;
+                    let c = job % channels;
+                    let mut sam = RosaSam::with_max_time(time);
+                    let idx_ch = &mut slice[local * time..(local + 1) * time];
+                    for t in 0..time {
+                        let index = (b * time + t) * channels + c;
+                        idx_ch[t] = sam.push(q_at(index), k_at(index), v_at(index));
+                    }
+                }
+            });
+        }
+    });
+    let mut idx = vec![0_u8; batch.saturating_mul(time).saturating_mul(channels)];
     for b in 0..batch {
         for c in 0..channels {
-            let mut q_ch = Vec::with_capacity(time);
-            let mut k_ch = Vec::with_capacity(time);
-            let mut v_ch = Vec::with_capacity(time);
+            let job = b * channels + c;
             for t in 0..time {
-                let index = (b * time + t) * channels + c;
-                q_ch.push(q[index]);
-                k_ch.push(k[index]);
-                v_ch.push(v[index]);
-            }
-            let channel_idx = rosa_qkv_ref(&q_ch, &k_ch, &v_ch)?;
-            for t in 0..time {
-                idx[(b * time + t) * channels + c] = channel_idx[t];
+                idx[(b * time + t) * channels + c] = idx_bct[job * time + t];
             }
         }
     }

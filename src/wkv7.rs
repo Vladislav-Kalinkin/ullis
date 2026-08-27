@@ -27,7 +27,7 @@ pub struct Wkv7Backward {
     pub db: Vec<f32>,
 }
 
-fn require_shape(
+pub(crate) fn require_shape(
     w: &[f32],
     q: &[f32],
     k: &[f32],
@@ -139,6 +139,36 @@ pub fn wkv7_forward(
     Ok(Wkv7Forward { y, s, sa: sa_out })
 }
 
+pub(crate) fn require_backward_shape(
+    w: &[f32],
+    q: &[f32],
+    k: &[f32],
+    v: &[f32],
+    a: &[f32],
+    b: &[f32],
+    dy: &[f32],
+    s: &[f32],
+    sa: &[f32],
+    batch: usize,
+    time: usize,
+    heads: usize,
+) -> Result<(usize, usize)> {
+    let len = require_shape(w, q, k, v, a, b, batch, time, heads)?;
+    if dy.len() != len || sa.len() != len {
+        bail!("WKV7 backward dy/sa length mismatch");
+    }
+    let nchunks = time / CHUNK_LEN;
+    let s_len = batch
+        .saturating_mul(heads)
+        .saturating_mul(nchunks)
+        .saturating_mul(HEAD_SIZE)
+        .saturating_mul(HEAD_SIZE);
+    if s.len() != s_len {
+        bail!("WKV7 backward state tape length mismatch");
+    }
+    Ok((len, s_len))
+}
+
 /// CUDA `backward_kernel`. `s`/`sa` must come from the matching forward.
 pub fn wkv7_backward(
     w: &[f32],
@@ -154,19 +184,8 @@ pub fn wkv7_backward(
     time: usize,
     heads: usize,
 ) -> Result<Wkv7Backward> {
-    let len = require_shape(w, q, k, v, a, b, batch, time, heads)?;
-    if dy.len() != len || sa.len() != len {
-        bail!("WKV7 backward dy/sa length mismatch");
-    }
+    let (len, _s_len) = require_backward_shape(w, q, k, v, a, b, dy, s, sa, batch, time, heads)?;
     let nchunks = time / CHUNK_LEN;
-    let s_len = batch
-        .saturating_mul(heads)
-        .saturating_mul(nchunks)
-        .saturating_mul(HEAD_SIZE)
-        .saturating_mul(HEAD_SIZE);
-    if s.len() != s_len {
-        bail!("WKV7 backward state tape length mismatch");
-    }
     let mut dw = vec![0.0; len];
     let mut dq = vec![0.0; len];
     let mut dk = vec![0.0; len];

@@ -2,6 +2,8 @@
 using namespace metal;
 
 constant float ULLIS_LN_EPS = 1e-5f;
+constant uint ULLIS_TILE = 16u;
+constant uint ULLIS_SCALE_THREADS = 256u;
 
 inline float packed_sign(device const uint *bits, uint index) {
     return (bits[index >> 5] & (1u << (index & 31u))) ? 1.0f : -1.0f;
@@ -81,7 +83,6 @@ kernel void ullis_time_shift_delta(
         return;
     }
     const uint row = index / channels;
-    const uint channel = index % channels;
     const uint t = row % time;
     if (t == 0u) {
         output[index] = -input[index];
@@ -167,8 +168,8 @@ kernel void ullis_layer_norm_backward(
     device const float *output_gradient [[buffer(1)]],
     device const half *weight [[buffer(2)]],
     device float *input_gradient [[buffer(3)]],
-    device atomic_uint *weight_gradient [[buffer(4)]],
-    device atomic_uint *bias_gradient [[buffer(5)]],
+    device float *row_mean [[buffer(4)]],
+    device float *row_inv [[buffer(5)]],
     constant uint &rows [[buffer(6)]],
     constant uint &channels [[buffer(7)]],
     uint row [[thread_position_in_grid]]) {
@@ -188,6 +189,8 @@ kernel void ullis_layer_norm_backward(
     }
     var /= float(channels);
     const float inv = rsqrt(var + ULLIS_LN_EPS);
+    row_mean[row] = mean;
+    row_inv[row] = inv;
     const float inv_n = inv / float(channels);
     float sum_dxhat = 0.0f;
     float sum_dxhat_xhat = 0.0f;
@@ -196,8 +199,6 @@ kernel void ullis_layer_norm_backward(
         const float dxhat = output_gradient[offset + c] * float(weight[c]);
         sum_dxhat += dxhat;
         sum_dxhat_xhat += dxhat * xhat;
-        atomic_add_f32(weight_gradient + c, output_gradient[offset + c] * xhat);
-        atomic_add_f32(bias_gradient + c, output_gradient[offset + c]);
     }
     for (uint c = 0u; c < channels; ++c) {
         const float xhat = (input[offset + c] - mean) * inv;
@@ -207,6 +208,116 @@ kernel void ullis_layer_norm_backward(
     }
 }
 
+// One threadgroup per channel; no atomics. Uses mean/inv from the gx kernel.
+kernel void ullis_layer_norm_param_bwd(
+    device const float *input [[buffer(0)]],
+    device const float *output_gradient [[buffer(1)]],
+    device const float *row_mean [[buffer(2)]],
+    device const float *row_inv [[buffer(3)]],
+    device float *weight_gradient [[buffer(4)]],
+    device float *bias_gradient [[buffer(5)]],
+    constant uint &rows [[buffer(6)]],
+    constant uint &channels [[buffer(7)]],
+    uint lane [[thread_position_in_threadgroup]],
+    uint c [[threadgroup_position_in_grid]]) {
+    if (c >= channels) {
+        return;
+    }
+    float g_w = 0.0f;
+    float g_b = 0.0f;
+    for (uint row = lane; row < rows; row += ULLIS_SCALE_THREADS) {
+        const uint index = row * channels + c;
+        const float gy = output_gradient[index];
+        const float xhat = (input[index] - row_mean[row]) * row_inv[row];
+        g_w += gy * xhat;
+        g_b += gy;
+    }
+    threadgroup float shared_w[256];
+    threadgroup float shared_b[256];
+    shared_w[lane] = g_w;
+    shared_b[lane] = g_b;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint step = ULLIS_SCALE_THREADS / 2u; step > 0u; step >>= 1u) {
+        if (lane < step) {
+            shared_w[lane] += shared_w[lane + step];
+            shared_b[lane] += shared_b[lane + step];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    if (lane == 0u) {
+        weight_gradient[c] = shared_w[0];
+        bias_gradient[c] = shared_b[0];
+    }
+}
+
+kernel void ullis_time_shift_mix(
+    device const float *input [[buffer(0)]],
+    device const half *mix [[buffer(1)]],
+    device float *xx_out [[buffer(2)]],
+    device float *shifted [[buffer(3)]],
+    constant uint &rows [[buffer(4)]],
+    constant uint &time [[buffer(5)]],
+    constant uint &channels [[buffer(6)]],
+    uint index [[thread_position_in_grid]]) {
+    const uint elements = rows * channels;
+    if (index >= elements || time == 0u) {
+        return;
+    }
+    const uint row = index / channels;
+    const uint c = index % channels;
+    const uint t = row % time;
+    const float xt = input[index];
+    const float xx = (t == 0u) ? -xt : input[index - channels] - xt;
+    xx_out[index] = xx;
+    shifted[index] = xt + xx * float(mix[c]);
+}
+
+kernel void ullis_time_shift_mix3(
+    device const float *input [[buffer(0)]],
+    device const half *mix_q [[buffer(1)]],
+    device const half *mix_k [[buffer(2)]],
+    device const half *mix_v [[buffer(3)]],
+    device float *q_in [[buffer(4)]],
+    device float *k_in [[buffer(5)]],
+    device float *v_in [[buffer(6)]],
+    constant uint &rows [[buffer(7)]],
+    constant uint &time [[buffer(8)]],
+    constant uint &channels [[buffer(9)]],
+    uint index [[thread_position_in_grid]]) {
+    const uint elements = rows * channels;
+    if (index >= elements || time == 0u) {
+        return;
+    }
+    const uint row = index / channels;
+    const uint c = index % channels;
+    const uint t = row % time;
+    const float xt = input[index];
+    const float xx = (t == 0u) ? -xt : input[index - channels] - xt;
+    q_in[index] = xt + xx * float(mix_q[c]);
+    k_in[index] = xt + xx * float(mix_k[c]);
+    v_in[index] = xt + xx * float(mix_v[c]);
+}
+
+kernel void ullis_pack_latent_bits(
+    device const half *latent [[buffer(0)]],
+    device uint *bits [[buffer(1)]],
+    constant uint &elements [[buffer(2)]],
+    uint word [[thread_position_in_grid]]) {
+    const uint base = word * 32u;
+    if (base >= elements) {
+        return;
+    }
+    uint packed = 0u;
+    for (uint lane = 0u; lane < 32u; ++lane) {
+        const uint index = base + lane;
+        if (index < elements && float(latent[index]) >= 0.0f) {
+            packed |= 1u << lane;
+        }
+    }
+    bits[word] = packed;
+}
+
+// Tiled Y = scale * X @ Sign^T + bias. Threadgroup 16x16; gid=(o, row).
 kernel void ullis_binary_linear(
     device const float *input [[buffer(0)]],
     device const uint *bits [[buffer(1)]],
@@ -217,22 +328,39 @@ kernel void ullis_binary_linear(
     constant uint &in_features [[buffer(6)]],
     constant uint &out_features [[buffer(7)]],
     constant uint &has_bias [[buffer(8)]],
-    uint index [[thread_position_in_grid]]) {
-    if (index >= rows * out_features) {
-        return;
-    }
-    const uint row = index / out_features;
-    const uint o = index % out_features;
+    uint2 tid [[thread_position_in_threadgroup]],
+    uint2 tgid [[threadgroup_position_in_grid]]) {
+    const uint o = tgid.x * ULLIS_TILE + tid.x;
+    const uint row = tgid.y * ULLIS_TILE + tid.y;
+    const uint tg_o = tgid.x * ULLIS_TILE;
+    const uint tg_row = tgid.y * ULLIS_TILE;
+    threadgroup float a_tile[16][17];
+    threadgroup float b_tile[16][17];
     float sum = 0.0f;
-    const uint base = o * in_features;
-    const device float *x = input + row * in_features;
-    for (uint i = 0u; i < in_features; ++i) {
-        sum += packed_sign(bits, base + i) * x[i];
+    for (uint k0 = 0u; k0 < in_features; k0 += ULLIS_TILE) {
+        const uint k = k0 + tid.x;
+        const uint load_row = tg_row + tid.y;
+        const uint load_o = tg_o + tid.y;
+        a_tile[tid.y][tid.x] = (load_row < rows && k < in_features)
+            ? input[load_row * in_features + k]
+            : 0.0f;
+        b_tile[tid.y][tid.x] = (load_o < out_features && k < in_features)
+            ? packed_sign(bits, load_o * in_features + k)
+            : 0.0f;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+#pragma unroll
+        for (uint kk = 0u; kk < 16u; ++kk) {
+            sum += a_tile[tid.y][kk] * b_tile[tid.x][kk];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
     }
-    const float b = has_bias != 0u ? float(bias[o]) : 0.0f;
-    output[index] = b + float(scale[o]) * sum;
+    if (row < rows && o < out_features) {
+        const float b = has_bias != 0u ? float(bias[o]) : 0.0f;
+        output[row * out_features + o] = b + float(scale[o]) * sum;
+    }
 }
 
+// Tiled gX = (gY * scale) @ Sign. gid=(i, row), K=out_features.
 kernel void ullis_binary_linear_input_bwd(
     device const float *output_gradient [[buffer(0)]],
     device const uint *bits [[buffer(1)]],
@@ -241,20 +369,38 @@ kernel void ullis_binary_linear_input_bwd(
     constant uint &rows [[buffer(4)]],
     constant uint &in_features [[buffer(5)]],
     constant uint &out_features [[buffer(6)]],
-    uint index [[thread_position_in_grid]]) {
-    if (index >= rows * in_features) {
-        return;
-    }
-    const uint row = index / in_features;
-    const uint i = index % in_features;
-    const device float *gy = output_gradient + row * out_features;
+    uint2 tid [[thread_position_in_threadgroup]],
+    uint2 tgid [[threadgroup_position_in_grid]]) {
+    const uint i = tgid.x * ULLIS_TILE + tid.x;
+    const uint row = tgid.y * ULLIS_TILE + tid.y;
+    const uint tg_i = tgid.x * ULLIS_TILE;
+    const uint tg_row = tgid.y * ULLIS_TILE;
+    threadgroup float a_tile[16][17];
+    threadgroup float b_tile[16][17];
     float gx = 0.0f;
-    for (uint o = 0u; o < out_features; ++o) {
-        gx += gy[o] * float(scale[o]) * packed_sign(bits, o * in_features + i);
+    for (uint k0 = 0u; k0 < out_features; k0 += ULLIS_TILE) {
+        const uint k = k0 + tid.x;
+        const uint load_row = tg_row + tid.y;
+        const uint load_i = tg_i + tid.y;
+        a_tile[tid.y][tid.x] = (load_row < rows && k < out_features)
+            ? output_gradient[load_row * out_features + k]
+            : 0.0f;
+        b_tile[tid.y][tid.x] = (load_i < in_features && k < out_features)
+            ? float(scale[k]) * packed_sign(bits, k * in_features + load_i)
+            : 0.0f;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+#pragma unroll
+        for (uint kk = 0u; kk < 16u; ++kk) {
+            gx += a_tile[tid.y][kk] * b_tile[tid.x][kk];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
     }
-    input_gradient[index] = gx;
+    if (row < rows && i < in_features) {
+        input_gradient[row * in_features + i] = gx;
+    }
 }
 
+// One threadgroup per output feature; 256 lanes reduce over rows.
 kernel void ullis_binary_linear_scale_bwd(
     device const float *input [[buffer(0)]],
     device const float *output_gradient [[buffer(1)]],
@@ -265,14 +411,15 @@ kernel void ullis_binary_linear_scale_bwd(
     constant uint &in_features [[buffer(6)]],
     constant uint &out_features [[buffer(7)]],
     constant uint &has_bias [[buffer(8)]],
-    uint o [[thread_position_in_grid]]) {
+    uint lane [[thread_position_in_threadgroup]],
+    uint o [[threadgroup_position_in_grid]]) {
     if (o >= out_features) {
         return;
     }
     const uint base = o * in_features;
     float g_scale = 0.0f;
     float g_bias = 0.0f;
-    for (uint row = 0u; row < rows; ++row) {
+    for (uint row = lane; row < rows; row += ULLIS_SCALE_THREADS) {
         const float gy = output_gradient[row * out_features + o];
         const device float *x = input + row * in_features;
         float signed_dot = 0.0f;
@@ -282,9 +429,111 @@ kernel void ullis_binary_linear_scale_bwd(
         g_scale += gy * signed_dot;
         g_bias += gy;
     }
-    scale_gradient[o] = g_scale;
-    if (has_bias != 0u) {
-        bias_gradient[o] = g_bias;
+    threadgroup float shared_s[256];
+    threadgroup float shared_b[256];
+    shared_s[lane] = g_scale;
+    shared_b[lane] = g_bias;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint step = ULLIS_SCALE_THREADS / 2u; step > 0u; step >>= 1u) {
+        if (lane < step) {
+            shared_s[lane] += shared_s[lane + step];
+            shared_b[lane] += shared_b[lane + step];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    if (lane == 0u) {
+        scale_gradient[o] = shared_s[0];
+        if (has_bias != 0u) {
+            bias_gradient[o] = shared_b[0];
+        }
+    }
+}
+
+// g_scale[o] = Σ_row gY[row,o] * (Y[row,o] - bias) / scale[o]. Avoids a second matmul.
+kernel void ullis_binary_linear_scale_bwd_from_output(
+    device const float *output [[buffer(0)]],
+    device const float *output_gradient [[buffer(1)]],
+    device const half *scale [[buffer(2)]],
+    device const half *bias [[buffer(3)]],
+    device float *scale_gradient [[buffer(4)]],
+    device float *bias_gradient [[buffer(5)]],
+    constant uint &rows [[buffer(6)]],
+    constant uint &out_features [[buffer(7)]],
+    constant uint &has_bias [[buffer(8)]],
+    uint lane [[thread_position_in_threadgroup]],
+    uint o [[threadgroup_position_in_grid]]) {
+    if (o >= out_features) {
+        return;
+    }
+    const float s = float(scale[o]);
+    const float b = has_bias != 0u ? float(bias[o]) : 0.0f;
+    float g_scale = 0.0f;
+    float g_bias = 0.0f;
+    for (uint row = lane; row < rows; row += ULLIS_SCALE_THREADS) {
+        const uint index = row * out_features + o;
+        const float gy = output_gradient[index];
+        g_bias += gy;
+        if (s != 0.0f) {
+            g_scale += gy * (output[index] - b) / s;
+        }
+    }
+    threadgroup float shared_s[256];
+    threadgroup float shared_b[256];
+    shared_s[lane] = g_scale;
+    shared_b[lane] = g_bias;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint step = ULLIS_SCALE_THREADS / 2u; step > 0u; step >>= 1u) {
+        if (lane < step) {
+            shared_s[lane] += shared_s[lane + step];
+            shared_b[lane] += shared_b[lane + step];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    if (lane == 0u) {
+        scale_gradient[o] = shared_s[0];
+        if (has_bias != 0u) {
+            bias_gradient[o] = shared_b[0];
+        }
+    }
+}
+
+// Tiled gW = scale * gY^T @ X. gid=(i, o), K=rows.
+kernel void ullis_binary_linear_weight_bwd(
+    device const float *input [[buffer(0)]],
+    device const float *output_gradient [[buffer(1)]],
+    device const half *scale [[buffer(2)]],
+    device float *weight_gradient [[buffer(3)]],
+    constant uint &rows [[buffer(4)]],
+    constant uint &in_features [[buffer(5)]],
+    constant uint &out_features [[buffer(6)]],
+    uint2 tid [[thread_position_in_threadgroup]],
+    uint2 tgid [[threadgroup_position_in_grid]]) {
+    const uint i = tgid.x * ULLIS_TILE + tid.x;
+    const uint o = tgid.y * ULLIS_TILE + tid.y;
+    const uint tg_i = tgid.x * ULLIS_TILE;
+    const uint tg_o = tgid.y * ULLIS_TILE;
+    threadgroup float a_tile[16][17];
+    threadgroup float b_tile[16][17];
+    float gw = 0.0f;
+    for (uint k0 = 0u; k0 < rows; k0 += ULLIS_TILE) {
+        const uint k = k0 + tid.x;
+        const uint load_o = tg_o + tid.y;
+        const uint load_i = tg_i + tid.y;
+        a_tile[tid.y][tid.x] = (load_o < out_features && k < rows)
+            ? output_gradient[k * out_features + load_o]
+            : 0.0f;
+        b_tile[tid.y][tid.x] = (load_i < in_features && k < rows)
+            ? input[k * in_features + load_i]
+            : 0.0f;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+#pragma unroll
+        for (uint kk = 0u; kk < 16u; ++kk) {
+            gw += a_tile[tid.y][kk] * b_tile[tid.x][kk];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    if (o < out_features && i < in_features) {
+        weight_gradient[o * in_features + i] = float(scale[o]) * gw;
     }
 }
 
@@ -338,6 +587,7 @@ kernel void ullis_binary_linear_latent_sgd(
     bits[word] = packed;
 }
 
+// Tiled Y = X @ W^T. gid=(o, row).
 kernel void ullis_fp16_linear(
     device const float *input [[buffer(0)]],
     device const half *weight [[buffer(1)]],
@@ -345,21 +595,38 @@ kernel void ullis_fp16_linear(
     constant uint &rows [[buffer(3)]],
     constant uint &in_features [[buffer(4)]],
     constant uint &out_features [[buffer(5)]],
-    uint index [[thread_position_in_grid]]) {
-    if (index >= rows * out_features) {
-        return;
-    }
-    const uint row = index / out_features;
-    const uint o = index % out_features;
-    const device float *x = input + row * in_features;
-    const device half *w = weight + o * in_features;
+    uint2 tid [[thread_position_in_threadgroup]],
+    uint2 tgid [[threadgroup_position_in_grid]]) {
+    const uint o = tgid.x * ULLIS_TILE + tid.x;
+    const uint row = tgid.y * ULLIS_TILE + tid.y;
+    const uint tg_o = tgid.x * ULLIS_TILE;
+    const uint tg_row = tgid.y * ULLIS_TILE;
+    threadgroup float a_tile[16][17];
+    threadgroup float b_tile[16][17];
     float sum = 0.0f;
-    for (uint i = 0u; i < in_features; ++i) {
-        sum += float(w[i]) * x[i];
+    for (uint k0 = 0u; k0 < in_features; k0 += ULLIS_TILE) {
+        const uint k = k0 + tid.x;
+        const uint load_row = tg_row + tid.y;
+        const uint load_o = tg_o + tid.y;
+        a_tile[tid.y][tid.x] = (load_row < rows && k < in_features)
+            ? input[load_row * in_features + k]
+            : 0.0f;
+        b_tile[tid.y][tid.x] = (load_o < out_features && k < in_features)
+            ? float(weight[load_o * in_features + k])
+            : 0.0f;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+#pragma unroll
+        for (uint kk = 0u; kk < 16u; ++kk) {
+            sum += a_tile[tid.y][kk] * b_tile[tid.x][kk];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
     }
-    output[index] = sum;
+    if (row < rows && o < out_features) {
+        output[row * out_features + o] = sum;
+    }
 }
 
+// kind 0: gX, gid=(i, row), K=out. kind 1: gW, gid=(i, o), K=rows.
 kernel void ullis_fp16_linear_bwd(
     device const float *input [[buffer(0)]],
     device const float *output_gradient [[buffer(1)]],
@@ -370,30 +637,60 @@ kernel void ullis_fp16_linear_bwd(
     constant uint &in_features [[buffer(6)]],
     constant uint &out_features [[buffer(7)]],
     constant uint &kind [[buffer(8)]],
-    uint index [[thread_position_in_grid]]) {
+    uint2 tid [[thread_position_in_threadgroup]],
+    uint2 tgid [[threadgroup_position_in_grid]]) {
+    threadgroup float a_tile[16][17];
+    threadgroup float b_tile[16][17];
     if (kind == 0u) {
-        if (index >= rows * in_features) {
-            return;
-        }
-        const uint row = index / in_features;
-        const uint i = index % in_features;
-        const device float *gy = output_gradient + row * out_features;
+        const uint i = tgid.x * ULLIS_TILE + tid.x;
+        const uint row = tgid.y * ULLIS_TILE + tid.y;
+        const uint tg_i = tgid.x * ULLIS_TILE;
+        const uint tg_row = tgid.y * ULLIS_TILE;
         float gx = 0.0f;
-        for (uint o = 0u; o < out_features; ++o) {
-            gx += gy[o] * float(weight[o * in_features + i]);
+        for (uint k0 = 0u; k0 < out_features; k0 += ULLIS_TILE) {
+            const uint k = k0 + tid.x;
+            const uint load_row = tg_row + tid.y;
+            const uint load_i = tg_i + tid.y;
+            a_tile[tid.y][tid.x] = (load_row < rows && k < out_features)
+                ? output_gradient[load_row * out_features + k]
+                : 0.0f;
+            b_tile[tid.y][tid.x] = (load_i < in_features && k < out_features)
+                ? float(weight[k * in_features + load_i])
+                : 0.0f;
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            for (uint kk = 0u; kk < 16u; ++kk) {
+                gx += a_tile[tid.y][kk] * b_tile[tid.x][kk];
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
         }
-        input_gradient[index] = gx;
+        if (row < rows && i < in_features) {
+            input_gradient[row * in_features + i] = gx;
+        }
     } else {
-        if (index >= out_features * in_features) {
-            return;
-        }
-        const uint o = index / in_features;
-        const uint i = index % in_features;
+        const uint i = tgid.x * ULLIS_TILE + tid.x;
+        const uint o = tgid.y * ULLIS_TILE + tid.y;
+        const uint tg_i = tgid.x * ULLIS_TILE;
+        const uint tg_o = tgid.y * ULLIS_TILE;
         float gw = 0.0f;
-        for (uint row = 0u; row < rows; ++row) {
-            gw += output_gradient[row * out_features + o] * input[row * in_features + i];
+        for (uint k0 = 0u; k0 < rows; k0 += ULLIS_TILE) {
+            const uint k = k0 + tid.x;
+            const uint load_o = tg_o + tid.y;
+            const uint load_i = tg_i + tid.y;
+            a_tile[tid.y][tid.x] = (load_o < out_features && k < rows)
+                ? output_gradient[k * out_features + load_o]
+                : 0.0f;
+            b_tile[tid.y][tid.x] = (load_i < in_features && k < rows)
+                ? input[k * in_features + load_i]
+                : 0.0f;
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            for (uint kk = 0u; kk < 16u; ++kk) {
+                gw += a_tile[tid.y][kk] * b_tile[tid.x][kk];
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
         }
-        weight_gradient[index] = gw;
+        if (o < out_features && i < in_features) {
+            weight_gradient[o * in_features + i] = gw;
+        }
     }
 }
 
@@ -407,12 +704,13 @@ kernel void ullis_streamed_cross_entropy_fp16(
     device float *hidden_gradient [[buffer(4)]],
     device float *row_loss [[buffer(5)]],
     device atomic_uint *scale_gradient [[buffer(6)]],
-    constant uint &rows [[buffer(7)]],
-    constant uint &time [[buffer(8)]],
-    constant uint &channels [[buffer(9)]],
-    constant uint &vocab [[buffer(10)]],
-    constant uint &horizon [[buffer(11)]],
-    constant float &gradient_scale [[buffer(12)]],
+    device float *logit_gradient [[buffer(7)]],
+    constant uint &rows [[buffer(8)]],
+    constant uint &time [[buffer(9)]],
+    constant uint &channels [[buffer(10)]],
+    constant uint &vocab [[buffer(11)]],
+    constant uint &horizon [[buffer(12)]],
+    constant float &gradient_scale [[buffer(13)]],
     uint row [[thread_position_in_grid]]) {
     if (row >= rows) {
         return;
@@ -423,6 +721,9 @@ kernel void ullis_streamed_cross_entropy_fp16(
         row_loss[row] = 0.0f;
         for (uint c = 0u; c < channels; ++c) {
             hidden_gradient[offset + c] = 0.0f;
+        }
+        for (uint token = 0u; token < vocab; ++token) {
+            logit_gradient[row * vocab + token] = 0.0f;
         }
         return;
     }
@@ -477,7 +778,49 @@ kernel void ullis_streamed_cross_entropy_fp16(
         const float logit = s * signed_dot;
         const float p = exp(logit - maximum) * inv_sum;
         const float gy_logit = gradient_scale * (p - float(token == target));
+        logit_gradient[row * vocab + token] = gy_logit;
         atomic_add_f32(scale_gradient + token, gy_logit * signed_dot);
+    }
+}
+
+// Softmax + next-token CE on a materialized `[rows, vocab]` logit buffer.
+kernel void ullis_softmax_cross_entropy(
+    device const float *logits [[buffer(0)]],
+    device const uint *tokens [[buffer(1)]],
+    device float *row_loss [[buffer(2)]],
+    device float *logit_gradient [[buffer(3)]],
+    constant uint &rows [[buffer(4)]],
+    constant uint &time [[buffer(5)]],
+    constant uint &vocab [[buffer(6)]],
+    constant uint &horizon [[buffer(7)]],
+    constant float &gradient_scale [[buffer(8)]],
+    uint row [[thread_position_in_grid]]) {
+    if (row >= rows) {
+        return;
+    }
+    const uint start = row * vocab;
+    const uint position = row % time;
+    if (position + horizon >= time) {
+        row_loss[row] = 0.0f;
+        for (uint token = 0u; token < vocab; ++token) {
+            logit_gradient[start + token] = 0.0f;
+        }
+        return;
+    }
+    const uint target = tokens[row + horizon];
+    float maximum = -INFINITY;
+    for (uint token = 0u; token < vocab; ++token) {
+        maximum = max(maximum, logits[start + token]);
+    }
+    float exp_sum = 0.0f;
+    for (uint token = 0u; token < vocab; ++token) {
+        exp_sum += exp(logits[start + token] - maximum);
+    }
+    row_loss[row] = maximum + log(exp_sum) - logits[start + target];
+    const float inv_sum = 1.0f / exp_sum;
+    for (uint token = 0u; token < vocab; ++token) {
+        const float p = exp(logits[start + token] - maximum) * inv_sum;
+        logit_gradient[start + token] = gradient_scale * (p - float(token == target));
     }
 }
 
@@ -520,8 +863,27 @@ inline void rosa_set_child(
     }
 }
 
+kernel void ullis_rosa_sam_reset(
+    device int *trans0 [[buffer(0)]],
+    device int *trans1 [[buffer(1)]],
+    device int *fail [[buffer(2)]],
+    device int *maxlen [[buffer(3)]],
+    device int *last [[buffer(4)]],
+    constant uint &count [[buffer(5)]],
+    uint index [[thread_position_in_grid]]) {
+    if (index >= count) {
+        return;
+    }
+    trans0[index] = -1;
+    trans1[index] = -1;
+    fail[index] = -1;
+    maxlen[index] = 0;
+    last[index] = -1;
+}
+
 // 1-bit QKV SAM. One thread owns (batch, channel); time is serial in-thread.
 // Global trans0/1, fail, maxlen, last are [B, D, 2T+1] i32. Missing child is -1.
+// Caller must run ullis_rosa_sam_reset first; this kernel does not initialize.
 kernel void ullis_rosa_qkv_1bit_fwd(
     device const uint *q_bits [[buffer(0)]],
     device const uint *k_bits [[buffer(1)]],
@@ -546,13 +908,6 @@ kernel void ullis_rosa_qkv_1bit_fwd(
     const uint c = thread_id % channels;
     const uint nodes = 2u * time + 1u;
     const uint base = thread_id * nodes;
-    for (uint node = 0u; node < nodes; ++node) {
-        trans0[base + node] = -1;
-        trans1[base + node] = -1;
-        fail[base + node] = -1;
-        maxlen[base + node] = 0;
-        last[base + node] = -1;
-    }
 
     int u = 1;
     int g = 0;
@@ -679,8 +1034,10 @@ kernel void ullis_wkv7_forward(
     device float *sa_ [[buffer(8)]],
     constant uint &T [[buffer(9)]],
     constant uint &H [[buffer(10)]],
-    uint i [[thread_position_in_threadgroup]],
+    uint2 tid [[thread_position_in_threadgroup]],
     uint2 tg [[threadgroup_position_in_grid]]) {
+    // Metal requires matching scalar/vector ranks on thread-index attributes.
+    const uint i = tid.x;
     const uint hh = tg.x;
     const uint bb = tg.y;
     const uint n = ULLIS_WKV7_N;
@@ -746,8 +1103,9 @@ kernel void ullis_wkv7_backward(
     device float *db_ [[buffer(14)]],
     constant uint &T [[buffer(15)]],
     constant uint &H [[buffer(16)]],
-    uint i [[thread_position_in_threadgroup]],
+    uint2 tid [[thread_position_in_threadgroup]],
     uint2 tg [[threadgroup_position_in_grid]]) {
+    const uint i = tid.x;
     const uint hh = tg.x;
     const uint bb = tg.y;
     const uint n = ULLIS_WKV7_N;

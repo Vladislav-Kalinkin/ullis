@@ -13,7 +13,7 @@ pub use batch::{CausalBatch, CausalBatcher};
 pub use config::{Architecture, MemoryEstimate, RosaGradMode, TrainConfig};
 pub use model::{
     CausalLoss, CheckpointInspect, HeronGenerateState, InferenceStateBytes, ModelCheckpoint,
-    ParamCounts, UllisHeron,
+    ParamCounts, TrainStepProfile, UllisHeron,
 };
 pub use optimizer::{Lion, LionConfig, OptimizerKind};
 pub use precision::{Fp16, Fp16Storage};

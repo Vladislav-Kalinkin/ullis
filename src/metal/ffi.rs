@@ -115,9 +115,12 @@ impl MetalBuffer {
         if byte_len > self.len {
             bail!("Metal map length {byte_len} exceeds buffer {}", self.len);
         }
+        #[cfg(feature = "trace_metal_copies")]
         if is_read && byte_len > TRACE_COPY_THRESHOLD {
             eprintln!("trace_metal_copies: map read {byte_len} bytes");
         }
+        #[cfg(not(feature = "trace_metal_copies"))]
+        let _ = is_read;
         // SAFETY: the buffer is StorageModeShared, retained for `'self`, and
         // `byte_len` was checked against the allocation. Unified-memory
         // `contents()` is valid for CPU access while the buffer lives.

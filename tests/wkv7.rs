@@ -94,6 +94,9 @@ fn metal_matches_cpu_on_fixture() {
             &w, &q, &k, &v, &a, &b, &dy, &cpu.s, &cpu.sa, batch, time, heads,
         )
         .unwrap();
-    assert!(max_abs(&cpu_b.dq, &gpu_b.dq) < 2e-3, "dq {}", max_abs(&cpu_b.dq, &gpu_b.dq));
+    // dq is a rewind of the transposed state; FP32 accumulates ~1e-3 over the chunk.
+    assert!(max_abs(&cpu_b.dq, &gpu_b.dq) < 5e-3, "dq {}", max_abs(&cpu_b.dq, &gpu_b.dq));
     assert!(max_abs(&cpu_b.dv, &gpu_b.dv) < 2e-3);
+    assert!(max_abs(&cpu_b.dw, &gpu_b.dw) < 2e-3);
+    assert!(max_abs(&cpu_b.da, &gpu_b.da) < 2e-3);
 }

@@ -24,6 +24,7 @@ path = "src/main.rs"
 default = ["metal"]
 metal = []
 accelerate = []
+trace_metal_copies = []
 
 [dependencies]
 anyhow = "1"

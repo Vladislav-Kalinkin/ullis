@@ -1,7 +1,7 @@
 use ullis::rosa::{
     BITFLIP_TAU, RosaSam, bit_from_activation, exact_bitflip_qkv, pack_bitplane, qkv_bitplane_bytes,
-    rosa, rosa_qkv_batch, rosa_qkv_out, rosa_qkv_out_batched, rosa_qkv_ref, sam_node_count,
-    sam_workspace_bytes,
+    rosa, rosa_qkv_batch, rosa_qkv_batch_packed, rosa_qkv_out, rosa_qkv_out_batched, rosa_qkv_ref,
+    sam_node_count, sam_workspace_bytes,
 };
 
 /// T=5 C=3 fixture from `251014_rosa_1bit_layer.py`.
@@ -152,6 +152,16 @@ fn batched_qkv_matches_per_channel_ref_and_pm_e() {
         v.extend(ROSA_T5_C3[t].iter().map(|&x| bit_from_activation(x)));
     }
     let idx = rosa_qkv_batch(&q, &k, &v, 1, 5, 3).unwrap();
+    let packed = rosa_qkv_batch_packed(
+        &pack_bitplane(&q).unwrap(),
+        &pack_bitplane(&k).unwrap(),
+        &pack_bitplane(&v).unwrap(),
+        1,
+        5,
+        3,
+    )
+    .unwrap();
+    assert_eq!(idx, packed);
     for channel in 0..3 {
         let expected: Vec<u8> = ROSA_Y[channel].iter().map(|&y| y.max(0) as u8).collect();
         let got: Vec<u8> = (0..5).map(|t| idx[t * 3 + channel]).collect();

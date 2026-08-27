@@ -13,6 +13,7 @@ use crate::rosa::{RosaSam, bit_from_activation, sam_workspace_bytes};
 use crate::wkv7::{self, CHUNK_LEN, HEAD_SIZE};
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
+use std::time::Instant;
 
 pub const CHECKPOINT_FORMAT_VERSION: u32 = 2;
 
@@ -23,6 +24,31 @@ pub struct CausalLoss {
     pub next_token: f32,
     pub next_token_count: usize,
     pub binary_flip_count: usize,
+}
+
+/// Wall-clock breakdown of one `train_step`. Phases with the same name are summed.
+#[derive(Clone, Debug, Default)]
+pub struct TrainStepProfile {
+    pub phases_ms: Vec<(String, f64)>,
+}
+
+impl TrainStepProfile {
+    fn add(&mut self, name: &str, started: Instant) {
+        let ms = started.elapsed().as_secs_f64() * 1_000.0;
+        if let Some((_, total)) = self.phases_ms.iter_mut().find(|(key, _)| key == name) {
+            *total += ms;
+        } else {
+            self.phases_ms.push((name.to_string(), ms));
+        }
+    }
+
+    pub fn line(&self) -> String {
+        self.phases_ms
+            .iter()
+            .map(|(name, ms)| format!("{name}={ms:.0}ms"))
+            .collect::<Vec<_>>()
+            .join(" ")
+    }
 }
 
 impl CausalLoss {
@@ -65,6 +91,24 @@ fn pack_plus_bits(plus: impl Iterator<Item = bool>, weights: usize) -> Vec<u32> 
         }
     }
     bits
+}
+
+fn time_shift_on(
+    x: &[f32],
+    batch: usize,
+    time: usize,
+    channels: usize,
+    metal: Option<&MetalTrainRuntime<'_>>,
+) -> Result<Vec<f32>> {
+    #[cfg(target_os = "macos")]
+    if let Some(device) = metal {
+        let rows = batch
+            .checked_mul(time)
+            .ok_or_else(|| anyhow::anyhow!("time-shift shape overflow"))?;
+        return device.runtime.time_shift_delta(x, rows, time, channels);
+    }
+    let _ = metal;
+    time_shift_delta(x, batch, time, channels)
 }
 
 fn time_shift_delta(x: &[f32], batch: usize, time: usize, channels: usize) -> Result<Vec<f32>> {
@@ -214,6 +258,48 @@ impl LayerNorm {
         }
         Ok(())
     }
+
+    fn forward_on(
+        &self,
+        x: &[f32],
+        rows: usize,
+        metal: Option<&MetalTrainRuntime<'_>>,
+    ) -> Result<Vec<f32>> {
+        #[cfg(target_os = "macos")]
+        if let Some(device) = metal {
+            return device.runtime.layer_norm(
+                x,
+                &fp16_to_f32(&self.weight),
+                &fp16_to_f32(&self.bias),
+                rows,
+                self.channels(),
+            );
+        }
+        let _ = metal;
+        self.forward(x, rows)
+    }
+
+    fn backward_on(
+        &self,
+        x: &[f32],
+        gy: &[f32],
+        rows: usize,
+        metal: Option<&MetalTrainRuntime<'_>>,
+    ) -> Result<(Vec<f32>, Vec<f32>, Vec<f32>)> {
+        #[cfg(target_os = "macos")]
+        if let Some(device) = metal {
+            let bwd = device.runtime.layer_norm_backward(
+                x,
+                gy,
+                &fp16_to_f32(&self.weight),
+                rows,
+                self.channels(),
+            )?;
+            return Ok((bwd.input_gradient, bwd.weight_gradient, bwd.bias_gradient));
+        }
+        let _ = metal;
+        self.backward(x, gy, rows)
+    }
 }
 
 /// Dense FP16 matrix without bias (CMix value, later Tmix).
@@ -309,6 +395,57 @@ impl Fp16Linear {
             self.weight.apply_clipped_sgd(i, g_weight[i], learning_rate);
         }
         Ok(())
+    }
+
+    fn weight_bits(&self) -> &[u16] {
+        self.weight.as_bits()
+    }
+
+    fn replace_weight(&mut self, bits: Vec<u16>) -> Result<()> {
+        if bits.len() != self.weight.len() {
+            bail!("FP16 linear install length mismatch");
+        }
+        self.weight = Fp16Storage::from_bits(bits);
+        Ok(())
+    }
+
+    fn forward_on(
+        &self,
+        x: &[f32],
+        rows: usize,
+        metal: Option<&MetalTrainRuntime<'_>>,
+    ) -> Result<Vec<f32>> {
+        #[cfg(target_os = "macos")]
+        if let Some(device) = metal {
+            let shape =
+                crate::metal::LinearDispatchShape::new(rows, self.in_features, self.out_features)?;
+            return device
+                .runtime
+                .fp16_linear(x, &fp16_to_f32(&self.weight), shape);
+        }
+        let _ = metal;
+        self.forward(x, rows)
+    }
+
+    fn backward_on(
+        &self,
+        x: &[f32],
+        gy: &[f32],
+        rows: usize,
+        metal: Option<&MetalTrainRuntime<'_>>,
+    ) -> Result<(Vec<f32>, Vec<f32>)> {
+        #[cfg(target_os = "macos")]
+        if let Some(device) = metal {
+            let shape =
+                crate::metal::LinearDispatchShape::new(rows, self.in_features, self.out_features)?;
+            let bwd =
+                device
+                    .runtime
+                    .fp16_linear_backward(x, gy, &fp16_to_f32(&self.weight), shape)?;
+            return Ok((bwd.input_gradient, bwd.weight_gradient));
+        }
+        let _ = metal;
+        self.backward(x, gy, rows)
     }
 }
 
@@ -430,6 +567,27 @@ impl PackedBinaryLinear {
 
     pub fn bits(&self) -> &[u32] {
         &self.bits
+    }
+
+    fn scale_bits(&self) -> &[u16] {
+        self.scale.as_bits()
+    }
+
+    fn bias_bits(&self) -> Option<&[u16]> {
+        self.bias.as_ref().map(Fp16Storage::as_bits)
+    }
+
+    fn latent_bits(&self) -> &[u16] {
+        self.latent.as_bits()
+    }
+
+    fn replace_packed(&mut self, latent: Vec<u16>, bits: Vec<u32>) -> Result<()> {
+        if latent.len() != self.latent.len() || bits.len() != packed_word_count(self.latent.len()) {
+            bail!("packed linear install length mismatch");
+        }
+        self.latent = Fp16Storage::from_bits(latent);
+        self.bits = bits;
+        Ok(())
     }
 
     pub fn latent(&self) -> &Fp16Storage {
@@ -558,7 +716,40 @@ impl PackedBinaryLinear {
         g_bias: Option<&[f32]>,
         learning_rate: f32,
     ) -> Result<usize> {
+        self.flip_after_gradients(g_w, g_scale, g_bias, learning_rate, None)
+    }
+
+    fn flip_after_gradients(
+        &mut self,
+        g_w: &[f32],
+        g_scale: &[f32],
+        g_bias: Option<&[f32]>,
+        learning_rate: f32,
+        metal: Option<&MetalTrainRuntime<'_>>,
+    ) -> Result<usize> {
         let before = self.bits.clone();
+        #[cfg(target_os = "macos")]
+        if let Some(device) = metal {
+            let (next_latent, next_bits) =
+                device
+                    .runtime
+                    .apply_latent_sgd(self.latent_bits(), g_w, learning_rate)?;
+            self.replace_packed(next_latent, next_bits)?;
+            for o in 0..self.out_features {
+                self.scale.apply_clipped_sgd(o, g_scale[o], learning_rate);
+            }
+            if let (Some(bias), Some(g_bias)) = (self.bias.as_mut(), g_bias) {
+                if g_bias.len() != self.out_features {
+                    bail!("packed linear bias SGD shape mismatch");
+                }
+                for o in 0..self.out_features {
+                    bias.apply_clipped_sgd(o, g_bias[o], learning_rate);
+                }
+            }
+            return Ok(bit_flip_count(&before, &self.bits));
+        }
+        #[cfg(not(target_os = "macos"))]
+        let _ = metal;
         self.apply_clipped_sgd(g_w, g_scale, g_bias, learning_rate)?;
         Ok(bit_flip_count(&before, &self.bits))
     }
@@ -569,6 +760,75 @@ impl PackedBinaryLinear {
             (0..weights).map(|index| self.latent.get(index) >= 0.0),
             weights,
         );
+    }
+
+    fn scale_f32(&self) -> Vec<f32> {
+        fp16_to_f32(&self.scale)
+    }
+
+    fn bias_f32(&self) -> Option<Vec<f32>> {
+        self.bias.as_ref().map(fp16_to_f32)
+    }
+
+    fn forward_on(
+        &self,
+        x: &[f32],
+        rows: usize,
+        metal: Option<&MetalTrainRuntime<'_>>,
+    ) -> Result<Vec<f32>> {
+        #[cfg(target_os = "macos")]
+        if let Some(device) = metal {
+            let shape =
+                crate::metal::LinearDispatchShape::new(rows, self.in_features, self.out_features)?;
+            let scale = self.scale_f32();
+            let bias = self.bias_f32();
+            return device
+                .runtime
+                .binary_linear(x, &self.bits, &scale, bias.as_deref(), shape);
+        }
+        let _ = metal;
+        self.forward(x, rows)
+    }
+
+    fn backward_ste_on(
+        &self,
+        x: &[f32],
+        gy: &[f32],
+        rows: usize,
+        g_w: &mut [f32],
+        mut g_x: Option<&mut [f32]>,
+        g_scale: &mut [f32],
+        mut g_bias: Option<&mut [f32]>,
+        metal: Option<&MetalTrainRuntime<'_>>,
+    ) -> Result<()> {
+        #[cfg(target_os = "macos")]
+        if let Some(device) = metal {
+            let shape =
+                crate::metal::LinearDispatchShape::new(rows, self.in_features, self.out_features)?;
+            let scale = self.scale_f32();
+            let bwd = device.runtime.binary_linear_backward(
+                x,
+                gy,
+                &self.bits,
+                &scale,
+                self.bias.is_some(),
+                shape,
+            )?;
+            if g_w.len() != bwd.weight_gradient.len() || g_scale.len() != bwd.scale_gradient.len() {
+                bail!("packed linear metal gradient length mismatch");
+            }
+            g_w.copy_from_slice(&bwd.weight_gradient);
+            g_scale.copy_from_slice(&bwd.scale_gradient);
+            if let Some(dst) = g_x.as_mut() {
+                dst.copy_from_slice(&bwd.input_gradient);
+            }
+            if let (Some(dst), Some(src)) = (g_bias.as_mut(), bwd.bias_gradient.as_ref()) {
+                dst.copy_from_slice(src);
+            }
+            return Ok(());
+        }
+        let _ = metal;
+        self.backward_ste(x, gy, rows, g_w, g_x, g_scale, g_bias)
     }
 }
 
@@ -632,9 +892,36 @@ impl RwkvCMixX070 {
         self.value.forward(&relu2, 1)
     }
 
-    fn forward_tape(&self, x: &[f32], batch: usize, time: usize) -> Result<CmixTape> {
+    fn forward_tape(
+        &self,
+        x: &[f32],
+        batch: usize,
+        time: usize,
+        metal: Option<&MetalTrainRuntime<'_>>,
+    ) -> Result<CmixTape> {
         let d = self.x_k.len();
-        let xx = time_shift_delta(x, batch, time, d)?;
+        #[cfg(target_os = "macos")]
+        if let Some(device) = metal {
+            let fwd = device.runtime.cmix_block_forward(
+                x,
+                self.x_k.as_bits(),
+                self.key.bits(),
+                self.key.scale_bits(),
+                self.value.weight_bits(),
+                batch,
+                time,
+                d,
+                self.key.out_features,
+            )?;
+            return Ok(CmixTape {
+                xx: fwd.xx,
+                shifted: fwd.shifted,
+                key: fwd.key,
+                relu2: fwd.relu2,
+                out: fwd.out,
+            });
+        }
+        let xx = time_shift_on(x, batch, time, d, metal)?;
         let rows = batch.saturating_mul(time);
         let mut shifted = vec![0.0; x.len()];
         for i in 0..rows {
@@ -643,9 +930,9 @@ impl RwkvCMixX070 {
                 shifted[index] = x[index] + xx[index] * self.x_k.get(c);
             }
         }
-        let key = self.key.forward(&shifted, rows)?;
-        let relu2: Vec<f32> = key.iter().map(|v| v.max(0.0) * v.max(0.0)).collect();
-        let out = self.value.forward(&relu2, rows)?;
+        let key = self.key.forward_on(&shifted, rows, metal)?;
+        let relu2 = relu2_on(&key, metal)?;
+        let out = self.value.forward_on(&relu2, rows, metal)?;
         Ok(CmixTape {
             xx,
             shifted,
@@ -664,24 +951,56 @@ impl RwkvCMixX070 {
         learning_rate: f32,
         batch: usize,
         time: usize,
+        metal: Option<&MetalTrainRuntime<'_>>,
     ) -> Result<usize> {
         let d = self.x_k.len();
         let rows = batch.saturating_mul(time);
-        let (g_relu2, g_value) = self.value.backward(&tape.relu2, gy, rows)?;
-        self.value.apply_clipped_sgd(&g_value, learning_rate)?;
-        let mut g_key = vec![0.0; tape.key.len()];
-        for (g, (key, g_relu)) in g_key.iter_mut().zip(tape.key.iter().zip(&g_relu2)) {
-            *g = if *key > 0.0 {
-                2.0 * *key * *g_relu
-            } else {
-                0.0
-            };
-        }
         let key_weights = self.key.out_features.saturating_mul(self.key.in_features);
+        #[cfg(target_os = "macos")]
+        if let Some(device) = metal {
+            let before = self.key.bits.clone();
+            let bwd = device.runtime.cmix_block_backward_sgd(
+                &tape.shifted,
+                &tape.key,
+                &tape.relu2,
+                gy,
+                self.key.bits(),
+                self.key.scale_bits(),
+                self.key.latent_bits(),
+                self.value.weight_bits(),
+                rows,
+                d,
+                self.key.out_features,
+                learning_rate,
+            )?;
+            self.value.replace_weight(bwd.next_value_weight)?;
+            self.key
+                .replace_packed(bwd.next_key_latent, bwd.next_key_bits)?;
+            for o in 0..self.key.out_features {
+                self.key
+                    .scale
+                    .apply_clipped_sgd(o, bwd.g_key_scale[o], learning_rate);
+            }
+            let flips = bit_flip_count(&before, &self.key.bits);
+            let _ = g_w;
+            let _ = key_weights;
+            let g_shifted = bwd.g_shifted;
+            let mut g_mix = vec![0.0; d];
+            lerp_shift_backward(
+                &tape.xx, &self.x_k, &g_shifted, batch, time, d, g_x, &mut g_mix,
+            );
+            for c in 0..d {
+                self.x_k.apply_clipped_sgd(c, g_mix[c], learning_rate);
+            }
+            return Ok(flips);
+        }
+        let (g_relu2, g_value) = self.value.backward_on(&tape.relu2, gy, rows, metal)?;
+        self.value.apply_clipped_sgd(&g_value, learning_rate)?;
+        let g_key = relu2_bwd_on(&tape.key, &g_relu2, metal)?;
         g_w[..key_weights].fill(0.0);
         let mut g_scale = vec![0.0; self.key.out_features];
         let mut g_shifted = vec![0.0; tape.shifted.len()];
-        self.key.backward_ste(
+        self.key.backward_ste_on(
             &tape.shifted,
             &g_key,
             rows,
@@ -689,6 +1008,7 @@ impl RwkvCMixX070 {
             Some(&mut g_shifted),
             &mut g_scale,
             None,
+            metal,
         )?;
         let flips =
             self.key
@@ -702,6 +1022,32 @@ impl RwkvCMixX070 {
         }
         Ok(flips)
     }
+}
+
+fn relu2_on(input: &[f32], metal: Option<&MetalTrainRuntime<'_>>) -> Result<Vec<f32>> {
+    #[cfg(target_os = "macos")]
+    if let Some(device) = metal {
+        return device.runtime.cmix_relu2(input);
+    }
+    let _ = metal;
+    Ok(input.iter().map(|v| v.max(0.0) * v.max(0.0)).collect())
+}
+
+fn relu2_bwd_on(
+    input: &[f32],
+    output_gradient: &[f32],
+    metal: Option<&MetalTrainRuntime<'_>>,
+) -> Result<Vec<f32>> {
+    #[cfg(target_os = "macos")]
+    if let Some(device) = metal {
+        return device.runtime.cmix_relu2_backward(input, output_gradient);
+    }
+    let _ = metal;
+    Ok(input
+        .iter()
+        .zip(output_gradient)
+        .map(|(v, g)| if *v > 0.0 { 2.0 * *v * *g } else { 0.0 })
+        .collect())
 }
 
 fn lerp_shift_backward(
@@ -851,8 +1197,42 @@ impl RwkvRosaQkv1Bit {
         metal: Option<&MetalTrainRuntime<'_>>,
     ) -> Result<RosaTape> {
         let d = self.e.len();
-        let xx = time_shift_delta(x, batch, time, d)?;
         let rows = batch.saturating_mul(time);
+        #[cfg(target_os = "macos")]
+        if let Some(device) = metal {
+            let q_bias = self.q.bias_bits().ok_or_else(|| anyhow::anyhow!("ROSA Q bias missing"))?;
+            let k_bias = self.k.bias_bits().ok_or_else(|| anyhow::anyhow!("ROSA K bias missing"))?;
+            let v_bias = self.v.bias_bits().ok_or_else(|| anyhow::anyhow!("ROSA V bias missing"))?;
+            let o_bias = self.o.bias_bits().ok_or_else(|| anyhow::anyhow!("ROSA O bias missing"))?;
+            let fwd = device.runtime.rosa_block_forward(
+                x,
+                self.x_q.as_bits(),
+                self.x_k.as_bits(),
+                self.x_v.as_bits(),
+                self.q.bits(),
+                self.q.scale_bits(),
+                q_bias,
+                self.k.bits(),
+                self.k.scale_bits(),
+                k_bias,
+                self.v.bits(),
+                self.v.scale_bits(),
+                v_bias,
+                self.e.as_bits(),
+                self.o.bits(),
+                self.o.scale_bits(),
+                o_bias,
+                batch,
+                time,
+                d,
+            )?;
+            return Ok(RosaTape {
+                y: fwd.y,
+                idx: fwd.idx,
+                out: fwd.out,
+            });
+        }
+        let xx = time_shift_on(x, batch, time, d, metal)?;
         let mut q_in = vec![0.0; x.len()];
         let mut k_in = vec![0.0; x.len()];
         let mut v_in = vec![0.0; x.len()];
@@ -864,11 +1244,11 @@ impl RwkvRosaQkv1Bit {
                 v_in[index] = x[index] + xx[index] * self.x_v.get(c);
             }
         }
-        let q = self.q.forward(&q_in, rows)?;
-        let k = self.k.forward(&k_in, rows)?;
-        let v = self.v.forward(&v_in, rows)?;
+        let q = self.q.forward_on(&q_in, rows, metal)?;
+        let k = self.k.forward_on(&k_in, rows, metal)?;
+        let v = self.v.forward_on(&v_in, rows, metal)?;
         let (idx, y) = rosa_qkv_y(&q, &k, &v, &self.e, batch, time, d, metal)?;
-        let out = self.o.forward(&y, rows)?;
+        let out = self.o.forward_on(&y, rows, metal)?;
         Ok(RosaTape { y, idx, out })
     }
 
@@ -883,11 +1263,45 @@ impl RwkvRosaQkv1Bit {
     ) -> Result<usize> {
         let d = self.e.len();
         let weights = self.o.out_features.saturating_mul(self.o.in_features);
+        #[cfg(target_os = "macos")]
+        if let Some(device) = metal {
+            let o_bias = self
+                .o
+                .bias_bits()
+                .ok_or_else(|| anyhow::anyhow!("ROSA O bias missing"))?;
+            let before = self.o.bits.clone();
+            let bwd = device.runtime.rosa_o_stop_grad_sgd(
+                &tape.y,
+                &tape.out,
+                gy,
+                &tape.idx,
+                self.o.bits(),
+                self.o.scale_bits(),
+                o_bias,
+                self.o.latent_bits(),
+                rows,
+                d,
+                learning_rate,
+            )?;
+            self.o.replace_packed(bwd.next_latent, bwd.next_bits)?;
+            for c in 0..d {
+                self.o
+                    .scale
+                    .apply_clipped_sgd(c, bwd.scale_gradient[c], learning_rate);
+                if let Some(bias) = self.o.bias.as_mut() {
+                    bias.apply_clipped_sgd(c, bwd.bias_gradient[c], learning_rate);
+                }
+                self.e.apply_clipped_sgd(c, bwd.e_gradient[c], learning_rate);
+            }
+            let _ = g_w;
+            let _ = weights;
+            return Ok(bit_flip_count(&before, &self.o.bits));
+        }
         g_w[..weights].fill(0.0);
         let mut g_scale = vec![0.0; self.o.out_features];
         let mut g_bias = vec![0.0; self.o.out_features];
         let mut g_y = vec![0.0; tape.y.len()];
-        self.o.backward_ste(
+        self.o.backward_ste_on(
             &tape.y,
             gy,
             rows,
@@ -895,10 +1309,15 @@ impl RwkvRosaQkv1Bit {
             Some(&mut g_y),
             &mut g_scale,
             Some(&mut g_bias),
+            metal,
         )?;
-        let flips =
-            self.o
-                .flip_count_after(&g_w[..weights], &g_scale, Some(&g_bias), learning_rate)?;
+        let flips = self.o.flip_after_gradients(
+            &g_w[..weights],
+            &g_scale,
+            Some(&g_bias),
+            learning_rate,
+            metal,
+        )?;
         let g_e = rosa_e_grad(&g_y, &tape.idx, d, metal)?;
         for c in 0..d {
             self.e.apply_clipped_sgd(c, g_e[c], learning_rate);
@@ -1818,6 +2237,7 @@ pub struct UllisHeron {
     ln_out: LayerNorm,
     pub(crate) head: PackedBinaryLinear,
     g_w: Vec<f32>,
+    last_profile: Option<TrainStepProfile>,
 }
 
 impl UllisHeron {
@@ -1862,6 +2282,7 @@ impl UllisHeron {
             ln_out: LayerNorm::new(d),
             head,
             g_w: vec![0.0; max_matrix],
+            last_profile: None,
         })
     }
 
@@ -1906,7 +2327,12 @@ impl UllisHeron {
             ln_out: LayerNorm::new(d),
             head,
             g_w: vec![0.0; max_matrix],
+            last_profile: None,
         })
+    }
+
+    pub fn last_step_profile(&self) -> Option<&TrainStepProfile> {
+        self.last_profile.as_ref()
     }
 
     pub fn gradient_workspace(&self) -> &[f32] {
@@ -2147,29 +2573,37 @@ impl UllisHeron {
             bail!("token shape or context length is invalid");
         }
 
+        let metal_ref = metal.as_ref();
+        let mut profile = TrainStepProfile::default();
         let mut x = vec![0.0; rows.saturating_mul(d)];
+        let started = Instant::now();
         for (row, &id) in tokens.iter().enumerate() {
             let offset = id as usize * d;
             for c in 0..d {
                 x[row * d + c] = self.embedding.get(offset + c);
             }
         }
+        profile.add("embed", started);
 
         let mut tapes = Vec::with_capacity(self.blocks.len());
         for block in &self.blocks {
             let ln0_in = x.clone();
+            let started = Instant::now();
             if let Some(ln0) = &block.ln0 {
-                x = ln0.forward(&x, rows)?;
+                x = ln0.forward_on(&x, rows, metal_ref)?;
             }
-            let rosa_in = block.ln3.forward(&x, rows)?;
-            let rosa = block
-                .rosa
-                .forward_tape(&rosa_in, batch, time, metal.as_ref())?;
+            let rosa_in = block.ln3.forward_on(&x, rows, metal_ref)?;
+            profile.add("fwd_ln", started);
+            let started = Instant::now();
+            let rosa = block.rosa.forward_tape(&rosa_in, batch, time, metal_ref)?;
             add_inplace(&mut x, &rosa.out);
+            profile.add("fwd_rosa", started);
             let after_rosa = x.clone();
-            let ln2_out = block.ln2.forward(&x, rows)?;
-            let cmix = block.ffn.forward_tape(&ln2_out, batch, time)?;
+            let started = Instant::now();
+            let ln2_out = block.ln2.forward_on(&x, rows, metal_ref)?;
+            let cmix = block.ffn.forward_tape(&ln2_out, batch, time, metal_ref)?;
             add_inplace(&mut x, &cmix.out);
+            profile.add("fwd_cmix", started);
             tapes.push(BlockTape {
                 ln0_in,
                 rosa,
@@ -2178,19 +2612,28 @@ impl UllisHeron {
             });
         }
         let pre_ln_out = x.clone();
-        let hidden = self.ln_out.forward(&x, rows)?;
+        let started = Instant::now();
+        let hidden = self.ln_out.forward_on(&x, rows, metal_ref)?;
+        profile.add("fwd_ln", started);
 
+        let started = Instant::now();
         let (loss, mut g_x, n_valid, flips_head) =
-            self.apply_head_ce(&hidden, tokens, time, learning_rate, rows)?;
-        let (g_ln_in, g_w_ln, g_b_ln) = self.ln_out.backward(&pre_ln_out, &g_x, rows)?;
+            self.apply_head_ce(&hidden, tokens, time, learning_rate, rows, metal_ref)?;
+        profile.add("head", started);
+        let started = Instant::now();
+        let (g_ln_in, g_w_ln, g_b_ln) =
+            self.ln_out
+                .backward_on(&pre_ln_out, &g_x, rows, metal_ref)?;
         self.ln_out
             .apply_clipped_sgd(&g_w_ln, &g_b_ln, learning_rate)?;
         g_x = g_ln_in;
+        profile.add("bwd_ln", started);
 
         let mut flips = flips_head;
         for (block, tape) in self.blocks.iter_mut().zip(tapes).rev() {
             let mut g_after_rosa = g_x.clone();
             let mut g_ln2_out = vec![0.0; rows.saturating_mul(d)];
+            let started = Instant::now();
             flips += block.ffn.backward_update(
                 &tape.cmix,
                 &g_x,
@@ -2199,29 +2642,41 @@ impl UllisHeron {
                 learning_rate,
                 batch,
                 time,
+                metal_ref,
             )?;
-            let (g_ln2_in, g_w2, g_b2) = block.ln2.backward(&tape.after_rosa, &g_ln2_out, rows)?;
+            profile.add("bwd_cmix", started);
+            let started = Instant::now();
+            let (g_ln2_in, g_w2, g_b2) =
+                block
+                    .ln2
+                    .backward_on(&tape.after_rosa, &g_ln2_out, rows, metal_ref)?;
             block.ln2.apply_clipped_sgd(&g_w2, &g_b2, learning_rate)?;
             add_inplace(&mut g_after_rosa, &g_ln2_in);
+            profile.add("bwd_ln", started);
 
             let g_residual = g_after_rosa.clone();
+            let started = Instant::now();
             flips += block.rosa.backward_stop_grad(
                 &tape.rosa,
                 &g_after_rosa,
                 &mut self.g_w,
                 learning_rate,
                 rows,
-                metal.as_ref(),
+                metal_ref,
             )?;
+            profile.add("bwd_rosa", started);
+            let started = Instant::now();
             if let Some(ln0) = &mut block.ln0 {
-                let (g_in, gw, gb) = ln0.backward(&tape.ln0_in, &g_residual, rows)?;
+                let (g_in, gw, gb) = ln0.backward_on(&tape.ln0_in, &g_residual, rows, metal_ref)?;
                 ln0.apply_clipped_sgd(&gw, &gb, learning_rate)?;
                 g_x = g_in;
             } else {
                 g_x = g_residual;
             }
+            profile.add("bwd_ln", started);
         }
 
+        let started = Instant::now();
         for (row, &id) in tokens.iter().enumerate() {
             let offset = id as usize * d;
             for c in 0..d {
@@ -2229,6 +2684,8 @@ impl UllisHeron {
                     .apply_clipped_sgd(offset + c, g_x[row * d + c], learning_rate);
             }
         }
+        profile.add("embed_sgd", started);
+        self.last_profile = Some(profile);
 
         Ok(CausalLoss {
             next_token: loss,
@@ -2244,6 +2701,7 @@ impl UllisHeron {
         time: usize,
         learning_rate: f32,
         rows: usize,
+        metal: Option<&MetalTrainRuntime<'_>>,
     ) -> Result<(f32, Vec<f32>, usize, usize)> {
         let d = self.cfg.d_model;
         let vocab = self.head.out_features;
@@ -2253,12 +2711,40 @@ impl UllisHeron {
                 n_valid += 1;
             }
         }
+        let weights = vocab.saturating_mul(d);
+        #[cfg(target_os = "macos")]
+        if let Some(device) = metal {
+            let before = self.head.bits.clone();
+            let head = device.runtime.packed_head_train_sgd(
+                hidden,
+                self.head.bits(),
+                self.head.scale_bits(),
+                self.head.latent_bits(),
+                tokens,
+                rows,
+                time,
+                d,
+                vocab,
+                1,
+                learning_rate,
+            )?;
+            self.head
+                .replace_packed(head.next_latent, head.next_bits)?;
+            for o in 0..vocab {
+                self.head
+                    .scale
+                    .apply_clipped_sgd(o, head.scale_gradient[o], learning_rate);
+            }
+            let flips = bit_flip_count(&before, &self.head.bits);
+            let _ = weights;
+            return Ok((head.mean_loss, head.hidden_gradient, n_valid, flips));
+        }
+        let _ = metal;
         let loss_scale = if n_valid == 0 {
             0.0
         } else {
             1.0 / n_valid as f32
         };
-        let weights = vocab.saturating_mul(d);
         self.g_w[..weights].fill(0.0);
         let mut g_scale = vec![0.0; vocab];
         let mut gx = vec![0.0; hidden.len()];
@@ -2546,6 +3032,7 @@ fn hybrid_from_checkpoint(checkpoint: ModelCheckpoint) -> Result<UllisHeron> {
         ln_out,
         head,
         g_w: vec![0.0; max_matrix],
+        last_profile: None,
     })
 }
 
@@ -2634,6 +3121,7 @@ fn heron_from_checkpoint(checkpoint: ModelCheckpoint) -> Result<UllisHeron> {
         head,
         g_w: vec![0.0; max_matrix],
         hybrid_blocks: Vec::new(),
+        last_profile: None,
     })
 }
 
