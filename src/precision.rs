@@ -14,6 +14,10 @@ impl Fp16 {
         Self(bits)
     }
 
+    pub const fn to_bits(self) -> u16 {
+        self.0
+    }
+
     pub fn from_f32(value: f32) -> Self {
         let bits = value.to_bits();
         let sign = ((bits >> 16) & 0x8000) as u16;

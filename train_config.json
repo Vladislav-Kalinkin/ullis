@@ -1,29 +1,22 @@
 {
+  "architecture": "heron",
   "d_model": 256,
   "n_layers": 6,
   "vocab_size": 8192,
   "context_len": 2048,
   "batch_size": 1,
-  "filter_order": 8,
-  "hyena_kernel_len": 2048,
-  "hyena_chunk_len": 2048,
-  "ternary_delta": 0.7,
+  "dim_ffn": 1024,
+  "rosa_bits": 1,
+  "rosa_grad": "stop_grad_bits",
+  "head_size": 16,
+  "tmix_lora_rank": 16,
   "seed": 7,
   "optimizer": "stateless_sgd",
-  "memory_budget_bytes": 1073741824,
   "lion": {
-    "learning_rate": 0.0003,
+    "learning_rate": 0.0001,
     "beta1": 0.9,
     "beta2": 0.99,
     "weight_decay": 0.0
   },
-  "low_memory": {
-    "latent_weight_bytes": 2,
-    "parameter_bytes": 2,
-    "scale_bytes": 2,
-    "activation_bytes": 2,
-    "gradient_bytes": 2,
-    "fft_component_bytes": 4,
-    "activation_checkpoints": 2
-  }
+  "memory_budget_bytes": 4294967296
 }

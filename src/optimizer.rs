@@ -1,29 +1,34 @@
-//! Memory-conscious Lion optimiser for FP32 master weights.
+//! Memory-conscious optimisers for Heron training.
 //!
-//! Lion keeps one momentum vector per parameter. Unlike AdamW it does not
-//! allocate a second variance vector, which is material on unified memory.
+//! Default training is stateless clipped SGD. Lion keeps one momentum vector
+//! per FP16 tensor when explicitly selected; it does not allocate a second
+//! variance vector.
 
 use anyhow::{Result, bail};
 use serde::{Deserialize, Serialize};
 
 /// Optimizer choices supported by Ullis's memory contract.
-///
-/// Only the FP32 Lion reference is executable today. The remaining choices
-/// define the state layout that the Metal trainer must implement, so a config
-/// cannot silently budget one optimizer and instantiate another.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum OptimizerKind {
-    /// One FP16 momentum value per ternary latent weight.
-    #[default]
-    LionFp16,
-    /// One signed byte per latent weight plus an FP16 scale per 256 values.
-    LionInt8Blockwise,
     /// Fused clipped SGD update; no persistent optimizer allocation.
+    #[default]
     StatelessSgd,
+    /// One FP16 momentum value per FP16 tensor (emb, LN, bias, CMix value, Tmix).
+    LionFp16,
 }
 
 impl OptimizerKind {
+    /// Heron 0.10 train is clipped SGD on FP16 tensors and BinaryConnect latents.
+    pub fn require_train_step(self) -> Result<()> {
+        match self {
+            Self::StatelessSgd => Ok(()),
+            Self::LionFp16 => {
+                bail!("Heron train uses stateless clipped SGD; lion_fp16 is not wired")
+            }
+        }
+    }
+
     pub(crate) fn state_bytes(
         self,
         parameter_count: usize,
@@ -33,14 +38,6 @@ impl OptimizerKind {
             Self::LionFp16 => parameter_count
                 .checked_mul(latent_weight_bytes)
                 .ok_or_else(|| anyhow::anyhow!("Lion FP16 state size overflow")),
-            Self::LionInt8Blockwise => parameter_count
-                .checked_add(
-                    parameter_count
-                        .div_ceil(256)
-                        .checked_mul(latent_weight_bytes)
-                        .ok_or_else(|| anyhow::anyhow!("Lion int8 scale size overflow"))?,
-                )
-                .ok_or_else(|| anyhow::anyhow!("Lion int8 state size overflow")),
             Self::StatelessSgd => Ok(0),
         }
     }
@@ -152,14 +149,14 @@ mod tests {
     }
 
     #[test]
+    fn train_step_rejects_lion_until_wired() {
+        assert!(OptimizerKind::StatelessSgd.require_train_step().is_ok());
+        assert!(OptimizerKind::LionFp16.require_train_step().is_err());
+    }
+
+    #[test]
     fn planned_optimizer_state_is_explicit_about_its_memory_tradeoff() {
         assert_eq!(OptimizerKind::LionFp16.state_bytes(256, 2).unwrap(), 512);
-        assert_eq!(
-            OptimizerKind::LionInt8Blockwise
-                .state_bytes(257, 2)
-                .unwrap(),
-            257 + 2 * 2
-        );
         assert_eq!(
             OptimizerKind::StatelessSgd.state_bytes(1_000, 2).unwrap(),
             0

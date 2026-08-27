@@ -1,219 +1,200 @@
-//! Configuration for the single supported architecture: dense ternary Hyena.
+//! Configuration for the Heron / ROSA-RWKV7 architectures.
 use crate::optimizer::{LionConfig, OptimizerKind};
 use crate::tokenizer::{BpeTokenizer, MIN_VOCAB};
 use anyhow::{Result, bail};
 use serde::{Deserialize, Serialize};
+
 pub const MAX_CONTEXT_LEN: usize = 32_768;
-/// Default process budget.  Leaving headroom is essential on unified memory:
+/// Default process budget. Leaving headroom is essential on unified memory:
 /// macOS needs room for the window server, Metal driver, and file cache.
-pub const DEFAULT_MEMORY_BUDGET_BYTES: usize = 1_073_741_824;
+pub const DEFAULT_MEMORY_BUDGET_BYTES: usize = 4 * 1024 * 1024 * 1024;
+pub const DEFAULT_HEAD_SIZE: usize = 16;
+const COMMAND_SLACK_BYTES: usize = 32 * 1024 * 1024;
+/// Conservative activation-checkpoint reuse (four named layer snapshots).
+const CHECKPOINT_LAYERS: usize = 4;
+const FP16_BYTES: usize = 2;
 
-/// Describes the resident representation targeted by the Metal trainer.
-///
-/// The current CPU numerical oracle remains FP32. This profile is deliberately
-/// separate from that oracle: configuration must be able to budget the final
-/// trainer without pretending that its FP16 buffers already exist today.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct LowMemoryTrainingProfile {
-    /// FP16 latent weights are required to move ternary thresholds without a
-    /// permanent FP32 master copy.
-    pub latent_weight_bytes: usize,
-    /// Tied embeddings and compact implicit-filter parameters.
-    pub parameter_bytes: usize,
-    /// Row dequantisation scales for packed ternary projections.
-    pub scale_bytes: usize,
-    /// Resident activations and their checkpoint boundaries.
-    pub activation_bytes: usize,
-    /// Per-layer gradient workspace. It is reused after a fused update rather
-    /// than allocated for every parameter in the model.
-    pub gradient_bytes: usize,
-    /// Complex FFT precision. Keeping this at four bytes per component is the
-    /// conservative starting point for long contexts on M1.
-    pub fft_component_bytes: usize,
-    /// Number of `[B,T,D]` activation checkpoints retained by backward.
-    pub activation_checkpoints: usize,
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Architecture {
+    #[default]
+    Heron,
+    RosaRwkv7,
 }
 
-impl Default for LowMemoryTrainingProfile {
-    fn default() -> Self {
-        Self {
-            latent_weight_bytes: 2,
-            parameter_bytes: 2,
-            scale_bytes: 2,
-            activation_bytes: 2,
-            gradient_bytes: 2,
-            fft_component_bytes: 4,
-            activation_checkpoints: 2,
-        }
-    }
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RosaGradMode {
+    #[default]
+    StopGradBits,
+    ExactBitflip,
+    SteSign,
 }
 
-impl LowMemoryTrainingProfile {
-    fn validate(self) -> Result<()> {
-        if self.latent_weight_bytes != 2
-            || self.parameter_bytes != 2
-            || self.scale_bytes != 2
-            || self.activation_bytes != 2
-            || self.gradient_bytes != 2
-            || self.fft_component_bytes != 4
-            || self.activation_checkpoints == 0
-        {
-            bail!(
-                "the only supported low-memory profile is FP16 storage with FP32 FFT components and at least one activation checkpoint"
-            );
-        }
-        Ok(())
-    }
-}
-
-/// Conservative, overflow-checked upper bounds used before allocation.
+/// Overflow-checked upper bounds used before allocation.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct MemoryEstimate {
-    /// FP32 trainable state before optimiser copies.
-    pub parameters: usize,
-    /// Two packed bitplanes for each ternary projection.
-    pub ternary_codes: usize,
-    /// Per-output dequantisation scales for ternary projections.
-    pub ternary_scales: usize,
-    pub forward_working_set: usize,
-    /// Reused real filter and two complex FFT work buffers for one channel.
-    pub hyena_workspace: usize,
-    /// Cached shared Metal buffers for one dense Hyena convolution. This
-    /// includes two signal FFT buffers, two filter FFT buffers, and both the
-    /// shared and returned causal output, but not a host staging spectrum.
-    pub metal_hyena_workspace: usize,
-    pub materialized_mtp_logits: usize,
-    /// Detailed budget for the planned FP16 Metal trainer. This is not used to
-    /// admit the current FP32 reference implementation.
-    pub low_memory_training: LowMemoryTrainingEstimate,
-}
-
-/// Peak components of the planned low-memory training path.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct LowMemoryTrainingEstimate {
-    pub latent_ternary_weights: usize,
-    pub dense_parameters: usize,
-    pub ternary_codes: usize,
-    pub ternary_scales: usize,
-    pub optimizer_state: usize,
-    pub reusable_gradient_workspace: usize,
-    pub checkpoint_activations: usize,
-    pub fft_workspace: usize,
-}
-
-impl LowMemoryTrainingEstimate {
-    pub fn peak(self) -> Option<usize> {
-        self.latent_ternary_weights
-            .checked_add(self.dense_parameters)
-            .and_then(|total| total.checked_add(self.ternary_codes))
-            .and_then(|total| total.checked_add(self.ternary_scales))
-            .and_then(|total| total.checked_add(self.optimizer_state))
-            .and_then(|total| total.checked_add(self.reusable_gradient_workspace))
-            .and_then(|total| total.checked_add(self.checkpoint_activations))
-            .and_then(|total| total.checked_add(self.fft_workspace))
-    }
+    pub embedding: usize,
+    pub packed_bits_and_scales: usize,
+    pub fp16_matrices: usize,
+    pub ln_and_vec: usize,
+    pub act_checkpoints: usize,
+    pub qkv_bitplanes: usize,
+    pub rosa_sam_peak: usize,
+    pub packed_latents: usize,
+    pub binaryconnect_workspace: usize,
+    pub ce_scratch: usize,
+    pub wkv_tape: usize,
+    pub bwd_rosa_scratch: usize,
+    pub command_slack: usize,
 }
 
 impl MemoryEstimate {
-    pub fn inference_peak(self) -> Option<usize> {
-        self.parameters
-            .checked_add(self.ternary_codes)
-            .and_then(|total| total.checked_add(self.ternary_scales))
-            .and_then(|total| total.checked_add(self.forward_working_set))
-            .and_then(|total| {
-                total.checked_add(self.hyena_workspace.max(self.metal_hyena_workspace))
-            })
-    }
-
-    pub fn training_peak(self) -> Option<usize> {
-        // FP32 master weights, gradient, and Lion's one momentum vector.
-        // Packed codes are resident independently and remain needed for the
-        // forward pass.
-        self.parameters
-            .checked_mul(12)
-            .and_then(|weights| weights.checked_add(self.ternary_codes))
-            .and_then(|total| total.checked_add(self.ternary_scales))
-            .and_then(|total| total.checked_add(self.forward_working_set))
-            .and_then(|total| {
-                total.checked_add(self.hyena_workspace.max(self.metal_hyena_workspace))
-            })
+    pub fn peak(self) -> Option<usize> {
+        let add = |a: Option<usize>, b: usize| a.and_then(|total| total.checked_add(b));
+        [
+            self.embedding,
+            self.packed_bits_and_scales,
+            self.fp16_matrices,
+            self.ln_and_vec,
+            self.act_checkpoints,
+            self.qkv_bitplanes,
+            self.rosa_sam_peak,
+            self.packed_latents,
+            self.binaryconnect_workspace,
+            self.ce_scratch,
+            self.wkv_tape,
+            self.bwd_rosa_scratch,
+            self.command_slack,
+        ]
+        .into_iter()
+        .fold(Some(0), add)
     }
 }
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct TrainConfig {
+    #[serde(default)]
+    pub architecture: Architecture,
     pub d_model: usize,
     pub n_layers: usize,
     pub vocab_size: usize,
     pub context_len: usize,
     pub batch_size: usize,
-    pub filter_order: usize,
-    /// Maximum causal receptive field of each Hyena filter.  Longer contexts
-    /// are processed as a stream, so this—not `context_len`—sets FFT scratch.
-    #[serde(default = "default_hyena_kernel_len")]
-    pub hyena_kernel_len: usize,
-    /// Tokens processed per overlap-save FFT block. Must be at least the
-    /// bounded receptive field.
-    #[serde(default = "default_hyena_chunk_len")]
-    pub hyena_chunk_len: usize,
-    pub ternary_delta: f32,
-    pub seed: u64,
+    /// Hidden width of CMix. Zero in JSON means `4 * d_model`.
     #[serde(default)]
-    pub lion: LionConfig,
-    /// Selects the optimizer-state budget for the forthcoming GPU trainer.
-    /// Lion's numerical hyperparameters remain in `lion` for compatibility.
+    pub dim_ffn: usize,
+    #[serde(default = "default_rosa_bits")]
+    pub rosa_bits: u8,
+    #[serde(default)]
+    pub rosa_grad: RosaGradMode,
+    #[serde(default = "default_head_size")]
+    pub head_size: usize,
+    #[serde(default)]
+    pub tmix_lora_rank: usize,
+    pub seed: u64,
     #[serde(default)]
     pub optimizer: OptimizerKind,
     #[serde(default)]
-    pub low_memory: LowMemoryTrainingProfile,
-    /// Hard allocation budget.  Runtime paths reject oversized requests before
-    /// building vectors; callers may set a lower value for constrained Macs.
+    pub lion: LionConfig,
     #[serde(default = "default_memory_budget_bytes")]
     pub memory_budget_bytes: usize,
 }
+
+const fn default_memory_budget_bytes() -> usize {
+    DEFAULT_MEMORY_BUDGET_BYTES
+}
+
+const fn default_rosa_bits() -> u8 {
+    1
+}
+
+const fn default_head_size() -> usize {
+    DEFAULT_HEAD_SIZE
+}
+
 impl Default for TrainConfig {
     fn default() -> Self {
         Self {
+            architecture: Architecture::Heron,
             d_model: 256,
             n_layers: 6,
             vocab_size: 8192,
-            // 32k remains supported with an explicitly larger unified-memory
-            // budget; 8k is the safe out-of-the-box setting under 1 GiB once
-            // resident Metal FFT and gate buffers are reserved.
-            context_len: 8_192,
+            context_len: 2_048,
             batch_size: 1,
-            filter_order: 8,
-            hyena_kernel_len: default_hyena_kernel_len(),
-            hyena_chunk_len: default_hyena_chunk_len(),
-            ternary_delta: 0.7,
+            dim_ffn: 1_024,
+            rosa_bits: 1,
+            rosa_grad: RosaGradMode::StopGradBits,
+            head_size: DEFAULT_HEAD_SIZE,
+            tmix_lora_rank: 16,
             seed: 7,
+            optimizer: OptimizerKind::StatelessSgd,
             lion: LionConfig::default(),
-            optimizer: OptimizerKind::LionFp16,
-            low_memory: LowMemoryTrainingProfile::default(),
             memory_budget_bytes: DEFAULT_MEMORY_BUDGET_BYTES,
         }
     }
 }
+
 impl TrainConfig {
+    pub fn resolved_dim_ffn(&self) -> usize {
+        if self.dim_ffn == 0 {
+            self.d_model.saturating_mul(4)
+        } else {
+            self.dim_ffn
+        }
+    }
+
+    pub fn resolved_tmix_lora_rank(&self) -> usize {
+        if self.tmix_lora_rank == 0 {
+            if self.d_model <= 64 { 8 } else { 16 }
+        } else {
+            self.tmix_lora_rank
+        }
+    }
+
     pub fn validate(&self) -> Result<()> {
-        if self.d_model == 0 || self.n_layers == 0 || self.vocab_size < MIN_VOCAB as usize {
-            bail!("d_model, n_layers, and vocab_size must be non-zero (vocab >= {MIN_VOCAB})");
+        if self.d_model == 0 || self.n_layers == 0 {
+            bail!("d_model and n_layers must be non-zero");
+        }
+        let min_vocab = if matches!(self.architecture, Architecture::RosaRwkv7) {
+            12
+        } else {
+            MIN_VOCAB as usize
+        };
+        if self.vocab_size < min_vocab {
+            bail!("vocab_size must be at least {min_vocab}");
         }
         if self.context_len == 0 || self.context_len > MAX_CONTEXT_LEN {
             bail!("context_len must be in 1..={MAX_CONTEXT_LEN}");
         }
-        if self.filter_order == 0 {
-            bail!("filter_order must be positive");
+        if self.batch_size == 0 {
+            bail!("batch_size must be positive");
         }
-        if self.hyena_kernel_len == 0 || self.hyena_chunk_len == 0 {
-            bail!("hyena_kernel_len and hyena_chunk_len must be positive");
+        if self.rosa_bits != 1 {
+            bail!("rosa_bits must be 1 in Ullis 0.10 (4-bit ROSA is post-0.10)");
         }
-        if !self.ternary_delta.is_finite() || self.ternary_delta <= 0.0 {
-            bail!("ternary_delta must be finite and positive");
+        if self.head_size != DEFAULT_HEAD_SIZE {
+            bail!("head_size must be {DEFAULT_HEAD_SIZE}");
+        }
+        let dim_ffn = self.resolved_dim_ffn();
+        if dim_ffn == 0 {
+            bail!("dim_ffn must be positive");
+        }
+        let rank = self.resolved_tmix_lora_rank();
+        if rank != 8 && rank != 16 {
+            bail!("tmix_lora_rank must be 8 or 16");
+        }
+        if matches!(self.architecture, Architecture::RosaRwkv7) {
+            if !self.d_model.is_multiple_of(self.head_size) {
+                bail!("rosa_rwkv7 requires d_model to be a multiple of head_size");
+            }
+            if !self.context_len.is_multiple_of(16) {
+                bail!("rosa_rwkv7 requires context_len to be a multiple of 16");
+            }
         }
         self.lion.validate()?;
-        self.low_memory.validate()?;
         let estimate = self.memory_estimate()?;
-        if !matches!(estimate.training_peak(), Some(n) if n <= self.memory_budget_bytes) {
+        if !matches!(estimate.peak(), Some(n) if n <= self.memory_budget_bytes) {
             bail!(
                 "configuration needs more than the {} MiB memory budget; reduce d_model, layers, batch_size, or context_len",
                 self.memory_budget_bytes / (1024 * 1024)
@@ -231,119 +212,101 @@ impl TrainConfig {
             a.checked_add(b)
                 .ok_or_else(|| anyhow::anyhow!("model size overflow"))
         };
-        let d2 = mul(self.d_model, self.d_model)?;
-        let embedding = mul(self.vocab_size, self.d_model)?;
-        // Every layer has a D→2D and D→D ternary projection, plus three
-        // FP32 vectors for the implicit filter's compact generator.
-        let layer_projection = mul(3, d2)?;
-        let layer_filter = mul(3, mul(self.d_model, self.filter_order)?)?;
-        let per_layer = add(layer_projection, layer_filter)?;
-        let block_parameters = mul(self.n_layers, per_layer)?;
-        let mtp_parameters = mul(2, d2)?;
-        let parameter_floats = add(add(embedding, block_parameters)?, mtp_parameters)?;
-        let parameters = mul(parameter_floats, size_of::<f32>())?;
-        // Codes are stored in separate positive/negative 64-bit bitplanes.
-        // Each projection is rounded independently, matching the model layout.
-        let packed = |weights: usize| {
+        let packed_bytes = |weights: usize| {
             weights
-                .checked_add(63)
-                .and_then(|n| n.checked_div(64))
-                .and_then(|words| words.checked_mul(2 * size_of::<u64>()))
-                .ok_or_else(|| anyhow::anyhow!("ternary code size overflow"))
+                .checked_add(31)
+                .and_then(|n| n.checked_div(32))
+                .and_then(|words| words.checked_mul(size_of::<u32>()))
+                .ok_or_else(|| anyhow::anyhow!("packed bitplane size overflow"))
         };
-        let input_codes = packed(mul(2, d2)?)?;
-        let output_codes = packed(d2)?;
-        let layer_codes = add(input_codes, output_codes)?;
-        let mtp_codes = add(packed(d2)?, packed(d2)?)?;
-        let ternary_codes = add(mul(self.n_layers, layer_codes)?, mtp_codes)?;
-        let layer_scales = mul(3, self.d_model)?;
-        let ternary_scales = mul(
-            add(mul(self.n_layers, layer_scales)?, mul(2, self.d_model)?)?,
-            size_of::<f32>(),
-        )?;
+
+        let d = self.d_model;
+        let v = self.vocab_size;
+        let layers = self.n_layers;
+        let dim_ffn = self.resolved_dim_ffn();
         let rows = mul(self.batch_size, self.context_len)?;
-        let activations = mul(rows, self.d_model)?;
-        // Seven [B,T,D] FP32 buffers safely cover the residual input, 2D
-        // projection (which also holds the gate), convolution output, update,
-        // replacement residual, MTP head overlap, and allocator headroom.
-        let forward_working_set = mul(activations, 7 * size_of::<f32>())?;
-        let bounded_chunk_len = self.hyena_chunk_len.min(self.context_len);
-        let bounded_kernel_len = self.hyena_kernel_len.min(self.context_len);
-        let convolution_len = bounded_chunk_len
-            .checked_add(bounded_kernel_len)
-            .and_then(|n| n.checked_sub(1))
-            .ok_or_else(|| anyhow::anyhow!("FFT workspace size overflow"))?;
-        let fft_len = convolution_len
-            .checked_next_power_of_two()
-            .ok_or_else(|| anyhow::anyhow!("FFT workspace size overflow"))?;
-        let complex_work = mul(2, mul(fft_len, 2 * size_of::<f32>())?)?;
-        let hyena_workspace = add(complex_work, mul(bounded_kernel_len, size_of::<f32>())?)?;
-        let signal_transforms = mul(self.batch_size, self.d_model)?;
-        let chunk_count = self.context_len.div_ceil(bounded_chunk_len);
-        let chunked_signal_transforms = mul(signal_transforms, chunk_count)?;
-        let signal_fft = mul(
-            chunked_signal_transforms,
-            mul(fft_len, 2 * size_of::<f32>())?,
-        )?;
-        let filter_fft = mul(self.d_model, mul(fft_len, 2 * size_of::<f32>())?)?;
-        let metal_fft_workspace = add(
-            add(mul(2, signal_fft)?, mul(2, filter_fft)?)?,
-            // The final shared output and its CPU return value coexist until
-            // the caller takes ownership of the Vec.
-            mul(2, mul(activations, size_of::<f32>())?)?,
-        )?;
-        // A resident block also keeps its input, `[B,T,2D]` projection, and
-        // two `[B,T,2D]` gate buffers alive while the mixer runs. Reserving
-        // these now prevents a later readback-free forward path from making a
-        // previously accepted 32k configuration enter swap.
-        let metal_projection_gate = mul(7, mul(activations, size_of::<f32>())?)?;
-        let metal_hyena_workspace = add(metal_fft_workspace, metal_projection_gate)?;
-        let materialized_mtp_logits = mul(mul(rows, self.vocab_size)?, 2 * size_of::<f32>())?;
-        let ternary_weights = add(mul(self.n_layers, layer_projection)?, mtp_parameters)?;
-        let dense_parameters = add(embedding, mul(self.n_layers, layer_filter)?)?;
-        let largest_trainable_tensor = embedding.max(mul(2, d2)?);
-        let profile = self.low_memory;
-        let low_memory_fft_workspace = add(
-            add(
-                mul(
-                    2,
-                    mul(
-                        signal_transforms,
-                        mul(fft_len, 2 * profile.fft_component_bytes)?,
-                    )?,
-                )?,
-                mul(
-                    2,
-                    mul(self.d_model, mul(fft_len, 2 * profile.fft_component_bytes)?)?,
-                )?,
-            )?,
-            mul(2, mul(activations, profile.activation_bytes)?)?,
-        )?;
-        let optimizer_state = self
-            .optimizer
-            .state_bytes(ternary_weights, profile.latent_weight_bytes)?;
-        let low_memory_training = LowMemoryTrainingEstimate {
-            latent_ternary_weights: mul(ternary_weights, profile.latent_weight_bytes)?,
-            dense_parameters: mul(dense_parameters, profile.parameter_bytes)?,
-            ternary_codes,
-            ternary_scales: ternary_scales / size_of::<f32>() * profile.scale_bytes,
-            optimizer_state,
-            reusable_gradient_workspace: mul(largest_trainable_tensor, profile.gradient_bytes)?,
-            checkpoint_activations: mul(
-                profile.activation_checkpoints,
-                mul(activations, profile.activation_bytes)?,
-            )?,
-            fft_workspace: low_memory_fft_workspace,
+        let d2 = mul(d, d)?;
+        let ffn_mat = mul(dim_ffn, d)?;
+        let head_mat = mul(v, d)?;
+
+        let embedding = mul(head_mat, FP16_BYTES)?;
+
+        let layer_packed_weights = add(mul(4, d2)?, ffn_mat)?;
+        let packed_weights = add(mul(layers, layer_packed_weights)?, head_mat)?;
+        let packed_bits = packed_bytes(packed_weights)?;
+        // Q/K/V/O scales + CMix-key scales + head scales, plus QKVO bias.
+        let scale_rows = add(add(mul(layers, mul(4, d)?)?, mul(layers, dim_ffn)?)?, v)?;
+        let scales = mul(scale_rows, FP16_BYTES)?;
+        let rosa_bias = mul(mul(layers, mul(4, d)?)?, FP16_BYTES)?;
+        let packed_bits_and_scales = add(add(packed_bits, scales)?, rosa_bias)?;
+
+        let mut fp16_matrices = mul(mul(layers, ffn_mat)?, FP16_BYTES)?;
+        if matches!(self.architecture, Architecture::RosaRwkv7) {
+            let rank = self.resolved_tmix_lora_rank();
+            let heads = d / self.head_size;
+            let lora = mul(d, rank)?;
+            let tmix = add(
+                add(mul(6, d)?, mul(8, lora)?)?,
+                add(add(mul(5, d)?, mul(heads, self.head_size)?)?, mul(4, d2)?)?,
+            )?;
+            fp16_matrices = add(fp16_matrices, mul(mul(layers, tmix)?, FP16_BYTES)?)?;
+        }
+
+        // ln0 (layer 0) + ln2/ln3 per layer + ln_out, plus x_qkv/e/x_k.
+        let ln_vecs = add(mul(2, d)?, mul(layers, mul(4, d)?)?)?;
+        let rosa_vecs = mul(layers, mul(4, d)?)?;
+        let cmix_shift = mul(layers, d)?;
+        let ln_and_vec = mul(add(add(ln_vecs, rosa_vecs)?, cmix_shift)?, FP16_BYTES)?;
+
+        let per_layer_acts = mul(12, mul(rows, d)?)?;
+        let act_checkpoints = mul(CHECKPOINT_LAYERS, mul(per_layer_acts, FP16_BYTES)?)?;
+
+        let qkv_bitplanes = mul(3, rows)?
+            .checked_mul(d)
+            .and_then(|bits| bits.checked_div(8))
+            .ok_or_else(|| anyhow::anyhow!("QKV bitplane size overflow"))?;
+        let rosa_sam_peak = mul(40, mul(self.context_len, d)?)?;
+        let packed_latents = mul(packed_weights, FP16_BYTES)?;
+        let largest_matrix = d2.max(ffn_mat).max(head_mat);
+        let binaryconnect_workspace = mul(largest_matrix, size_of::<f32>())?;
+        let ce_scratch = mul(add(d, v)?, 8)?;
+
+        let wkv_tape = if matches!(self.architecture, Architecture::RosaRwkv7) {
+            let heads = d / self.head_size;
+            let chunks = self.context_len.div_ceil(16);
+            let state = mul(
+                mul(mul(self.batch_size, heads)?, chunks)?,
+                mul(self.head_size, self.head_size)?,
+            )?;
+            let sa = mul(
+                mul(mul(self.batch_size, self.context_len)?, heads)?,
+                self.head_size,
+            )?;
+            mul(add(state, sa)?, size_of::<f32>())?
+        } else {
+            0
         };
+        let bwd_rosa_scratch = 0;
+        let optimizer_state = self.optimizer.state_bytes(
+            add(embedding / FP16_BYTES, fp16_matrices / FP16_BYTES)?,
+            FP16_BYTES,
+        )?;
+        let command_slack = add(COMMAND_SLACK_BYTES, optimizer_state)?;
+
         Ok(MemoryEstimate {
-            parameters,
-            ternary_codes,
-            ternary_scales,
-            forward_working_set,
-            hyena_workspace,
-            metal_hyena_workspace,
-            materialized_mtp_logits,
-            low_memory_training,
+            embedding,
+            packed_bits_and_scales,
+            fp16_matrices,
+            ln_and_vec,
+            act_checkpoints,
+            qkv_bitplanes,
+            rosa_sam_peak,
+            packed_latents,
+            binaryconnect_workspace,
+            ce_scratch,
+            wkv_tape,
+            bwd_rosa_scratch,
+            command_slack,
         })
     }
 
@@ -355,42 +318,6 @@ impl TrainConfig {
         self.validate()?;
         Ok(self)
     }
-
-    /// Full vocab logits are useful for tiny tests and generation, but must
-    /// never be allocated for 32k pretraining.  The trainer will use streamed
-    /// cross-entropy instead.
-    pub fn validate_materialized_mtp(&self, time: usize) -> Result<()> {
-        if time == 0 || time > self.context_len {
-            bail!("time must be in 1..=context_len");
-        }
-        let rows = self
-            .batch_size
-            .checked_mul(time)
-            .ok_or_else(|| anyhow::anyhow!("MTP rows overflow"))?;
-        let bytes = rows
-            .checked_mul(self.vocab_size)
-            .and_then(|n| n.checked_mul(2 * size_of::<f32>()))
-            .ok_or_else(|| anyhow::anyhow!("MTP logits size overflow"))?;
-        if bytes > self.memory_budget_bytes / 4 {
-            bail!(
-                "materialized MTP logits require {} MiB; use streamed MTP loss instead",
-                bytes / (1024 * 1024)
-            );
-        }
-        Ok(())
-    }
-}
-
-const fn default_memory_budget_bytes() -> usize {
-    DEFAULT_MEMORY_BUDGET_BYTES
-}
-
-const fn default_hyena_kernel_len() -> usize {
-    1_024
-}
-
-const fn default_hyena_chunk_len() -> usize {
-    2_048
 }
 
 #[cfg(test)]
@@ -399,42 +326,52 @@ mod tests {
     use crate::tokenizer::train_bpe;
 
     #[test]
-    fn estimate_accounts_for_two_bit_ternary_planes() {
-        let cfg = TrainConfig {
-            vocab_size: 320,
-            d_model: 8,
-            n_layers: 1,
-            context_len: 8,
-            ..Default::default()
-        };
-        // D→2D: 128 weights -> 32 bytes; D→D: 64 -> 16; two MTP D→D
-        // heads add 32 bytes, for 80 bytes total.
-        assert_eq!(cfg.memory_estimate().unwrap().ternary_codes, 80);
-        assert_eq!(cfg.memory_estimate().unwrap().ternary_scales, 160);
+    fn default_profile_fits_the_four_gib_budget() {
+        let cfg = TrainConfig::default();
+        cfg.validate().unwrap();
+        let estimate = cfg.memory_estimate().unwrap();
+        let peak = estimate.peak().unwrap();
+        assert!(peak <= DEFAULT_MEMORY_BUDGET_BYTES);
+        assert!(
+            peak < 200 * 1024 * 1024,
+            "default peak {peak} should stay well under 200 MiB"
+        );
+        assert_eq!(estimate.embedding, 8192 * 256 * 2);
+        assert_eq!(estimate.rosa_sam_peak, 40 * 2048 * 256);
+        assert_eq!(estimate.qkv_bitplanes, 3 * 2048 * 256 / 8);
+        assert_eq!(estimate.binaryconnect_workspace, 8192 * 256 * 4);
+        assert_eq!(estimate.wkv_tape, 0);
+        assert_eq!(cfg.optimizer, OptimizerKind::StatelessSgd);
+        assert_eq!(cfg.context_len, 2048);
     }
 
     #[test]
-    fn estimate_includes_reused_fft_workspace() {
+    fn wide_heron_profile_is_admitted() {
         let cfg = TrainConfig {
-            context_len: 32,
+            n_layers: 12,
+            d_model: 768,
+            dim_ffn: 768 * 4,
+            context_len: 512,
+            tmix_lora_rank: 16,
             ..Default::default()
         };
-        // FFT length is 64. Two complex FP32 buffers use 1024 bytes; the
-        // real filter channel uses another 128 bytes.
-        assert_eq!(cfg.memory_estimate().unwrap().hyena_workspace, 1_152);
+        cfg.validate().unwrap();
+        assert!(cfg.memory_estimate().unwrap().peak().unwrap() < 512 * 1024 * 1024);
     }
 
     #[test]
-    fn estimate_reserves_cached_metal_hyena_buffers_without_host_staging() {
+    fn hybrid_rejects_unpadded_digit_lengths() {
         let cfg = TrainConfig {
-            d_model: 2,
-            batch_size: 1,
-            context_len: 4,
+            architecture: Architecture::RosaRwkv7,
+            d_model: 32,
+            n_layers: 2,
+            dim_ffn: 128,
+            context_len: 129,
+            tmix_lora_rank: 8,
+            vocab_size: MIN_VOCAB as usize,
             ..Default::default()
         };
-        // FFT buffers and outputs consume 576 bytes. Resident input,
-        // projection, and two gate buffers add seven [B,T,D] FP32 tensors.
-        assert_eq!(cfg.memory_estimate().unwrap().metal_hyena_workspace, 800);
+        assert!(cfg.validate().is_err());
     }
 
     #[test]
@@ -445,36 +382,24 @@ mod tests {
     }
 
     #[test]
-    fn low_memory_ledger_separates_reusable_gradient_and_optimizer_state() {
-        let cfg = TrainConfig {
-            vocab_size: 320,
-            d_model: 8,
-            n_layers: 1,
-            context_len: 8,
-            ..Default::default()
-        };
-        let estimate = cfg.memory_estimate().unwrap().low_memory_training;
-        // Ternary masters: D→2D + D→D + two MTP heads = 320 values.
-        assert_eq!(estimate.latent_ternary_weights, 640);
-        assert_eq!(estimate.optimizer_state, 640);
-        // The tied embedding is the largest single trainable tensor, not a
-        // second full-model gradient allocation.
-        assert_eq!(estimate.reusable_gradient_workspace, 320 * 8 * 2);
-        assert!(estimate.peak().is_some());
+    fn stateless_sgd_has_no_persistent_optimizer_budget() {
+        let cfg = TrainConfig::default();
+        let sgd = cfg.memory_estimate().unwrap();
+        let lion = TrainConfig {
+            optimizer: OptimizerKind::LionFp16,
+            ..cfg
+        }
+        .memory_estimate()
+        .unwrap();
+        assert!(lion.command_slack > sgd.command_slack);
     }
 
     #[test]
-    fn stateless_sgd_has_no_persistent_optimizer_budget() {
+    fn four_bit_rosa_is_rejected() {
         let cfg = TrainConfig {
-            optimizer: OptimizerKind::StatelessSgd,
+            rosa_bits: 4,
             ..Default::default()
         };
-        assert_eq!(
-            cfg.memory_estimate()
-                .unwrap()
-                .low_memory_training
-                .optimizer_state,
-            0
-        );
+        assert!(cfg.validate().is_err());
     }
 }

@@ -1,14 +1,24 @@
-//! Metal forward-path admission and shader-pipeline validation.
+//! Metal runtime for Heron: LayerNorm, BinaryConnect, FP16 linear, streamed CE,
+//! 1-bit QKV ROSA SAM, and WKV7.
 //!
-//! This module intentionally starts with pipeline construction only. Buffer
-//! mapping is the one place where Metal requires raw pointers; it will live in
-//! a small, audited follow-up boundary rather than weakening the safe CPU model
-//! API throughout the crate.
+//! Buffer mapping lives in [`ffi`]. There is no MPS path. Identity remains a
+//! pipeline-smoke entry point.
 
 use anyhow::{Result, bail};
+use core::cell::RefCell;
+use objc2::rc::Retained;
+use objc2::runtime::ProtocolObject;
+use objc2_metal::MTLComputePipelineState;
 
-#[cfg(target_os = "macos")]
-use crate::hyena::{HyenaChunkPlan, HyenaFftPlan};
+use crate::precision::Fp16;
+
+pub mod ffi;
+
+use self::ffi::{MetalBuffer, set_buffer, set_bytes_f32, set_bytes_u32};
+
+type Device = Retained<ProtocolObject<dyn objc2_metal::MTLDevice>>;
+type Queue = Retained<ProtocolObject<dyn objc2_metal::MTLCommandQueue>>;
+type Pipeline = Retained<ProtocolObject<dyn MTLComputePipelineState>>;
 
 /// A validated one-dimensional dispatch.
 ///
@@ -46,143 +56,19 @@ impl MetalDispatchShape {
     }
 }
 
-/// The first compiled pipeline. It is an elementwise identity kernel used to
-/// prove buffer layout and dispatch mechanics before replacing it with fused
-/// RMSNorm/ternary and FFT stages.
-pub const IDENTITY_KERNEL_NAME: &str = "ullis_identity";
-pub const CLIPPED_SGD_FP16_KERNEL_NAME: &str = "ullis_clipped_sgd_fp16";
-pub const EMBEDDING_LOOKUP_FP16_KERNEL_NAME: &str = "ullis_embedding_lookup_fp16";
-pub const TARGET_EMBEDDING_GRADIENT_FP16_KERNEL_NAME: &str = "ullis_target_embedding_gradient_fp16";
-pub const INPUT_EMBEDDING_GRADIENT_KERNEL_NAME: &str = "ullis_input_embedding_gradient";
-pub const SCALE_FP32_KERNEL_NAME: &str = "ullis_scale_fp32";
-pub const ADD_FP32_KERNEL_NAME: &str = "ullis_add_fp32";
-pub const FP16_TO_FP32_KERNEL_NAME: &str = "ullis_fp16_to_fp32";
-pub const STREAMED_CROSS_ENTROPY_FP16_KERNEL_NAME: &str = "ullis_streamed_cross_entropy_fp16";
-pub const TIED_LOGITS_FP16_KERNEL_NAME: &str = "ullis_tied_logits_fp16";
-pub const CROSS_ENTROPY_LOGITS_FP16_KERNEL_NAME: &str = "ullis_cross_entropy_logits_fp16";
-pub const SOFTMAX_LOGITS_FP16_KERNEL_NAME: &str = "ullis_softmax_logits_fp16";
-pub const FINALIZE_CROSS_ENTROPY_GRADIENT_FP16_KERNEL_NAME: &str =
-    "ullis_finalize_cross_entropy_gradient_fp16";
-pub const TERNARY_ROW_SCALES_FP16_KERNEL_NAME: &str = "ullis_ternary_row_scales_fp16";
-pub const REFRESH_TERNARY_CODES_FP16_KERNEL_NAME: &str = "ullis_refresh_ternary_codes_fp16";
-pub const RMS_NORM_KERNEL_NAME: &str = "ullis_rms_norm";
-pub const RMS_NORM_BACKWARD_KERNEL_NAME: &str = "ullis_rms_norm_backward";
-pub const TERNARY_LINEAR_KERNEL_NAME: &str = "ullis_ternary_linear";
-pub const TERNARY_LINEAR_FP16_KERNEL_NAME: &str = "ullis_ternary_linear_fp16";
-pub const TERNARY_INPUT_BACKWARD_KERNEL_NAME: &str = "ullis_ternary_linear_input_backward";
-pub const TERNARY_STE_WEIGHT_BACKWARD_TILED_KERNEL_NAME: &str =
-    "ullis_ternary_linear_ste_weight_backward_tiled";
-pub const CAUSAL_CONV_INPUT_BACKWARD_KERNEL_NAME: &str = "ullis_causal_conv_input_backward";
-pub const CAUSAL_CONV_FILTER_BACKWARD_KERNEL_NAME: &str = "ullis_causal_conv_filter_backward";
-pub const EXTRACT_PROJECTION_SIGNAL_KERNEL_NAME: &str = "ullis_extract_projection_signal";
-pub const ADD_PROJECTION_SIGNAL_GRADIENT_KERNEL_NAME: &str = "ullis_add_projection_signal_gradient";
-pub const RMS_NORM_TERNARY_LINEAR_KERNEL_NAME: &str = "ullis_rms_norm_ternary_linear";
-pub const FFT_BITREVERSE_KERNEL_NAME: &str = "ullis_fft_bitreverse";
-pub const FFT_STAGE_KERNEL_NAME: &str = "ullis_fft_stage";
-pub const FFT_THREADGROUP_4096_KERNEL_NAME: &str = "ullis_fft_threadgroup_4096";
-pub const FFT_COMPLEX_MULTIPLY_KERNEL_NAME: &str = "ullis_fft_complex_multiply";
-pub const PACK_REVERSE_GRADIENT_KERNEL_NAME: &str = "ullis_pack_reverse_gradient_to_complex";
-pub const PACK_FILTER_KERNEL_NAME: &str = "ullis_pack_filter_to_complex";
-pub const FFT_EXTRACT_INPUT_BACKWARD_KERNEL_NAME: &str = "ullis_fft_extract_input_backward";
-pub const FFT_EXTRACT_CAUSAL_KERNEL_NAME: &str = "ullis_fft_extract_causal";
-pub const IMPLICIT_FILTER_KERNEL_NAME: &str = "ullis_generate_implicit_filter";
-pub const IMPLICIT_FILTER_FP16_KERNEL_NAME: &str = "ullis_generate_implicit_filter_fp16";
-pub const TANH_GATE_KERNEL_NAME: &str = "ullis_tanh_gate_in_place";
-pub const TANH_GATE_FP16_KERNEL_NAME: &str = "ullis_tanh_gate_fp16";
-pub const PACK_STRIDED_REAL_KERNEL_NAME: &str = "ullis_pack_strided_real_to_complex";
-pub const PACK_OVERLAP_SAVE_KERNEL_NAME: &str = "ullis_pack_overlap_save_to_complex";
-pub const EXTRACT_OVERLAP_SAVE_KERNEL_NAME: &str = "ullis_extract_overlap_save";
-pub const APPLY_GATE_KERNEL_NAME: &str = "ullis_apply_gate";
-pub const APPLY_GATE_FP16_KERNEL_NAME: &str = "ullis_apply_gate_fp16";
-pub const HYENA_GATE_BACKWARD_KERNEL_NAME: &str = "ullis_hyena_gate_backward";
-pub const RESIDUAL_ADD_KERNEL_NAME: &str = "ullis_residual_add";
-pub const RESIDUAL_ADD_FP16_KERNEL_NAME: &str = "ullis_residual_add_fp16";
-pub const HYENA_METAL_SOURCE: &str = include_str!("metal/hyena.metal");
-
-/// Checked dimensions for one packed-ternary projection.
+/// Checked dimensions for one packed or FP16 projection.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct TernaryLinearShape {
+pub struct LinearDispatchShape {
     pub rows: usize,
     pub in_features: usize,
     pub out_features: usize,
 }
 
-/// GPU result for the exact local derivative of `mixed * tanh(gate)`.
-#[derive(Clone, Debug, PartialEq)]
-pub struct MetalHyenaGateBackward {
-    pub mixed_gradient: Vec<f32>,
-    pub projection_gradient: Vec<f32>,
-}
-
-/// GPU result for the packed-forward input derivative and ternary STE weight
-/// surrogate. Both vectors are FP32 local workspaces, not persistent state.
-#[derive(Clone, Debug, PartialEq)]
-pub struct MetalTernaryLinearBackward {
-    pub input_gradient: Vec<f32>,
-    pub latent_weight_gradient: Vec<f32>,
-}
-
-/// GPU result for exact bounded causal-convolution derivatives.
-#[derive(Clone, Debug, PartialEq)]
-pub struct MetalCausalConvBackward {
-    pub input_gradient: Vec<f32>,
-    pub filter_gradient: Vec<f32>,
-}
-
-/// Final tensors read back from one resident Hyena block backward command.
-#[derive(Clone, Debug, PartialEq)]
-pub struct MetalHyenaBlockBackward {
-    pub input_gradient: Vec<f32>,
-    pub input_projection_weight_gradient: Vec<f32>,
-    pub output_projection_weight_gradient: Vec<f32>,
-    pub filter_gradient: Vec<f32>,
-}
-
-/// Readbacks needed after a cached block backward pass that updates resident
-/// projection weights in place. Projection gradients never cross the host
-/// boundary in this path.
-#[derive(Clone, Debug, PartialEq)]
-pub struct MetalHyenaBlockUpdatedBackward {
-    pub input_gradient: Vec<f32>,
-    pub filter_gradient: Vec<f32>,
-}
-
-#[cfg(target_os = "macos")]
-#[derive(Clone, Copy)]
-struct ResidentTernaryUpdates<'a> {
-    input: &'a ResidentTrainableFp16TernaryWeights,
-    output: &'a ResidentTrainableFp16TernaryWeights,
-    learning_rate: f32,
-}
-
-#[cfg(target_os = "macos")]
-enum CachedBlockBackwardResult {
-    Reference(MetalHyenaBlockBackward),
-    Updated(MetalHyenaBlockUpdatedBackward),
-}
-
-/// Forward values retained on Metal for one Hyena block training pass.
-///
-/// These are deliberately independent of the runtime's ping-pong scratch
-/// slots: a later block is free to reuse those slots while this cache remains
-/// valid for reverse traversal.  No tensor is copied through the CPU.
-#[cfg(target_os = "macos")]
-pub struct ResidentHyenaBlockCache {
-    input: objc2::rc::Retained<objc2::runtime::ProtocolObject<dyn objc2_metal::MTLBuffer>>,
-    normalized_input:
-        objc2::rc::Retained<objc2::runtime::ProtocolObject<dyn objc2_metal::MTLBuffer>>,
-    gated_projection:
-        objc2::rc::Retained<objc2::runtime::ProtocolObject<dyn objc2_metal::MTLBuffer>>,
-    mixed: objc2::rc::Retained<objc2::runtime::ProtocolObject<dyn objc2_metal::MTLBuffer>>,
-    rows: usize,
-    channels: usize,
-}
-
-impl TernaryLinearShape {
+impl LinearDispatchShape {
     pub fn new(rows: usize, in_features: usize, out_features: usize) -> Result<Self> {
         MetalDispatchShape::new(rows, 1, out_features)?;
         if in_features == 0 || u32::try_from(in_features).is_err() {
-            bail!("Metal ternary input width is invalid");
+            bail!("Metal linear input width is invalid");
         }
         Ok(Self {
             rows,
@@ -194,1271 +80,438 @@ impl TernaryLinearShape {
     pub fn packed_words(self) -> Result<usize> {
         self.in_features
             .checked_mul(self.out_features)
-            .ok_or_else(|| anyhow::anyhow!("Metal ternary weight shape overflow"))
-            .map(|weights| weights.div_ceil(64))
+            .ok_or_else(|| anyhow::anyhow!("Metal linear weight shape overflow"))
+            .map(|weights| weights.div_ceil(32))
     }
 }
 
-/// CPU reference for the exact packed-bitplane convention used by the Metal
-/// ternary shader. It is kept public for GPU equivalence tests and contains no
-/// model state or allocation beyond its output.
-pub fn ternary_reference(
-    input: &[f32],
-    positive: &[u64],
-    negative: &[u64],
-    scales: &[f32],
-    shape: TernaryLinearShape,
-) -> Result<Vec<f32>> {
-    let input_len = shape
-        .rows
-        .checked_mul(shape.in_features)
-        .ok_or_else(|| anyhow::anyhow!("ternary input shape overflow"))?;
-    let output_len = shape
-        .rows
-        .checked_mul(shape.out_features)
-        .ok_or_else(|| anyhow::anyhow!("ternary output shape overflow"))?;
-    let weights = shape
-        .in_features
-        .checked_mul(shape.out_features)
-        .ok_or_else(|| anyhow::anyhow!("ternary weight shape overflow"))?;
-    if input.len() != input_len
-        || positive.len() != shape.packed_words()?
-        || negative.len() != shape.packed_words()?
-        || scales.len() != shape.out_features
-    {
-        bail!("ternary reference shape mismatch");
-    }
-    let mut output = vec![0.0; output_len];
-    for row in 0..shape.rows {
-        for out in 0..shape.out_features {
-            let mut sum = 0.0;
-            for i in 0..shape.in_features {
-                let w = out * shape.in_features + i;
-                let bit = 1_u64 << (w % 64);
-                let code = if positive[w / 64] & bit != 0 {
-                    1.0
-                } else if negative[w / 64] & bit != 0 {
-                    -1.0
-                } else {
-                    0.0
-                };
-                sum += input[row * shape.in_features + i] * code;
-            }
-            output[row * shape.out_features + out] = sum * scales[out];
-        }
-    }
-    debug_assert_eq!(weights.div_ceil(64), positive.len());
-    Ok(output)
-}
+pub const IDENTITY_KERNEL_NAME: &str = "ullis_identity";
+pub const LAYER_NORM_KERNEL_NAME: &str = "ullis_layer_norm";
+pub const LAYER_NORM_BACKWARD_KERNEL_NAME: &str = "ullis_layer_norm_backward";
+pub const LAYER_NORM_PARAM_BWD_KERNEL_NAME: &str = "ullis_layer_norm_param_bwd";
+pub const TIME_SHIFT_DELTA_KERNEL_NAME: &str = "ullis_time_shift_delta";
+pub const TIME_SHIFT_MIX_KERNEL_NAME: &str = "ullis_time_shift_mix";
+pub const TIME_SHIFT_MIX3_KERNEL_NAME: &str = "ullis_time_shift_mix3";
+pub const BINARY_LINEAR_KERNEL_NAME: &str = "ullis_binary_linear";
+pub const BINARY_LINEAR_INPUT_BWD_KERNEL_NAME: &str = "ullis_binary_linear_input_bwd";
+pub const BINARY_LINEAR_SCALE_BWD_KERNEL_NAME: &str = "ullis_binary_linear_scale_bwd";
+pub const BINARY_LINEAR_WEIGHT_BWD_KERNEL_NAME: &str = "ullis_binary_linear_weight_bwd";
+pub const BINARY_LINEAR_SCALE_BWD_FROM_OUTPUT_KERNEL_NAME: &str =
+    "ullis_binary_linear_scale_bwd_from_output";
+pub const BINARY_LINEAR_LATENT_SGD_KERNEL_NAME: &str = "ullis_binary_linear_latent_sgd";
+pub const LINEAR_TILE: usize = 16;
+pub const SCALE_BWD_THREADS: usize = 256;
+pub const FP16_LINEAR_KERNEL_NAME: &str = "ullis_fp16_linear";
+pub const FP16_LINEAR_BWD_KERNEL_NAME: &str = "ullis_fp16_linear_bwd";
+pub const SIGN_PACK_BITS_KERNEL_NAME: &str = "ullis_sign_pack_bits";
+pub const PACK_LATENT_BITS_KERNEL_NAME: &str = "ullis_pack_latent_bits";
+pub const ROSA_SAM_RESET_KERNEL_NAME: &str = "ullis_rosa_sam_reset";
+pub const ROSA_QKV_1BIT_FWD_KERNEL_NAME: &str = "ullis_rosa_qkv_1bit_fwd";
+pub const ROSA_QKV_1BIT_BWD_E_KERNEL_NAME: &str = "ullis_rosa_qkv_1bit_bwd_e";
+pub const CMIX_RELU2_KERNEL_NAME: &str = "ullis_cmix_relu2";
+pub const CMIX_RELU2_BACKWARD_KERNEL_NAME: &str = "ullis_cmix_relu2_backward";
+pub const RESIDUAL_ADD_KERNEL_NAME: &str = "ullis_residual_add";
+pub const STREAMED_CROSS_ENTROPY_FP16_KERNEL_NAME: &str = "ullis_streamed_cross_entropy_fp16";
+pub const SOFTMAX_CROSS_ENTROPY_KERNEL_NAME: &str = "ullis_softmax_cross_entropy";
+pub const CLIPPED_SGD_FP16_KERNEL_NAME: &str = "ullis_clipped_sgd_fp16";
+pub const WKV7_FORWARD_KERNEL_NAME: &str = "ullis_wkv7_forward";
+pub const WKV7_BACKWARD_KERNEL_NAME: &str = "ullis_wkv7_backward";
 
-/// CPU reference for fused RMSNorm and packed ternary projection. The
-/// normalized row is never materialized, mirroring the GPU kernel's memory
-/// contract.
-pub fn rms_norm_ternary_reference(
-    input: &[f32],
-    positive: &[u64],
-    negative: &[u64],
-    scales: &[f32],
-    shape: TernaryLinearShape,
-) -> Result<Vec<f32>> {
-    let input_len = shape
-        .rows
-        .checked_mul(shape.in_features)
-        .ok_or_else(|| anyhow::anyhow!("fused ternary input shape overflow"))?;
-    if input.len() != input_len
-        || positive.len() != shape.packed_words()?
-        || negative.len() != shape.packed_words()?
-        || scales.len() != shape.out_features
-    {
-        bail!("fused ternary reference shape mismatch");
-    }
-    let output_len = shape
-        .rows
-        .checked_mul(shape.out_features)
-        .ok_or_else(|| anyhow::anyhow!("fused ternary output shape overflow"))?;
-    let mut output = vec![0.0; output_len];
-    for row in 0..shape.rows {
-        let source = &input[row * shape.in_features..(row + 1) * shape.in_features];
-        let inverse_rms = (source.iter().map(|value| value * value).sum::<f32>()
-            / shape.in_features as f32
-            + 1e-5)
-            .sqrt()
-            .recip();
-        for out in 0..shape.out_features {
-            let mut sum = 0.0;
-            for (i, value) in source.iter().enumerate() {
-                let weight = out * shape.in_features + i;
-                let bit = 1_u64 << (weight % 64);
-                let code = if positive[weight / 64] & bit != 0 {
-                    1.0
-                } else if negative[weight / 64] & bit != 0 {
-                    -1.0
-                } else {
-                    0.0
-                };
-                sum += value * code;
-            }
-            output[row * shape.out_features + out] = sum * inverse_rms * scales[out];
-        }
-    }
-    Ok(output)
-}
+pub const RWKV8_METAL_SOURCE: &str = include_str!("metal/rwkv8.metal");
 
-#[cfg(target_os = "macos")]
+pub const PR3_KERNEL_NAMES: &[&str] = &[
+    IDENTITY_KERNEL_NAME,
+    LAYER_NORM_KERNEL_NAME,
+    LAYER_NORM_BACKWARD_KERNEL_NAME,
+    LAYER_NORM_PARAM_BWD_KERNEL_NAME,
+    TIME_SHIFT_DELTA_KERNEL_NAME,
+    TIME_SHIFT_MIX_KERNEL_NAME,
+    TIME_SHIFT_MIX3_KERNEL_NAME,
+    BINARY_LINEAR_KERNEL_NAME,
+    BINARY_LINEAR_INPUT_BWD_KERNEL_NAME,
+    BINARY_LINEAR_SCALE_BWD_KERNEL_NAME,
+    BINARY_LINEAR_WEIGHT_BWD_KERNEL_NAME,
+    BINARY_LINEAR_SCALE_BWD_FROM_OUTPUT_KERNEL_NAME,
+    BINARY_LINEAR_LATENT_SGD_KERNEL_NAME,
+    FP16_LINEAR_KERNEL_NAME,
+    FP16_LINEAR_BWD_KERNEL_NAME,
+    SIGN_PACK_BITS_KERNEL_NAME,
+    PACK_LATENT_BITS_KERNEL_NAME,
+    CMIX_RELU2_KERNEL_NAME,
+    CMIX_RELU2_BACKWARD_KERNEL_NAME,
+    RESIDUAL_ADD_KERNEL_NAME,
+    STREAMED_CROSS_ENTROPY_FP16_KERNEL_NAME,
+    SOFTMAX_CROSS_ENTROPY_KERNEL_NAME,
+    CLIPPED_SGD_FP16_KERNEL_NAME,
+];
+
+pub const PR4_KERNEL_NAMES: &[&str] = &[ROSA_SAM_RESET_KERNEL_NAME, ROSA_QKV_1BIT_FWD_KERNEL_NAME];
+pub const PR5_KERNEL_NAMES: &[&str] = &[ROSA_QKV_1BIT_BWD_E_KERNEL_NAME];
+pub const PR8_KERNEL_NAMES: &[&str] = &[WKV7_FORWARD_KERNEL_NAME, WKV7_BACKWARD_KERNEL_NAME];
+
+/// Compiles the identity entry point and checks its dispatch capacity.
 pub fn validate_metal_pipeline(shape: MetalDispatchShape) -> Result<usize> {
     validate_metal_kernel(IDENTITY_KERNEL_NAME, shape)
 }
 
 /// Compiles a named Ullis MSL entry point and checks its dispatch capacity.
-/// This admits a kernel before it is allowed into the model execution path.
-#[cfg(target_os = "macos")]
 pub fn validate_metal_kernel(kernel_name: &str, shape: MetalDispatchShape) -> Result<usize> {
-    use objc2_foundation::NSString;
-    use objc2_metal::{
-        MTLCompileOptions, MTLComputePipelineState, MTLCreateSystemDefaultDevice, MTLDevice,
-        MTLLibrary,
-    };
-
-    let device = MTLCreateSystemDefaultDevice()
-        .ok_or_else(|| anyhow::anyhow!("Metal device is unavailable"))?;
-    let source = NSString::from_str(HYENA_METAL_SOURCE);
-    let options = MTLCompileOptions::new();
-    let library = device
-        .newLibraryWithSource_options_error(&source, Some(&options))
-        .map_err(|error| anyhow::anyhow!("Metal shader compilation failed: {error}"))?;
-    let name = NSString::from_str(kernel_name);
-    let function = library
-        .newFunctionWithName(&name)
-        .ok_or_else(|| anyhow::anyhow!("Metal function {kernel_name:?} is missing"))?;
-    let pipeline = device
-        .newComputePipelineStateWithFunction_error(&function)
-        .map_err(|error| anyhow::anyhow!("Metal pipeline creation failed: {error}"))?;
+    let pipeline = compile_named_pipeline(kernel_name)?;
     let width = pipeline.maxTotalThreadsPerThreadgroup();
     if width == 0 {
         bail!("Metal pipeline reported zero threads per threadgroup");
     }
-    // The checked shape is deliberately consumed here: later dispatch code can
-    // use the same type without a second unchecked `usize -> uint` conversion.
     let _ = shape.elements();
     Ok(width)
 }
 
-#[cfg(not(target_os = "macos"))]
-pub fn validate_metal_pipeline(_shape: MetalDispatchShape) -> Result<usize> {
-    bail!("Ullis Metal backend requires macOS on Apple Silicon")
+fn compile_options() -> Retained<objc2_metal::MTLCompileOptions> {
+    use objc2_metal::{MTLCompileOptions, MTLMathMode};
+
+    let options = MTLCompileOptions::new();
+    // Default fast-math relaxes exp/log enough to miss the WKV7 CPU oracle.
+    options.setMathMode(MTLMathMode::Safe);
+    options
 }
 
-#[cfg(not(target_os = "macos"))]
-pub fn validate_metal_kernel(_kernel_name: &str, _shape: MetalDispatchShape) -> Result<usize> {
-    bail!("Ullis Metal backend requires macOS on Apple Silicon")
-}
-
-/// Executes the stage-zero Metal kernel and returns a fresh output vector.
-///
-/// This is intentionally a correctness harness, not the final tensor runtime:
-/// it proves the owned-buffer, command-buffer, and `[B,T,D]` dispatch contract
-/// against the CPU before more complex kernels are introduced.
-#[cfg(target_os = "macos")]
-#[allow(unsafe_code)]
-fn execute_reference_kernel(
-    input: &[f32],
-    kernel_name: &str,
-    grid_width: usize,
-    scalars: &[u32],
-) -> Result<Vec<f32>> {
-    use core::ffi::c_void;
-    use core::ptr::NonNull;
+fn compile_named_pipeline(kernel_name: &str) -> Result<Pipeline> {
     use objc2_foundation::NSString;
-    use objc2_metal::{
-        MTLBuffer, MTLCommandBuffer, MTLCommandEncoder, MTLCommandQueue, MTLCompileOptions,
-        MTLComputeCommandEncoder, MTLComputePipelineState, MTLCreateSystemDefaultDevice, MTLDevice,
-        MTLLibrary, MTLResourceOptions, MTLSize,
-    };
+    use objc2_metal::{MTLCreateSystemDefaultDevice, MTLDevice};
 
-    MetalDispatchShape::new(1, input.len(), 1)?;
-    if grid_width == 0 || u32::try_from(grid_width).is_err() {
-        bail!("Metal grid width is invalid");
-    }
-    let bytes = input
-        .len()
-        .checked_mul(size_of::<f32>())
-        .ok_or_else(|| anyhow::anyhow!("Metal buffer byte size overflow"))?;
     let device = MTLCreateSystemDefaultDevice()
         .ok_or_else(|| anyhow::anyhow!("Metal device is unavailable"))?;
-    let source = NSString::from_str(HYENA_METAL_SOURCE);
-    let options = MTLCompileOptions::new();
+    let source = NSString::from_str(RWKV8_METAL_SOURCE);
+    let options = compile_options();
     let library = device
         .newLibraryWithSource_options_error(&source, Some(&options))
         .map_err(|error| anyhow::anyhow!("Metal shader compilation failed: {error}"))?;
+    pipeline_from_library(&device, &library, kernel_name)
+}
+
+fn pipeline_from_library(
+    device: &Device,
+    library: &Retained<ProtocolObject<dyn objc2_metal::MTLLibrary>>,
+    kernel_name: &str,
+) -> Result<Pipeline> {
+    use objc2_foundation::NSString;
+    use objc2_metal::{MTLDevice, MTLLibrary};
+
     let name = NSString::from_str(kernel_name);
     let function = library
         .newFunctionWithName(&name)
-        .ok_or_else(|| anyhow::anyhow!("Metal identity function is missing"))?;
-    let pipeline = device
+        .ok_or_else(|| anyhow::anyhow!("Metal function {kernel_name:?} is missing"))?;
+    device
         .newComputePipelineStateWithFunction_error(&function)
-        .map_err(|error| anyhow::anyhow!("Metal pipeline creation failed: {error}"))?;
-    let queue = device
-        .newCommandQueue()
-        .ok_or_else(|| anyhow::anyhow!("Metal command queue is unavailable"))?;
-    let input_buffer = device
-        .newBufferWithLength_options(bytes, MTLResourceOptions::StorageModeShared)
-        .ok_or_else(|| anyhow::anyhow!("Metal input buffer allocation failed"))?;
-    let output_buffer = device
-        .newBufferWithLength_options(bytes, MTLResourceOptions::StorageModeShared)
-        .ok_or_else(|| anyhow::anyhow!("Metal output buffer allocation failed"))?;
+        .map_err(|error| anyhow::anyhow!("Metal pipeline {kernel_name:?} failed: {error}"))
+}
 
-    // SAFETY: Shared buffers are allocated for exactly `bytes`, which was
-    // checked from `input.len() * size_of::<f32>()`; both pointers stay valid
-    // while their retained buffers are in scope and Metal has not been sent a
-    // command buffer yet.
-    unsafe {
-        input_buffer
-            .contents()
-            .cast::<f32>()
-            .as_ptr()
-            .copy_from_nonoverlapping(input.as_ptr(), input.len());
+fn fp16_bits(values: &[f32]) -> Vec<u16> {
+    values
+        .iter()
+        .copied()
+        .map(|v| Fp16::from_f32(v).to_bits())
+        .collect()
+}
+
+fn as_u32(value: usize, label: &str) -> Result<u32> {
+    u32::try_from(value).map_err(|_| anyhow::anyhow!("Metal {label} exceeds u32"))
+}
+
+/// Local derivatives of affine LayerNorm.
+#[derive(Clone, Debug, PartialEq)]
+pub struct LayerNormBackward {
+    pub input_gradient: Vec<f32>,
+    pub weight_gradient: Vec<f32>,
+    pub bias_gradient: Vec<f32>,
+}
+
+/// STE gradients for a packed ±1 linear (no `g_w`; that lives in latent SGD).
+#[derive(Clone, Debug, PartialEq)]
+pub struct BinaryLinearBackward {
+    pub input_gradient: Vec<f32>,
+    pub scale_gradient: Vec<f32>,
+    pub bias_gradient: Option<Vec<f32>>,
+    pub weight_gradient: Vec<f32>,
+}
+
+/// Dense FP16 linear derivatives.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Fp16LinearBackward {
+    pub input_gradient: Vec<f32>,
+    pub weight_gradient: Vec<f32>,
+}
+
+/// Resident 1-bit QKV SAM forward: collapsed idx and `out = (2·idx − 1)·e`.
+#[derive(Clone, Debug, PartialEq)]
+pub struct RosaQkvForward {
+    pub idx: Vec<u8>,
+    pub out: Vec<f32>,
+}
+
+/// Fused ROSA-QKV block: time-mix, QKV, SAM, and output projection.
+#[derive(Clone, Debug, PartialEq)]
+pub struct RosaQkvBlockForward {
+    pub idx: Vec<u8>,
+    pub y: Vec<f32>,
+    pub out: Vec<f32>,
+}
+
+/// Fused CMix block activations kept for STE backward.
+#[derive(Clone, Debug, PartialEq)]
+pub struct CmixBlockForward {
+    pub xx: Vec<f32>,
+    pub shifted: Vec<f32>,
+    pub key: Vec<f32>,
+    pub relu2: Vec<f32>,
+    pub out: Vec<f32>,
+}
+
+/// Packed head train with BinaryConnect SGD applied on GPU. `g_w` stays resident.
+#[derive(Clone, Debug, PartialEq)]
+pub struct PackedHeadTrainSgd {
+    pub mean_loss: f32,
+    pub hidden_gradient: Vec<f32>,
+    pub scale_gradient: Vec<f32>,
+    pub next_latent: Vec<u16>,
+    pub next_bits: Vec<u32>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct CmixBlockBackwardSgd {
+    pub g_shifted: Vec<f32>,
+    pub g_key_scale: Vec<f32>,
+    pub next_key_latent: Vec<u16>,
+    pub next_key_bits: Vec<u32>,
+    pub next_value_weight: Vec<u16>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct RosaOStopGradSgd {
+    pub e_gradient: Vec<f32>,
+    pub scale_gradient: Vec<f32>,
+    pub bias_gradient: Vec<f32>,
+    pub next_latent: Vec<u16>,
+    pub next_bits: Vec<u32>,
+}
+
+/// Next-token streamed CE without a `[rows, vocab]` logit tensor.
+#[derive(Clone, Debug, PartialEq)]
+pub struct StreamedCrossEntropy {
+    pub mean_loss: f32,
+    pub hidden_gradient: Vec<f32>,
+    pub scale_gradient: Vec<f32>,
+    pub row_loss: Vec<f32>,
+    pub logit_gradient: Vec<f32>,
+}
+
+/// Head train: packed linear + softmax CE + STE `g_w`, logits stay on GPU.
+#[derive(Clone, Debug, PartialEq)]
+pub struct PackedHeadTrain {
+    pub mean_loss: f32,
+    pub hidden_gradient: Vec<f32>,
+    pub scale_gradient: Vec<f32>,
+    pub weight_gradient: Vec<f32>,
+}
+
+struct RecycledBuffer<'a> {
+    inner: Option<MetalBuffer>,
+    scratch: &'a RefCell<Vec<MetalBuffer>>,
+}
+
+impl RecycledBuffer<'_> {
+    fn live(&self) -> &MetalBuffer {
+        self.inner
+            .as_ref()
+            .expect("scratch buffer is returned to the pool")
     }
+}
 
-    let command = queue
-        .commandBuffer()
-        .ok_or_else(|| anyhow::anyhow!("Metal command buffer allocation failed"))?;
-    let encoder = command
-        .computeCommandEncoder()
-        .ok_or_else(|| anyhow::anyhow!("Metal compute encoder allocation failed"))?;
-    encoder.setComputePipelineState(&pipeline);
-    // SAFETY: indices 0 and 1 are the shared buffers in every reference MSL
-    // kernel. Scalar words are copied synchronously into consecutive slots.
-    unsafe {
-        encoder.setBuffer_offset_atIndex(Some(&input_buffer), 0, 0);
-        encoder.setBuffer_offset_atIndex(Some(&output_buffer), 0, 1);
-        for (offset, scalar) in scalars.iter().enumerate() {
-            encoder.setBytes_length_atIndex(
-                NonNull::from(scalar).cast::<c_void>(),
-                size_of::<u32>(),
-                offset + 2,
-            );
+impl Drop for RecycledBuffer<'_> {
+    fn drop(&mut self) {
+        if let Some(buffer) = self.inner.take() {
+            self.scratch.borrow_mut().push(buffer);
         }
     }
-    let thread_width = pipeline.maxTotalThreadsPerThreadgroup().min(grid_width);
-    if thread_width == 0 {
-        bail!("Metal pipeline reported zero threads per threadgroup");
-    }
-    encoder.dispatchThreads_threadsPerThreadgroup(
-        MTLSize {
-            width: grid_width,
-            height: 1,
-            depth: 1,
-        },
-        MTLSize {
-            width: thread_width,
-            height: 1,
-            depth: 1,
-        },
-    );
-    encoder.endEncoding();
-    command.commit();
-    command.waitUntilCompleted();
-    if let Some(error) = command.error() {
-        bail!("Metal identity command failed: {error}");
-    }
-
-    let mut output = vec![0.0; input.len()];
-    // SAFETY: GPU work is complete, `output_buffer` remains retained, and the
-    // destination vector has exactly the number of initialized `f32` slots
-    // represented by the source buffer.
-    unsafe {
-        output.as_mut_ptr().copy_from_nonoverlapping(
-            output_buffer.contents().cast::<f32>().as_ptr(),
-            output.len(),
-        );
-    }
-    Ok(output)
 }
 
-#[cfg(target_os = "macos")]
-pub fn identity_forward(input: &[f32]) -> Result<Vec<f32>> {
-    let elements = u32::try_from(input.len())
-        .map_err(|_| anyhow::anyhow!("Metal element count exceeds u32"))?;
-    execute_reference_kernel(input, IDENTITY_KERNEL_NAME, input.len(), &[elements])
-}
+impl core::ops::Deref for RecycledBuffer<'_> {
+    type Target = MetalBuffer;
 
-/// GPU numerical-reference RMSNorm over contiguous rows.
-#[cfg(target_os = "macos")]
-pub fn rms_norm_forward(input: &[f32], rows: usize, channels: usize) -> Result<Vec<f32>> {
-    let shape = MetalDispatchShape::new(rows, 1, channels)?;
-    if input.len() != shape.elements() {
-        bail!("RMSNorm input shape mismatch");
+    fn deref(&self) -> &MetalBuffer {
+        self.live()
     }
-    let rows = u32::try_from(rows).map_err(|_| anyhow::anyhow!("RMSNorm rows exceed u32"))?;
-    let channels =
-        u32::try_from(channels).map_err(|_| anyhow::anyhow!("RMSNorm channels exceed u32"))?;
-    execute_reference_kernel(
-        input,
-        RMS_NORM_KERNEL_NAME,
-        rows as usize,
-        &[rows, channels],
-    )
 }
 
-/// Reusable Metal objects for the hot ternary projection path.
-///
-/// The runtime is intentionally single-threaded (`RefCell` protects its
-/// scratch buffers). A trainer should own one runtime on its dispatch thread;
-/// this prevents hidden locks and makes resource lifetime explicit.
-#[cfg(target_os = "macos")]
+impl AsRef<MetalBuffer> for RecycledBuffer<'_> {
+    fn as_ref(&self) -> &MetalBuffer {
+        self.live()
+    }
+}
+
+impl AsRef<MetalBuffer> for MetalBuffer {
+    fn as_ref(&self) -> &MetalBuffer {
+        self
+    }
+}
+
+struct Pipelines {
+    identity: Pipeline,
+    layer_norm: Pipeline,
+    layer_norm_backward: Pipeline,
+    layer_norm_param_bwd: Pipeline,
+    time_shift_delta: Pipeline,
+    time_shift_mix: Pipeline,
+    time_shift_mix3: Pipeline,
+    binary_linear: Pipeline,
+    binary_linear_input_bwd: Pipeline,
+    binary_linear_scale_bwd: Pipeline,
+    binary_linear_weight_bwd: Pipeline,
+    binary_linear_scale_bwd_from_output: Pipeline,
+    binary_linear_latent_sgd: Pipeline,
+    fp16_linear: Pipeline,
+    fp16_linear_bwd: Pipeline,
+    sign_pack_bits: Pipeline,
+    pack_latent_bits: Pipeline,
+    rosa_sam_reset: Pipeline,
+    rosa_qkv_1bit_fwd: Pipeline,
+    rosa_qkv_1bit_bwd_e: Pipeline,
+    cmix_relu2: Pipeline,
+    cmix_relu2_backward: Pipeline,
+    residual_add: Pipeline,
+    streamed_cross_entropy_fp16: Pipeline,
+    softmax_cross_entropy: Pipeline,
+    clipped_sgd_fp16: Pipeline,
+    wkv7_forward: Pipeline,
+    wkv7_backward: Pipeline,
+}
+
+/// Reusable Metal objects for resident Heron kernels. No MPS GEMM.
 pub struct MetalRuntime {
-    device: objc2::rc::Retained<objc2::runtime::ProtocolObject<dyn objc2_metal::MTLDevice>>,
-    queue: objc2::rc::Retained<objc2::runtime::ProtocolObject<dyn objc2_metal::MTLCommandQueue>>,
-    ternary_pipeline: objc2::rc::Retained<
-        objc2::runtime::ProtocolObject<dyn objc2_metal::MTLComputePipelineState>,
-    >,
-    ternary_fp16_pipeline: objc2::rc::Retained<
-        objc2::runtime::ProtocolObject<dyn objc2_metal::MTLComputePipelineState>,
-    >,
-    identity_pipeline: objc2::rc::Retained<
-        objc2::runtime::ProtocolObject<dyn objc2_metal::MTLComputePipelineState>,
-    >,
-    clipped_sgd_fp16_pipeline: objc2::rc::Retained<
-        objc2::runtime::ProtocolObject<dyn objc2_metal::MTLComputePipelineState>,
-    >,
-    embedding_lookup_fp16_pipeline: objc2::rc::Retained<
-        objc2::runtime::ProtocolObject<dyn objc2_metal::MTLComputePipelineState>,
-    >,
-    target_embedding_gradient_fp16_pipeline: objc2::rc::Retained<
-        objc2::runtime::ProtocolObject<dyn objc2_metal::MTLComputePipelineState>,
-    >,
-    input_embedding_gradient_pipeline: objc2::rc::Retained<
-        objc2::runtime::ProtocolObject<dyn objc2_metal::MTLComputePipelineState>,
-    >,
-    scale_fp32_pipeline: objc2::rc::Retained<
-        objc2::runtime::ProtocolObject<dyn objc2_metal::MTLComputePipelineState>,
-    >,
-    add_fp32_pipeline: objc2::rc::Retained<
-        objc2::runtime::ProtocolObject<dyn objc2_metal::MTLComputePipelineState>,
-    >,
-    fp16_to_fp32_pipeline: objc2::rc::Retained<
-        objc2::runtime::ProtocolObject<dyn objc2_metal::MTLComputePipelineState>,
-    >,
-    streamed_cross_entropy_fp16_pipeline: objc2::rc::Retained<
-        objc2::runtime::ProtocolObject<dyn objc2_metal::MTLComputePipelineState>,
-    >,
-    tied_logits_fp16_pipeline: objc2::rc::Retained<
-        objc2::runtime::ProtocolObject<dyn objc2_metal::MTLComputePipelineState>,
-    >,
-    cross_entropy_logits_fp16_pipeline: objc2::rc::Retained<
-        objc2::runtime::ProtocolObject<dyn objc2_metal::MTLComputePipelineState>,
-    >,
-    softmax_logits_fp16_pipeline: objc2::rc::Retained<
-        objc2::runtime::ProtocolObject<dyn objc2_metal::MTLComputePipelineState>,
-    >,
-    finalize_cross_entropy_gradient_fp16_pipeline: objc2::rc::Retained<
-        objc2::runtime::ProtocolObject<dyn objc2_metal::MTLComputePipelineState>,
-    >,
-    ternary_row_scales_fp16_pipeline: objc2::rc::Retained<
-        objc2::runtime::ProtocolObject<dyn objc2_metal::MTLComputePipelineState>,
-    >,
-    refresh_ternary_codes_fp16_pipeline: objc2::rc::Retained<
-        objc2::runtime::ProtocolObject<dyn objc2_metal::MTLComputePipelineState>,
-    >,
-    rms_norm_pipeline: objc2::rc::Retained<
-        objc2::runtime::ProtocolObject<dyn objc2_metal::MTLComputePipelineState>,
-    >,
-    ternary_input_backward_pipeline: objc2::rc::Retained<
-        objc2::runtime::ProtocolObject<dyn objc2_metal::MTLComputePipelineState>,
-    >,
-    ternary_ste_weight_backward_tiled_pipeline: objc2::rc::Retained<
-        objc2::runtime::ProtocolObject<dyn objc2_metal::MTLComputePipelineState>,
-    >,
-    causal_conv_input_backward_pipeline: objc2::rc::Retained<
-        objc2::runtime::ProtocolObject<dyn objc2_metal::MTLComputePipelineState>,
-    >,
-    causal_conv_filter_backward_pipeline: objc2::rc::Retained<
-        objc2::runtime::ProtocolObject<dyn objc2_metal::MTLComputePipelineState>,
-    >,
-    extract_projection_signal_pipeline: objc2::rc::Retained<
-        objc2::runtime::ProtocolObject<dyn objc2_metal::MTLComputePipelineState>,
-    >,
-    add_projection_signal_gradient_pipeline: objc2::rc::Retained<
-        objc2::runtime::ProtocolObject<dyn objc2_metal::MTLComputePipelineState>,
-    >,
-    rms_norm_backward_pipeline: objc2::rc::Retained<
-        objc2::runtime::ProtocolObject<dyn objc2_metal::MTLComputePipelineState>,
-    >,
-    fused_rms_norm_ternary_pipeline: objc2::rc::Retained<
-        objc2::runtime::ProtocolObject<dyn objc2_metal::MTLComputePipelineState>,
-    >,
-    fft_bitreverse_pipeline: objc2::rc::Retained<
-        objc2::runtime::ProtocolObject<dyn objc2_metal::MTLComputePipelineState>,
-    >,
-    fft_stage_pipeline: objc2::rc::Retained<
-        objc2::runtime::ProtocolObject<dyn objc2_metal::MTLComputePipelineState>,
-    >,
-    fft_threadgroup_4096_pipeline: objc2::rc::Retained<
-        objc2::runtime::ProtocolObject<dyn objc2_metal::MTLComputePipelineState>,
-    >,
-    fft_multiply_pipeline: objc2::rc::Retained<
-        objc2::runtime::ProtocolObject<dyn objc2_metal::MTLComputePipelineState>,
-    >,
-    pack_reverse_gradient_pipeline: objc2::rc::Retained<
-        objc2::runtime::ProtocolObject<dyn objc2_metal::MTLComputePipelineState>,
-    >,
-    pack_filter_pipeline: objc2::rc::Retained<
-        objc2::runtime::ProtocolObject<dyn objc2_metal::MTLComputePipelineState>,
-    >,
-    fft_extract_input_backward_pipeline: objc2::rc::Retained<
-        objc2::runtime::ProtocolObject<dyn objc2_metal::MTLComputePipelineState>,
-    >,
-    fft_extract_pipeline: objc2::rc::Retained<
-        objc2::runtime::ProtocolObject<dyn objc2_metal::MTLComputePipelineState>,
-    >,
-    implicit_filter_pipeline: objc2::rc::Retained<
-        objc2::runtime::ProtocolObject<dyn objc2_metal::MTLComputePipelineState>,
-    >,
-    implicit_filter_fp16_pipeline: objc2::rc::Retained<
-        objc2::runtime::ProtocolObject<dyn objc2_metal::MTLComputePipelineState>,
-    >,
-    tanh_gate_pipeline: objc2::rc::Retained<
-        objc2::runtime::ProtocolObject<dyn objc2_metal::MTLComputePipelineState>,
-    >,
-    tanh_gate_fp16_pipeline: objc2::rc::Retained<
-        objc2::runtime::ProtocolObject<dyn objc2_metal::MTLComputePipelineState>,
-    >,
-    pack_strided_real_pipeline: objc2::rc::Retained<
-        objc2::runtime::ProtocolObject<dyn objc2_metal::MTLComputePipelineState>,
-    >,
-    pack_overlap_save_pipeline: objc2::rc::Retained<
-        objc2::runtime::ProtocolObject<dyn objc2_metal::MTLComputePipelineState>,
-    >,
-    extract_overlap_save_pipeline: objc2::rc::Retained<
-        objc2::runtime::ProtocolObject<dyn objc2_metal::MTLComputePipelineState>,
-    >,
-    apply_gate_pipeline: objc2::rc::Retained<
-        objc2::runtime::ProtocolObject<dyn objc2_metal::MTLComputePipelineState>,
-    >,
-    apply_gate_fp16_pipeline: objc2::rc::Retained<
-        objc2::runtime::ProtocolObject<dyn objc2_metal::MTLComputePipelineState>,
-    >,
-    hyena_gate_backward_pipeline: objc2::rc::Retained<
-        objc2::runtime::ProtocolObject<dyn objc2_metal::MTLComputePipelineState>,
-    >,
-    residual_add_pipeline: objc2::rc::Retained<
-        objc2::runtime::ProtocolObject<dyn objc2_metal::MTLComputePipelineState>,
-    >,
-    residual_add_fp16_pipeline: objc2::rc::Retained<
-        objc2::runtime::ProtocolObject<dyn objc2_metal::MTLComputePipelineState>,
-    >,
-    ternary_buffers: std::cell::RefCell<TernaryBuffers>,
-    fft_buffers: std::cell::RefCell<FftBuffers>,
-    filter_fft_buffers: std::cell::RefCell<FftBuffers>,
-    hyena_output_buffer: std::cell::RefCell<OutputBuffer>,
-    implicit_filter_parameters: std::cell::RefCell<ImplicitFilterParameters>,
-    gate_buffers: std::cell::RefCell<GateBuffers>,
-    activations: std::cell::RefCell<ActivationBuffers>,
-    gradient_activations: std::cell::RefCell<ActivationBuffers>,
-    fp16_activations: std::cell::RefCell<Fp16ActivationBuffers>,
-    resident_tokens: std::cell::RefCell<ResidentTokenBuffers>,
-    streamed_cross_entropy: std::cell::RefCell<StreamedCrossEntropyBuffers>,
-    backward_buffers: std::cell::RefCell<BackwardBuffers>,
-    block_backward_buffers: std::cell::RefCell<BlockBackwardBuffers>,
+    device: Device,
+    queue: Queue,
+    pipelines: Pipelines,
+    scratch: RefCell<Vec<MetalBuffer>>,
 }
 
-/// Which resident activation slot owns the current residual stream.  A block
-/// always writes the next stream to the other slot, preventing accidental
-/// in-place residual aliasing at the Rust API boundary.
-#[cfg(target_os = "macos")]
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum ResidentActivationSlot {
-    First,
-    Second,
-}
-
-/// Which resident slot owns the current reverse-mode gradient. It is separate
-/// from forward activation ping-pong so all block caches remain valid during
-/// the complete reverse traversal.
-#[cfg(target_os = "macos")]
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum ResidentGradientSlot {
-    First,
-    Second,
-    /// A terminal-only scratch slot keeps the second MTP head's source
-    /// derivative disjoint from its destination. It is consumed immediately
-    /// by the Hyena reverse chain and carries no persistent optimizer state.
-    Third,
-}
-
-#[cfg(target_os = "macos")]
-impl ResidentGradientSlot {
-    pub const fn other(self) -> Self {
-        match self {
-            Self::First | Self::Third => Self::Second,
-            Self::Second => Self::First,
-        }
+impl std::fmt::Debug for MetalRuntime {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("MetalRuntime").finish_non_exhaustive()
     }
 }
 
-/// Slot token for the FP16 resident training/inference stream.
-#[cfg(target_os = "macos")]
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum ResidentFp16ActivationSlot {
-    First,
-    Second,
-    Third,
-}
-
-#[cfg(target_os = "macos")]
-impl ResidentFp16ActivationSlot {
-    pub const fn other(self) -> Self {
-        match self {
-            Self::First => Self::Second,
-            Self::Second => Self::Third,
-            Self::Third => Self::First,
-        }
-    }
-}
-
-/// Immutable packed ternary weights retained by Metal across FP16 projection
-/// dispatches. The caller owns this object, making upload lifetime explicit.
-#[cfg(target_os = "macos")]
-pub struct ResidentFp16TernaryWeights {
-    positive: objc2::rc::Retained<objc2::runtime::ProtocolObject<dyn objc2_metal::MTLBuffer>>,
-    negative: objc2::rc::Retained<objc2::runtime::ProtocolObject<dyn objc2_metal::MTLBuffer>>,
-    scales: objc2::rc::Retained<objc2::runtime::ProtocolObject<dyn objc2_metal::MTLBuffer>>,
-    shape: TernaryLinearShape,
-}
-
-/// Persistent FP16 master parameters for a stateless Metal optimizer step.
-///
-/// The object contains parameters only: gradients are transient and the
-/// optimizer retains neither momentum nor variance. It is intentionally
-/// separate from packed ternary inference weights while GPU code-refresh is
-/// brought online.
-#[cfg(target_os = "macos")]
-pub struct ResidentFp16Parameters {
-    parameters: objc2::rc::Retained<objc2::runtime::ProtocolObject<dyn objc2_metal::MTLBuffer>>,
-    len: usize,
-}
-
-/// FP32 view of the tied embedding plus an MPS GEMM plan for terminal logits.
-///
-/// The model master remains FP16. This immutable expansion exists solely so
-/// MPS can execute `[B*T,D] × [V,D]^T` with its optimized FP32 matrix path.
-/// It replaces a much slower hand-written logits kernel and carries no
-/// optimizer state.
-#[cfg(target_os = "macos")]
-pub struct ResidentMpsExpectedEmbedding {
-    embedding: objc2::rc::Retained<objc2::runtime::ProtocolObject<dyn objc2_metal::MTLBuffer>>,
-    gradient: objc2::rc::Retained<objc2::runtime::ProtocolObject<dyn objc2_metal::MTLBuffer>>,
-    accumulator: objc2::rc::Retained<objc2::runtime::ProtocolObject<dyn objc2_metal::MTLBuffer>>,
-    rows: usize,
-    vocab: usize,
-    channels: usize,
-    multiplication: objc2::rc::Retained<objc2_metal_performance_shaders::MPSMatrixMultiplication>,
-    output_gradient_multiplication:
-        objc2::rc::Retained<objc2_metal_performance_shaders::MPSMatrixMultiplication>,
-}
-
-/// Exact streamed cross-entropy result at the explicit CPU graph boundary.
-/// The GPU never materializes per-vocabulary logits or probabilities.
-#[cfg(target_os = "macos")]
-#[derive(Clone, Debug, PartialEq)]
-pub struct MetalStreamedCrossEntropy {
-    pub loss_sum: f32,
-    pub token_count: usize,
-    pub head_gradient: Vec<f32>,
-}
-
-/// Compact loss statistics returned by the all-resident cross-entropy path.
-/// Its `D`-wide derivative remains in a [`ResidentGradientSlot`].
-#[cfg(target_os = "macos")]
-#[derive(Clone, Debug, PartialEq)]
-pub struct MetalResidentCrossEntropy {
-    pub loss_sum: f32,
-    pub token_count: usize,
-    pub gradient_slot: ResidentGradientSlot,
-}
-
-/// Fully resident, trainable ternary projection state.
-///
-/// FP16 masters update in place; Metal then rebuilds scales and packed
-/// bitplanes in the same command submission. No optimizer state is retained.
-#[cfg(target_os = "macos")]
-pub struct ResidentTrainableFp16TernaryWeights {
-    master: ResidentFp16Parameters,
-    positive: objc2::rc::Retained<objc2::runtime::ProtocolObject<dyn objc2_metal::MTLBuffer>>,
-    negative: objc2::rc::Retained<objc2::runtime::ProtocolObject<dyn objc2_metal::MTLBuffer>>,
-    scales: objc2::rc::Retained<objc2::runtime::ProtocolObject<dyn objc2_metal::MTLBuffer>>,
-    in_features: usize,
-    out_features: usize,
-    threshold_ratio: f32,
-}
-
-/// A compact CPU-side snapshot of one resident ternary code plane.
-///
-/// This is an explicit diagnostics boundary, not part of the training path:
-/// it reads only the two packed bitplanes (one bit per parameter each), never
-/// the FP16 master weights or transient activation/gradient workspaces.
-#[cfg(target_os = "macos")]
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct MetalTernaryCodeSnapshot {
-    pub parameters: usize,
-    pub positive: Vec<u64>,
-    pub negative: Vec<u64>,
-}
-
-/// Aggregate code-plane telemetry for one interval between two snapshots.
-#[cfg(target_os = "macos")]
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct MetalTernaryCodeStats {
-    pub parameters: usize,
-    pub positive: usize,
-    pub negative: usize,
-    pub changed: usize,
-}
-
-#[cfg(target_os = "macos")]
-impl MetalTernaryCodeSnapshot {
-    /// Counts signed codes, masking unused tail bits in the final packed word.
-    pub fn stats_against(&self, previous: Option<&Self>) -> MetalTernaryCodeStats {
-        let tail_bits = self.parameters % 64;
-        let tail_mask = if tail_bits == 0 {
-            u64::MAX
-        } else {
-            (1_u64 << tail_bits) - 1
-        };
-        let mut positive = 0;
-        let mut negative = 0;
-        let mut changed = 0;
-        for index in 0..self.positive.len() {
-            let mask = if index + 1 == self.positive.len() {
-                tail_mask
-            } else {
-                u64::MAX
-            };
-            let current_positive = self.positive[index] & mask;
-            let current_negative = self.negative[index] & mask;
-            positive += current_positive.count_ones() as usize;
-            negative += current_negative.count_ones() as usize;
-            if let Some(previous) = previous.filter(|previous| {
-                previous.parameters == self.parameters
-                    && previous.positive.len() == self.positive.len()
-                    && previous.negative.len() == self.negative.len()
-            }) {
-                changed += ((current_positive ^ previous.positive[index])
-                    | (current_negative ^ previous.negative[index]))
-                    .count_ones() as usize;
-            }
-        }
-        MetalTernaryCodeStats {
-            parameters: self.parameters,
-            positive,
-            negative,
-            changed,
-        }
-    }
-}
-
-/// Compact, persistent FP16 state for one implicit Hyena filter. It contains
-/// only the three generator vectors; no optimiser moments are retained.
-#[cfg(target_os = "macos")]
-pub struct ResidentImplicitFilterParameters {
-    freq: ResidentFp16Parameters,
-    phase: ResidentFp16Parameters,
-    decay: ResidentFp16Parameters,
-    channels: usize,
-    order: usize,
-}
-
-/// Immutable frequency-domain Hyena filter retained across training steps.
-/// It is valid only for its exact bounded-convolution plan.
-#[cfg(target_os = "macos")]
-pub struct ResidentFilterSpectrum {
-    buffer: objc2::rc::Retained<objc2::runtime::ProtocolObject<dyn objc2_metal::MTLBuffer>>,
-    channels: usize,
-    time: usize,
-    kernel_len: usize,
-    fft_len: usize,
-}
-
-#[cfg(target_os = "macos")]
-impl ResidentActivationSlot {
-    pub const fn other(self) -> Self {
-        match self {
-            Self::First => Self::Second,
-            Self::Second => Self::First,
-        }
-    }
-}
-
-#[cfg(target_os = "macos")]
-#[derive(Default)]
-struct TernaryBuffers {
-    input: Option<objc2::rc::Retained<objc2::runtime::ProtocolObject<dyn objc2_metal::MTLBuffer>>>,
-    positive:
-        Option<objc2::rc::Retained<objc2::runtime::ProtocolObject<dyn objc2_metal::MTLBuffer>>>,
-    negative:
-        Option<objc2::rc::Retained<objc2::runtime::ProtocolObject<dyn objc2_metal::MTLBuffer>>>,
-    scales: Option<objc2::rc::Retained<objc2::runtime::ProtocolObject<dyn objc2_metal::MTLBuffer>>>,
-    output: Option<objc2::rc::Retained<objc2::runtime::ProtocolObject<dyn objc2_metal::MTLBuffer>>>,
-    input_capacity: usize,
-    packed_capacity: usize,
-    scale_capacity: usize,
-    output_capacity: usize,
-}
-
-#[cfg(target_os = "macos")]
-#[derive(Default)]
-struct FftBuffers {
-    first: Option<objc2::rc::Retained<objc2::runtime::ProtocolObject<dyn objc2_metal::MTLBuffer>>>,
-    second: Option<objc2::rc::Retained<objc2::runtime::ProtocolObject<dyn objc2_metal::MTLBuffer>>>,
-    capacity: usize,
-}
-
-#[cfg(target_os = "macos")]
-#[derive(Default)]
-struct OutputBuffer {
-    buffer: Option<objc2::rc::Retained<objc2::runtime::ProtocolObject<dyn objc2_metal::MTLBuffer>>>,
-    capacity: usize,
-}
-
-#[cfg(target_os = "macos")]
-#[derive(Default)]
-struct ImplicitFilterParameters {
-    freq: Option<objc2::rc::Retained<objc2::runtime::ProtocolObject<dyn objc2_metal::MTLBuffer>>>,
-    phase: Option<objc2::rc::Retained<objc2::runtime::ProtocolObject<dyn objc2_metal::MTLBuffer>>>,
-    decay: Option<objc2::rc::Retained<objc2::runtime::ProtocolObject<dyn objc2_metal::MTLBuffer>>>,
-    capacity: usize,
-}
-
-#[cfg(target_os = "macos")]
-#[derive(Default)]
-struct GateBuffers {
-    input: Option<objc2::rc::Retained<objc2::runtime::ProtocolObject<dyn objc2_metal::MTLBuffer>>>,
-    output: Option<objc2::rc::Retained<objc2::runtime::ProtocolObject<dyn objc2_metal::MTLBuffer>>>,
-    capacity: usize,
-}
-
-#[cfg(target_os = "macos")]
-#[derive(Default)]
-struct ActivationBuffers {
-    first: Option<objc2::rc::Retained<objc2::runtime::ProtocolObject<dyn objc2_metal::MTLBuffer>>>,
-    second: Option<objc2::rc::Retained<objc2::runtime::ProtocolObject<dyn objc2_metal::MTLBuffer>>>,
-    third: Option<objc2::rc::Retained<objc2::runtime::ProtocolObject<dyn objc2_metal::MTLBuffer>>>,
-    capacity: usize,
-}
-
-/// Two FP16 activation buffers ping-ponged across resident operations.
-#[cfg(target_os = "macos")]
-#[derive(Default)]
-struct Fp16ActivationBuffers {
-    first: Option<objc2::rc::Retained<objc2::runtime::ProtocolObject<dyn objc2_metal::MTLBuffer>>>,
-    second: Option<objc2::rc::Retained<objc2::runtime::ProtocolObject<dyn objc2_metal::MTLBuffer>>>,
-    third: Option<objc2::rc::Retained<objc2::runtime::ProtocolObject<dyn objc2_metal::MTLBuffer>>>,
-    capacity: usize,
-}
-
-/// Token IDs for the resident input lookup. Kept distinct from the CE token
-/// workspace because the lookup is issued before the block chain and must not
-/// depend on loss-buffer allocation or lifetime.
-#[cfg(target_os = "macos")]
-#[derive(Default)]
-struct ResidentTokenBuffers {
-    tokens: Option<objc2::rc::Retained<objc2::runtime::ProtocolObject<dyn objc2_metal::MTLBuffer>>>,
-    capacity: usize,
-}
-
-#[cfg(target_os = "macos")]
-#[derive(Default)]
-struct StreamedCrossEntropyBuffers {
-    head: Option<objc2::rc::Retained<objc2::runtime::ProtocolObject<dyn objc2_metal::MTLBuffer>>>,
-    tokens: Option<objc2::rc::Retained<objc2::runtime::ProtocolObject<dyn objc2_metal::MTLBuffer>>>,
-    gradient:
-        Option<objc2::rc::Retained<objc2::runtime::ProtocolObject<dyn objc2_metal::MTLBuffer>>>,
-    loss: Option<objc2::rc::Retained<objc2::runtime::ProtocolObject<dyn objc2_metal::MTLBuffer>>>,
-    logits: Option<objc2::rc::Retained<objc2::runtime::ProtocolObject<dyn objc2_metal::MTLBuffer>>>,
-    head_capacity: usize,
-    tokens_capacity: usize,
-    gradient_capacity: usize,
-    loss_capacity: usize,
-    logits_capacity: usize,
-}
-
-/// Five independent, grow-only FP32 buffers shared by the local backward
-/// reference kernels. They are deliberately named by data-flow role rather
-/// than operation: the same allocation serves ternary, convolution, and
-/// RMSNorm without a per-dispatch Metal allocation.
-#[cfg(target_os = "macos")]
-#[derive(Default)]
-struct BackwardBuffers {
-    source: Option<objc2::rc::Retained<objc2::runtime::ProtocolObject<dyn objc2_metal::MTLBuffer>>>,
-    auxiliary:
-        Option<objc2::rc::Retained<objc2::runtime::ProtocolObject<dyn objc2_metal::MTLBuffer>>>,
-    output_gradient:
-        Option<objc2::rc::Retained<objc2::runtime::ProtocolObject<dyn objc2_metal::MTLBuffer>>>,
-    input_gradient:
-        Option<objc2::rc::Retained<objc2::runtime::ProtocolObject<dyn objc2_metal::MTLBuffer>>>,
-    parameter_gradient:
-        Option<objc2::rc::Retained<objc2::runtime::ProtocolObject<dyn objc2_metal::MTLBuffer>>>,
-    source_capacity: usize,
-    auxiliary_capacity: usize,
-    output_gradient_capacity: usize,
-    input_gradient_capacity: usize,
-    parameter_gradient_capacity: usize,
-}
-
-/// Tensor slots retained for one complete FP32 Hyena block backward pass.
-/// The slots are indexed by the graph encoder rather than exposed as a public
-/// tensor API: this keeps ownership local and makes every capacity grow-only.
-#[cfg(target_os = "macos")]
-#[derive(Default)]
-struct BlockBackwardBuffers {
-    buffers: Vec<objc2::rc::Retained<objc2::runtime::ProtocolObject<dyn objc2_metal::MTLBuffer>>>,
-    capacities: Vec<usize>,
-}
-
-#[cfg(target_os = "macos")]
-#[repr(C)]
-#[derive(Clone, Copy, Default)]
-struct Complex32 {
-    real: f32,
-    imaginary: f32,
-}
-
-#[cfg(target_os = "macos")]
-enum HyenaFilterSource<'a> {
-    Dense(&'a [f32]),
-    Implicit(&'a crate::hyena::ImplicitFilter),
-}
-
-#[cfg(target_os = "macos")]
-enum ResidentImplicitFilterSource<'a> {
-    Host(&'a crate::hyena::ImplicitFilter),
-    Trainable(&'a ResidentImplicitFilterParameters),
-}
-
-#[cfg(target_os = "macos")]
-impl FftBuffers {
-    fn ensure(
-        &mut self,
-        device: &objc2::runtime::ProtocolObject<dyn objc2_metal::MTLDevice>,
-        bytes: usize,
-    ) -> Result<()> {
-        use objc2_metal::{MTLDevice, MTLResourceOptions};
-
-        if self.capacity < bytes {
-            let shared = MTLResourceOptions::StorageModeShared;
-            self.first = Some(
-                device
-                    .newBufferWithLength_options(bytes, shared)
-                    .ok_or_else(|| anyhow::anyhow!("Metal FFT source allocation failed"))?,
-            );
-            self.second = Some(
-                device
-                    .newBufferWithLength_options(bytes, shared)
-                    .ok_or_else(|| anyhow::anyhow!("Metal FFT scratch allocation failed"))?,
-            );
-            self.capacity = bytes;
-        }
-        Ok(())
-    }
-}
-
-#[cfg(target_os = "macos")]
-impl OutputBuffer {
-    fn ensure(
-        &mut self,
-        device: &objc2::runtime::ProtocolObject<dyn objc2_metal::MTLDevice>,
-        bytes: usize,
-    ) -> Result<()> {
-        use objc2_metal::{MTLDevice, MTLResourceOptions};
-
-        if self.capacity < bytes {
-            self.buffer = Some(
-                device
-                    .newBufferWithLength_options(bytes, MTLResourceOptions::StorageModeShared)
-                    .ok_or_else(|| anyhow::anyhow!("Metal Hyena output allocation failed"))?,
-            );
-            self.capacity = bytes;
-        }
-        Ok(())
-    }
-}
-
-#[cfg(target_os = "macos")]
-impl ImplicitFilterParameters {
-    fn ensure(
-        &mut self,
-        device: &objc2::runtime::ProtocolObject<dyn objc2_metal::MTLDevice>,
-        bytes: usize,
-    ) -> Result<()> {
-        use objc2_metal::{MTLDevice, MTLResourceOptions};
-        if self.capacity < bytes {
-            let options = MTLResourceOptions::StorageModeShared;
-            self.freq = Some(
-                device
-                    .newBufferWithLength_options(bytes, options)
-                    .ok_or_else(|| {
-                        anyhow::anyhow!("Metal implicit-filter frequency allocation failed")
-                    })?,
-            );
-            self.phase = Some(
-                device
-                    .newBufferWithLength_options(bytes, options)
-                    .ok_or_else(|| {
-                        anyhow::anyhow!("Metal implicit-filter phase allocation failed")
-                    })?,
-            );
-            self.decay = Some(
-                device
-                    .newBufferWithLength_options(bytes, options)
-                    .ok_or_else(|| {
-                        anyhow::anyhow!("Metal implicit-filter decay allocation failed")
-                    })?,
-            );
-            self.capacity = bytes;
-        }
-        Ok(())
-    }
-}
-
-#[cfg(target_os = "macos")]
-impl GateBuffers {
-    fn ensure(
-        &mut self,
-        device: &objc2::runtime::ProtocolObject<dyn objc2_metal::MTLDevice>,
-        bytes: usize,
-    ) -> Result<()> {
-        use objc2_metal::{MTLDevice, MTLResourceOptions};
-        if self.capacity < bytes {
-            let options = MTLResourceOptions::StorageModeShared;
-            self.input = Some(
-                device
-                    .newBufferWithLength_options(bytes, options)
-                    .ok_or_else(|| anyhow::anyhow!("Metal gate input allocation failed"))?,
-            );
-            self.output = Some(
-                device
-                    .newBufferWithLength_options(bytes, options)
-                    .ok_or_else(|| anyhow::anyhow!("Metal gate output allocation failed"))?,
-            );
-            self.capacity = bytes;
-        }
-        Ok(())
-    }
-}
-
-#[cfg(target_os = "macos")]
-impl ActivationBuffers {
-    fn ensure(
-        &mut self,
-        device: &objc2::runtime::ProtocolObject<dyn objc2_metal::MTLDevice>,
-        bytes: usize,
-    ) -> Result<()> {
-        use objc2_metal::{MTLDevice, MTLResourceOptions};
-        if self.capacity < bytes {
-            let options = MTLResourceOptions::StorageModeShared;
-            self.first = Some(
-                device
-                    .newBufferWithLength_options(bytes, options)
-                    .ok_or_else(|| anyhow::anyhow!("Metal activation buffer allocation failed"))?,
-            );
-            self.second = Some(
-                device
-                    .newBufferWithLength_options(bytes, options)
-                    .ok_or_else(|| anyhow::anyhow!("Metal activation scratch allocation failed"))?,
-            );
-            self.third = Some(
-                device
-                    .newBufferWithLength_options(bytes, options)
-                    .ok_or_else(|| {
-                        anyhow::anyhow!("Metal activation terminal allocation failed")
-                    })?,
-            );
-            self.capacity = bytes;
-        }
-        Ok(())
-    }
-}
-
-#[cfg(target_os = "macos")]
-impl Fp16ActivationBuffers {
-    fn ensure(
-        &mut self,
-        device: &objc2::runtime::ProtocolObject<dyn objc2_metal::MTLDevice>,
-        bytes: usize,
-    ) -> Result<()> {
-        use objc2_metal::{MTLDevice, MTLResourceOptions};
-
-        if self.capacity < bytes {
-            let options = MTLResourceOptions::StorageModeShared;
-            self.first = Some(
-                device
-                    .newBufferWithLength_options(bytes, options)
-                    .ok_or_else(|| anyhow::anyhow!("Metal FP16 activation allocation failed"))?,
-            );
-            self.second = Some(
-                device
-                    .newBufferWithLength_options(bytes, options)
-                    .ok_or_else(|| {
-                        anyhow::anyhow!("Metal FP16 activation scratch allocation failed")
-                    })?,
-            );
-            self.third = Some(
-                device
-                    .newBufferWithLength_options(bytes, options)
-                    .ok_or_else(|| {
-                        anyhow::anyhow!("Metal FP16 activation work allocation failed")
-                    })?,
-            );
-            self.capacity = bytes;
-        }
-        Ok(())
-    }
-
-    fn buffer(
-        &self,
-        slot: ResidentFp16ActivationSlot,
-    ) -> Result<&objc2::runtime::ProtocolObject<dyn objc2_metal::MTLBuffer>> {
-        let buffer = match slot {
-            ResidentFp16ActivationSlot::First => self.first.as_deref(),
-            ResidentFp16ActivationSlot::Second => self.second.as_deref(),
-            ResidentFp16ActivationSlot::Third => self.third.as_deref(),
-        };
-        buffer.ok_or_else(|| anyhow::anyhow!("Metal FP16 activations are not allocated"))
-    }
-}
-
-#[cfg(target_os = "macos")]
-impl StreamedCrossEntropyBuffers {
-    fn ensure(
-        &mut self,
-        device: &objc2::runtime::ProtocolObject<dyn objc2_metal::MTLDevice>,
-        head_bytes: usize,
-        token_bytes: usize,
-        gradient_bytes: usize,
-        loss_bytes: usize,
-        logits_bytes: usize,
-    ) -> Result<()> {
-        use objc2_metal::{MTLDevice, MTLResourceOptions};
-        let shared = MTLResourceOptions::StorageModeShared;
-        let grow = |slot: &mut Option<_>, capacity: &mut usize, bytes, name| -> Result<()> {
-            if *capacity < bytes {
-                *slot = Some(
-                    device
-                        .newBufferWithLength_options(bytes, shared)
-                        .ok_or_else(|| {
-                            anyhow::anyhow!("Metal streamed cross-entropy {name} allocation failed")
-                        })?,
-                );
-                *capacity = bytes;
-            }
-            Ok(())
-        };
-        grow(&mut self.head, &mut self.head_capacity, head_bytes, "head")?;
-        grow(
-            &mut self.tokens,
-            &mut self.tokens_capacity,
-            token_bytes,
-            "tokens",
-        )?;
-        grow(
-            &mut self.gradient,
-            &mut self.gradient_capacity,
-            gradient_bytes,
-            "gradient",
-        )?;
-        grow(&mut self.loss, &mut self.loss_capacity, loss_bytes, "loss")?;
-        grow(
-            &mut self.logits,
-            &mut self.logits_capacity,
-            logits_bytes,
-            "logits",
-        )
-    }
-}
-
-#[cfg(target_os = "macos")]
-impl ResidentTokenBuffers {
-    fn ensure(
-        &mut self,
-        device: &objc2::runtime::ProtocolObject<dyn objc2_metal::MTLDevice>,
-        bytes: usize,
-    ) -> Result<()> {
-        use objc2_metal::{MTLDevice, MTLResourceOptions};
-
-        if self.capacity < bytes {
-            self.tokens = Some(
-                device
-                    .newBufferWithLength_options(bytes, MTLResourceOptions::StorageModeShared)
-                    .ok_or_else(|| anyhow::anyhow!("Metal resident token allocation failed"))?,
-            );
-            self.capacity = bytes;
-        }
-        Ok(())
-    }
-}
-
-#[cfg(target_os = "macos")]
-impl BackwardBuffers {
-    fn ensure(
-        &mut self,
-        device: &objc2::runtime::ProtocolObject<dyn objc2_metal::MTLDevice>,
-        source_bytes: usize,
-        auxiliary_bytes: usize,
-        output_gradient_bytes: usize,
-        input_gradient_bytes: usize,
-        parameter_gradient_bytes: usize,
-    ) -> Result<()> {
-        use objc2_metal::{MTLDevice, MTLResourceOptions};
-
-        let shared = MTLResourceOptions::StorageModeShared;
-        if self.source_capacity < source_bytes {
-            self.source = Some(
-                device
-                    .newBufferWithLength_options(source_bytes, shared)
-                    .ok_or_else(|| anyhow::anyhow!("Metal backward source allocation failed"))?,
-            );
-            self.source_capacity = source_bytes;
-        }
-        if self.auxiliary_capacity < auxiliary_bytes {
-            self.auxiliary = Some(
-                device
-                    .newBufferWithLength_options(auxiliary_bytes, shared)
-                    .ok_or_else(|| anyhow::anyhow!("Metal backward auxiliary allocation failed"))?,
-            );
-            self.auxiliary_capacity = auxiliary_bytes;
-        }
-        if self.output_gradient_capacity < output_gradient_bytes {
-            self.output_gradient = Some(
-                device
-                    .newBufferWithLength_options(output_gradient_bytes, shared)
-                    .ok_or_else(|| {
-                        anyhow::anyhow!("Metal backward output-gradient allocation failed")
-                    })?,
-            );
-            self.output_gradient_capacity = output_gradient_bytes;
-        }
-        if self.input_gradient_capacity < input_gradient_bytes {
-            self.input_gradient = Some(
-                device
-                    .newBufferWithLength_options(input_gradient_bytes, shared)
-                    .ok_or_else(|| {
-                        anyhow::anyhow!("Metal backward input-gradient allocation failed")
-                    })?,
-            );
-            self.input_gradient_capacity = input_gradient_bytes;
-        }
-        if self.parameter_gradient_capacity < parameter_gradient_bytes {
-            self.parameter_gradient = Some(
-                device
-                    .newBufferWithLength_options(parameter_gradient_bytes, shared)
-                    .ok_or_else(|| {
-                        anyhow::anyhow!("Metal backward parameter-gradient allocation failed")
-                    })?,
-            );
-            self.parameter_gradient_capacity = parameter_gradient_bytes;
-        }
-        Ok(())
-    }
-}
-
-#[cfg(target_os = "macos")]
-impl BlockBackwardBuffers {
-    fn ensure(
-        &mut self,
-        device: &objc2::runtime::ProtocolObject<dyn objc2_metal::MTLDevice>,
-        byte_requirements: &[usize],
-    ) -> Result<()> {
-        use objc2_metal::{MTLDevice, MTLResourceOptions};
-
-        let shared = MTLResourceOptions::StorageModeShared;
-        for (index, &bytes) in byte_requirements.iter().enumerate() {
-            if self.capacities.get(index).copied().unwrap_or_default() < bytes {
-                let buffer = device
-                    .newBufferWithLength_options(bytes, shared)
-                    .ok_or_else(|| {
-                        anyhow::anyhow!("Metal block-backward slot {index} allocation failed")
-                    })?;
-                if index == self.buffers.len() {
-                    self.buffers.push(buffer);
-                    self.capacities.push(bytes);
-                } else {
-                    self.buffers[index] = buffer;
-                    self.capacities[index] = bytes;
-                }
-            }
-        }
-        Ok(())
-    }
-
-    fn buffer(
-        &self,
-        index: usize,
-    ) -> Result<&objc2::runtime::ProtocolObject<dyn objc2_metal::MTLBuffer>> {
-        self.buffers
-            .get(index)
-            .map(objc2::rc::Retained::as_ref)
-            .ok_or_else(|| anyhow::anyhow!("Metal block-backward slot {index} is not allocated"))
-    }
-}
-
-#[cfg(target_os = "macos")]
-impl TernaryBuffers {
-    fn ensure(
-        &mut self,
-        device: &objc2::runtime::ProtocolObject<dyn objc2_metal::MTLDevice>,
-        input_bytes: usize,
-        packed_bytes: usize,
-        scale_bytes: usize,
-        output_bytes: usize,
-    ) -> Result<()> {
-        use objc2_metal::{MTLDevice, MTLResourceOptions};
-
-        let shared = MTLResourceOptions::StorageModeShared;
-        if self.input_capacity < input_bytes {
-            self.input = Some(
-                device
-                    .newBufferWithLength_options(input_bytes, shared)
-                    .ok_or_else(|| anyhow::anyhow!("Metal input buffer allocation failed"))?,
-            );
-            self.input_capacity = input_bytes;
-        }
-        if self.packed_capacity < packed_bytes {
-            self.positive = Some(
-                device
-                    .newBufferWithLength_options(packed_bytes, shared)
-                    .ok_or_else(|| anyhow::anyhow!("Metal positive bitplane allocation failed"))?,
-            );
-            self.negative = Some(
-                device
-                    .newBufferWithLength_options(packed_bytes, shared)
-                    .ok_or_else(|| anyhow::anyhow!("Metal negative bitplane allocation failed"))?,
-            );
-            self.packed_capacity = packed_bytes;
-        }
-        if self.scale_capacity < scale_bytes {
-            self.scales = Some(
-                device
-                    .newBufferWithLength_options(scale_bytes, shared)
-                    .ok_or_else(|| anyhow::anyhow!("Metal scale buffer allocation failed"))?,
-            );
-            self.scale_capacity = scale_bytes;
-        }
-        if self.output_capacity < output_bytes {
-            self.output = Some(
-                device
-                    .newBufferWithLength_options(output_bytes, shared)
-                    .ok_or_else(|| anyhow::anyhow!("Metal output buffer allocation failed"))?,
-            );
-            self.output_capacity = output_bytes;
-        }
-        Ok(())
-    }
-}
-
-#[cfg(target_os = "macos")]
 impl MetalRuntime {
-    /// Establishes an explicit host-visible boundary after queued resident
-    /// work. Training uses this only before checkpoint readback.
+    pub fn new() -> Result<Self> {
+        use objc2_foundation::NSString;
+        use objc2_metal::{MTLCreateSystemDefaultDevice, MTLDevice};
+
+        let device = MTLCreateSystemDefaultDevice()
+            .ok_or_else(|| anyhow::anyhow!("Metal device is unavailable"))?;
+        let source = NSString::from_str(RWKV8_METAL_SOURCE);
+        let options = compile_options();
+        let library = device
+            .newLibraryWithSource_options_error(&source, Some(&options))
+            .map_err(|error| anyhow::anyhow!("Metal shader compilation failed: {error}"))?;
+        let pipelines = Pipelines {
+            identity: pipeline_from_library(&device, &library, IDENTITY_KERNEL_NAME)?,
+            layer_norm: pipeline_from_library(&device, &library, LAYER_NORM_KERNEL_NAME)?,
+            layer_norm_backward: pipeline_from_library(
+                &device,
+                &library,
+                LAYER_NORM_BACKWARD_KERNEL_NAME,
+            )?,
+            layer_norm_param_bwd: pipeline_from_library(
+                &device,
+                &library,
+                LAYER_NORM_PARAM_BWD_KERNEL_NAME,
+            )?,
+            time_shift_delta: pipeline_from_library(
+                &device,
+                &library,
+                TIME_SHIFT_DELTA_KERNEL_NAME,
+            )?,
+            time_shift_mix: pipeline_from_library(&device, &library, TIME_SHIFT_MIX_KERNEL_NAME)?,
+            time_shift_mix3: pipeline_from_library(&device, &library, TIME_SHIFT_MIX3_KERNEL_NAME)?,
+            binary_linear: pipeline_from_library(&device, &library, BINARY_LINEAR_KERNEL_NAME)?,
+            binary_linear_input_bwd: pipeline_from_library(
+                &device,
+                &library,
+                BINARY_LINEAR_INPUT_BWD_KERNEL_NAME,
+            )?,
+            binary_linear_scale_bwd: pipeline_from_library(
+                &device,
+                &library,
+                BINARY_LINEAR_SCALE_BWD_KERNEL_NAME,
+            )?,
+            binary_linear_weight_bwd: pipeline_from_library(
+                &device,
+                &library,
+                BINARY_LINEAR_WEIGHT_BWD_KERNEL_NAME,
+            )?,
+            binary_linear_scale_bwd_from_output: pipeline_from_library(
+                &device,
+                &library,
+                BINARY_LINEAR_SCALE_BWD_FROM_OUTPUT_KERNEL_NAME,
+            )?,
+            binary_linear_latent_sgd: pipeline_from_library(
+                &device,
+                &library,
+                BINARY_LINEAR_LATENT_SGD_KERNEL_NAME,
+            )?,
+            fp16_linear: pipeline_from_library(&device, &library, FP16_LINEAR_KERNEL_NAME)?,
+            fp16_linear_bwd: pipeline_from_library(&device, &library, FP16_LINEAR_BWD_KERNEL_NAME)?,
+            sign_pack_bits: pipeline_from_library(&device, &library, SIGN_PACK_BITS_KERNEL_NAME)?,
+            pack_latent_bits: pipeline_from_library(
+                &device,
+                &library,
+                PACK_LATENT_BITS_KERNEL_NAME,
+            )?,
+            rosa_sam_reset: pipeline_from_library(&device, &library, ROSA_SAM_RESET_KERNEL_NAME)?,
+            rosa_qkv_1bit_fwd: pipeline_from_library(
+                &device,
+                &library,
+                ROSA_QKV_1BIT_FWD_KERNEL_NAME,
+            )?,
+            rosa_qkv_1bit_bwd_e: pipeline_from_library(
+                &device,
+                &library,
+                ROSA_QKV_1BIT_BWD_E_KERNEL_NAME,
+            )?,
+            cmix_relu2: pipeline_from_library(&device, &library, CMIX_RELU2_KERNEL_NAME)?,
+            cmix_relu2_backward: pipeline_from_library(
+                &device,
+                &library,
+                CMIX_RELU2_BACKWARD_KERNEL_NAME,
+            )?,
+            residual_add: pipeline_from_library(&device, &library, RESIDUAL_ADD_KERNEL_NAME)?,
+            streamed_cross_entropy_fp16: pipeline_from_library(
+                &device,
+                &library,
+                STREAMED_CROSS_ENTROPY_FP16_KERNEL_NAME,
+            )?,
+            softmax_cross_entropy: pipeline_from_library(
+                &device,
+                &library,
+                SOFTMAX_CROSS_ENTROPY_KERNEL_NAME,
+            )?,
+            clipped_sgd_fp16: pipeline_from_library(
+                &device,
+                &library,
+                CLIPPED_SGD_FP16_KERNEL_NAME,
+            )?,
+            wkv7_forward: pipeline_from_library(&device, &library, WKV7_FORWARD_KERNEL_NAME)?,
+            wkv7_backward: pipeline_from_library(&device, &library, WKV7_BACKWARD_KERNEL_NAME)?,
+        };
+        let queue = device
+            .newCommandQueue()
+            .ok_or_else(|| anyhow::anyhow!("Metal command queue is unavailable"))?;
+        Ok(Self {
+            device,
+            queue,
+            pipelines,
+            scratch: RefCell::new(Vec::new()),
+        })
+    }
+
     pub fn synchronize(&self) -> Result<()> {
         use objc2_metal::{MTLCommandBuffer, MTLCommandQueue};
 
@@ -1473,6586 +526,100 @@ impl MetalRuntime {
         Ok(())
     }
 
-    /// Compiles the ternary pipeline once and creates its command queue.
-    pub fn new() -> Result<Self> {
-        use objc2_foundation::NSString;
-        use objc2_metal::{MTLCompileOptions, MTLCreateSystemDefaultDevice, MTLDevice, MTLLibrary};
-
-        let device = MTLCreateSystemDefaultDevice()
-            .ok_or_else(|| anyhow::anyhow!("Metal device is unavailable"))?;
-        let source = NSString::from_str(HYENA_METAL_SOURCE);
-        let options = MTLCompileOptions::new();
-        let library = device
-            .newLibraryWithSource_options_error(&source, Some(&options))
-            .map_err(|error| anyhow::anyhow!("Metal shader compilation failed: {error}"))?;
-        let identity_name = NSString::from_str(IDENTITY_KERNEL_NAME);
-        let identity_function = library
-            .newFunctionWithName(&identity_name)
-            .ok_or_else(|| anyhow::anyhow!("Metal identity function is missing"))?;
-        let identity_pipeline = device
-            .newComputePipelineStateWithFunction_error(&identity_function)
-            .map_err(|error| anyhow::anyhow!("Metal identity pipeline failed: {error}"))?;
-        let clipped_sgd_fp16_name = NSString::from_str(CLIPPED_SGD_FP16_KERNEL_NAME);
-        let clipped_sgd_fp16_function = library
-            .newFunctionWithName(&clipped_sgd_fp16_name)
-            .ok_or_else(|| anyhow::anyhow!("Metal FP16 SGD function is missing"))?;
-        let clipped_sgd_fp16_pipeline = device
-            .newComputePipelineStateWithFunction_error(&clipped_sgd_fp16_function)
-            .map_err(|error| anyhow::anyhow!("Metal FP16 SGD pipeline failed: {error}"))?;
-        let embedding_lookup_fp16_name = NSString::from_str(EMBEDDING_LOOKUP_FP16_KERNEL_NAME);
-        let embedding_lookup_fp16_function = library
-            .newFunctionWithName(&embedding_lookup_fp16_name)
-            .ok_or_else(|| anyhow::anyhow!("Metal FP16 embedding lookup function is missing"))?;
-        let embedding_lookup_fp16_pipeline = device
-            .newComputePipelineStateWithFunction_error(&embedding_lookup_fp16_function)
-            .map_err(|error| {
-                anyhow::anyhow!("Metal FP16 embedding lookup pipeline failed: {error}")
-            })?;
-        let target_embedding_gradient_fp16_name =
-            NSString::from_str(TARGET_EMBEDDING_GRADIENT_FP16_KERNEL_NAME);
-        let target_embedding_gradient_fp16_function = library
-            .newFunctionWithName(&target_embedding_gradient_fp16_name)
-            .ok_or_else(|| {
-                anyhow::anyhow!("Metal target embedding-gradient function is missing")
-            })?;
-        let target_embedding_gradient_fp16_pipeline = device
-            .newComputePipelineStateWithFunction_error(&target_embedding_gradient_fp16_function)
-            .map_err(|error| {
-                anyhow::anyhow!("Metal target embedding-gradient pipeline failed: {error}")
-            })?;
-        let input_embedding_gradient_name =
-            NSString::from_str(INPUT_EMBEDDING_GRADIENT_KERNEL_NAME);
-        let input_embedding_gradient_function = library
-            .newFunctionWithName(&input_embedding_gradient_name)
-            .ok_or_else(|| anyhow::anyhow!("Metal input embedding-gradient function is missing"))?;
-        let input_embedding_gradient_pipeline = device
-            .newComputePipelineStateWithFunction_error(&input_embedding_gradient_function)
-            .map_err(|error| {
-                anyhow::anyhow!("Metal input embedding-gradient pipeline failed: {error}")
-            })?;
-        let scale_fp32_name = NSString::from_str(SCALE_FP32_KERNEL_NAME);
-        let scale_fp32_function = library
-            .newFunctionWithName(&scale_fp32_name)
-            .ok_or_else(|| anyhow::anyhow!("Metal FP32 scale function is missing"))?;
-        let scale_fp32_pipeline = device
-            .newComputePipelineStateWithFunction_error(&scale_fp32_function)
-            .map_err(|error| anyhow::anyhow!("Metal FP32 scale pipeline failed: {error}"))?;
-        let add_fp32_name = NSString::from_str(ADD_FP32_KERNEL_NAME);
-        let add_fp32_function = library
-            .newFunctionWithName(&add_fp32_name)
-            .ok_or_else(|| anyhow::anyhow!("Metal FP32 add function is missing"))?;
-        let add_fp32_pipeline = device
-            .newComputePipelineStateWithFunction_error(&add_fp32_function)
-            .map_err(|error| anyhow::anyhow!("Metal FP32 add pipeline failed: {error}"))?;
-        let fp16_to_fp32_name = NSString::from_str(FP16_TO_FP32_KERNEL_NAME);
-        let fp16_to_fp32_function = library
-            .newFunctionWithName(&fp16_to_fp32_name)
-            .ok_or_else(|| anyhow::anyhow!("Metal FP16-to-FP32 function is missing"))?;
-        let fp16_to_fp32_pipeline = device
-            .newComputePipelineStateWithFunction_error(&fp16_to_fp32_function)
-            .map_err(|error| anyhow::anyhow!("Metal FP16-to-FP32 pipeline failed: {error}"))?;
-        let streamed_cross_entropy_name =
-            NSString::from_str(STREAMED_CROSS_ENTROPY_FP16_KERNEL_NAME);
-        let streamed_cross_entropy_function = library
-            .newFunctionWithName(&streamed_cross_entropy_name)
-            .ok_or_else(|| anyhow::anyhow!("Metal streamed cross-entropy function is missing"))?;
-        let streamed_cross_entropy_fp16_pipeline = device
-            .newComputePipelineStateWithFunction_error(&streamed_cross_entropy_function)
-            .map_err(|error| {
-                anyhow::anyhow!("Metal streamed cross-entropy pipeline failed: {error}")
-            })?;
-        let tied_logits_name = NSString::from_str(TIED_LOGITS_FP16_KERNEL_NAME);
-        let tied_logits_function = library
-            .newFunctionWithName(&tied_logits_name)
-            .ok_or_else(|| anyhow::anyhow!("Metal tied-logits function is missing"))?;
-        let tied_logits_fp16_pipeline = device
-            .newComputePipelineStateWithFunction_error(&tied_logits_function)
-            .map_err(|error| anyhow::anyhow!("Metal tied-logits pipeline failed: {error}"))?;
-        let cross_entropy_logits_name = NSString::from_str(CROSS_ENTROPY_LOGITS_FP16_KERNEL_NAME);
-        let cross_entropy_logits_function = library
-            .newFunctionWithName(&cross_entropy_logits_name)
-            .ok_or_else(|| anyhow::anyhow!("Metal logits cross-entropy function is missing"))?;
-        let cross_entropy_logits_fp16_pipeline = device
-            .newComputePipelineStateWithFunction_error(&cross_entropy_logits_function)
-            .map_err(|error| {
-                anyhow::anyhow!("Metal logits cross-entropy pipeline failed: {error}")
-            })?;
-        let softmax_logits_name = NSString::from_str(SOFTMAX_LOGITS_FP16_KERNEL_NAME);
-        let softmax_logits_function = library
-            .newFunctionWithName(&softmax_logits_name)
-            .ok_or_else(|| anyhow::anyhow!("Metal softmax-logits function is missing"))?;
-        let softmax_logits_fp16_pipeline = device
-            .newComputePipelineStateWithFunction_error(&softmax_logits_function)
-            .map_err(|error| anyhow::anyhow!("Metal softmax-logits pipeline failed: {error}"))?;
-        let finalize_cross_entropy_gradient_name =
-            NSString::from_str(FINALIZE_CROSS_ENTROPY_GRADIENT_FP16_KERNEL_NAME);
-        let finalize_cross_entropy_gradient_function = library
-            .newFunctionWithName(&finalize_cross_entropy_gradient_name)
-            .ok_or_else(|| anyhow::anyhow!("Metal final CE-gradient function is missing"))?;
-        let finalize_cross_entropy_gradient_fp16_pipeline = device
-            .newComputePipelineStateWithFunction_error(&finalize_cross_entropy_gradient_function)
-            .map_err(|error| anyhow::anyhow!("Metal final CE-gradient pipeline failed: {error}"))?;
-        let rms_name = NSString::from_str(RMS_NORM_KERNEL_NAME);
-        let rms_function = library
-            .newFunctionWithName(&rms_name)
-            .ok_or_else(|| anyhow::anyhow!("Metal RMSNorm function is missing"))?;
-        let rms_norm_pipeline = device
-            .newComputePipelineStateWithFunction_error(&rms_function)
-            .map_err(|error| anyhow::anyhow!("Metal RMSNorm pipeline failed: {error}"))?;
-        let name = NSString::from_str(TERNARY_LINEAR_KERNEL_NAME);
-        let function = library
-            .newFunctionWithName(&name)
-            .ok_or_else(|| anyhow::anyhow!("Metal ternary function is missing"))?;
-        let ternary_pipeline = device
-            .newComputePipelineStateWithFunction_error(&function)
-            .map_err(|error| anyhow::anyhow!("Metal pipeline creation failed: {error}"))?;
-        let fp16_name = NSString::from_str(TERNARY_LINEAR_FP16_KERNEL_NAME);
-        let fp16_function = library
-            .newFunctionWithName(&fp16_name)
-            .ok_or_else(|| anyhow::anyhow!("Metal FP16 ternary function is missing"))?;
-        let ternary_fp16_pipeline = device
-            .newComputePipelineStateWithFunction_error(&fp16_function)
-            .map_err(|error| {
-                anyhow::anyhow!("Metal FP16 ternary pipeline creation failed: {error}")
-            })?;
-        let input_backward_name = NSString::from_str(TERNARY_INPUT_BACKWARD_KERNEL_NAME);
-        let input_backward_function = library
-            .newFunctionWithName(&input_backward_name)
-            .ok_or_else(|| anyhow::anyhow!("Metal ternary input-backward function is missing"))?;
-        let ternary_input_backward_pipeline = device
-            .newComputePipelineStateWithFunction_error(&input_backward_function)
-            .map_err(|error| {
-                anyhow::anyhow!("Metal ternary input-backward pipeline failed: {error}")
-            })?;
-        let tiled_weight_backward_name =
-            NSString::from_str(TERNARY_STE_WEIGHT_BACKWARD_TILED_KERNEL_NAME);
-        let tiled_weight_backward_function = library
-            .newFunctionWithName(&tiled_weight_backward_name)
-            .ok_or_else(|| {
-                anyhow::anyhow!("Metal tiled ternary weight-backward function is missing")
-            })?;
-        let ternary_ste_weight_backward_tiled_pipeline = device
-            .newComputePipelineStateWithFunction_error(&tiled_weight_backward_function)
-            .map_err(|error| {
-                anyhow::anyhow!("Metal tiled ternary weight-backward pipeline failed: {error}")
-            })?;
-        let causal_input_backward_name = NSString::from_str(CAUSAL_CONV_INPUT_BACKWARD_KERNEL_NAME);
-        let causal_input_backward_function = library
-            .newFunctionWithName(&causal_input_backward_name)
-            .ok_or_else(|| anyhow::anyhow!("Metal causal input-backward function is missing"))?;
-        let causal_conv_input_backward_pipeline = device
-            .newComputePipelineStateWithFunction_error(&causal_input_backward_function)
-            .map_err(|error| {
-                anyhow::anyhow!("Metal causal input-backward pipeline failed: {error}")
-            })?;
-        let causal_filter_backward_name =
-            NSString::from_str(CAUSAL_CONV_FILTER_BACKWARD_KERNEL_NAME);
-        let causal_filter_backward_function = library
-            .newFunctionWithName(&causal_filter_backward_name)
-            .ok_or_else(|| anyhow::anyhow!("Metal causal filter-backward function is missing"))?;
-        let causal_conv_filter_backward_pipeline = device
-            .newComputePipelineStateWithFunction_error(&causal_filter_backward_function)
-            .map_err(|error| {
-                anyhow::anyhow!("Metal causal filter-backward pipeline failed: {error}")
-            })?;
-        let extract_projection_signal_name =
-            NSString::from_str(EXTRACT_PROJECTION_SIGNAL_KERNEL_NAME);
-        let extract_projection_signal_function = library
-            .newFunctionWithName(&extract_projection_signal_name)
-            .ok_or_else(|| anyhow::anyhow!("Metal signal-extract function is missing"))?;
-        let extract_projection_signal_pipeline = device
-            .newComputePipelineStateWithFunction_error(&extract_projection_signal_function)
-            .map_err(|error| anyhow::anyhow!("Metal signal-extract pipeline failed: {error}"))?;
-        let add_projection_signal_gradient_name =
-            NSString::from_str(ADD_PROJECTION_SIGNAL_GRADIENT_KERNEL_NAME);
-        let add_projection_signal_gradient_function = library
-            .newFunctionWithName(&add_projection_signal_gradient_name)
-            .ok_or_else(|| anyhow::anyhow!("Metal projection-gradient-add function is missing"))?;
-        let add_projection_signal_gradient_pipeline = device
-            .newComputePipelineStateWithFunction_error(&add_projection_signal_gradient_function)
-            .map_err(|error| {
-                anyhow::anyhow!("Metal projection-gradient-add pipeline failed: {error}")
-            })?;
-        let rms_backward_name = NSString::from_str(RMS_NORM_BACKWARD_KERNEL_NAME);
-        let rms_backward_function = library
-            .newFunctionWithName(&rms_backward_name)
-            .ok_or_else(|| anyhow::anyhow!("Metal RMSNorm backward function is missing"))?;
-        let rms_norm_backward_pipeline = device
-            .newComputePipelineStateWithFunction_error(&rms_backward_function)
-            .map_err(|error| anyhow::anyhow!("Metal RMSNorm backward pipeline failed: {error}"))?;
-        let fused_name = NSString::from_str(RMS_NORM_TERNARY_LINEAR_KERNEL_NAME);
-        let fused_function = library
-            .newFunctionWithName(&fused_name)
-            .ok_or_else(|| anyhow::anyhow!("Metal fused ternary function is missing"))?;
-        let fused_rms_norm_ternary_pipeline = device
-            .newComputePipelineStateWithFunction_error(&fused_function)
-            .map_err(|error| anyhow::anyhow!("Metal fused pipeline creation failed: {error}"))?;
-        let bitreverse_name = NSString::from_str(FFT_BITREVERSE_KERNEL_NAME);
-        let bitreverse_function = library
-            .newFunctionWithName(&bitreverse_name)
-            .ok_or_else(|| anyhow::anyhow!("Metal FFT bitreverse function is missing"))?;
-        let fft_bitreverse_pipeline = device
-            .newComputePipelineStateWithFunction_error(&bitreverse_function)
-            .map_err(|error| {
-                anyhow::anyhow!("Metal FFT bitreverse pipeline creation failed: {error}")
-            })?;
-        let stage_name = NSString::from_str(FFT_STAGE_KERNEL_NAME);
-        let stage_function = library
-            .newFunctionWithName(&stage_name)
-            .ok_or_else(|| anyhow::anyhow!("Metal FFT stage function is missing"))?;
-        let fft_stage_pipeline = device
-            .newComputePipelineStateWithFunction_error(&stage_function)
-            .map_err(|error| {
-                anyhow::anyhow!("Metal FFT stage pipeline creation failed: {error}")
-            })?;
-        let fft_threadgroup_name = NSString::from_str(FFT_THREADGROUP_4096_KERNEL_NAME);
-        let fft_threadgroup_function = library
-            .newFunctionWithName(&fft_threadgroup_name)
-            .ok_or_else(|| anyhow::anyhow!("Metal threadgroup FFT function is missing"))?;
-        let fft_threadgroup_4096_pipeline = device
-            .newComputePipelineStateWithFunction_error(&fft_threadgroup_function)
-            .map_err(|error| anyhow::anyhow!("Metal threadgroup FFT pipeline failed: {error}"))?;
-        let multiply_name = NSString::from_str(FFT_COMPLEX_MULTIPLY_KERNEL_NAME);
-        let multiply_function = library
-            .newFunctionWithName(&multiply_name)
-            .ok_or_else(|| anyhow::anyhow!("Metal FFT multiply function is missing"))?;
-        let fft_multiply_pipeline = device
-            .newComputePipelineStateWithFunction_error(&multiply_function)
-            .map_err(|error| {
-                anyhow::anyhow!("Metal FFT multiply pipeline creation failed: {error}")
-            })?;
-        let extract_name = NSString::from_str(FFT_EXTRACT_CAUSAL_KERNEL_NAME);
-        let extract_function = library
-            .newFunctionWithName(&extract_name)
-            .ok_or_else(|| anyhow::anyhow!("Metal FFT extract function is missing"))?;
-        let fft_extract_pipeline = device
-            .newComputePipelineStateWithFunction_error(&extract_function)
-            .map_err(|error| {
-                anyhow::anyhow!("Metal FFT extract pipeline creation failed: {error}")
-            })?;
-        let implicit_name = NSString::from_str(IMPLICIT_FILTER_KERNEL_NAME);
-        let implicit_function = library
-            .newFunctionWithName(&implicit_name)
-            .ok_or_else(|| anyhow::anyhow!("Metal implicit-filter function is missing"))?;
-        let implicit_filter_pipeline = device
-            .newComputePipelineStateWithFunction_error(&implicit_function)
-            .map_err(|error| {
-                anyhow::anyhow!("Metal implicit-filter pipeline creation failed: {error}")
-            })?;
-        let implicit_fp16_name = NSString::from_str(IMPLICIT_FILTER_FP16_KERNEL_NAME);
-        let implicit_fp16_function = library
-            .newFunctionWithName(&implicit_fp16_name)
-            .ok_or_else(|| anyhow::anyhow!("Metal FP16 implicit-filter function is missing"))?;
-        let implicit_filter_fp16_pipeline = device
-            .newComputePipelineStateWithFunction_error(&implicit_fp16_function)
-            .map_err(|error| {
-                anyhow::anyhow!("Metal FP16 implicit-filter pipeline creation failed: {error}")
-            })?;
-        let gate_name = NSString::from_str(TANH_GATE_KERNEL_NAME);
-        let gate_function = library
-            .newFunctionWithName(&gate_name)
-            .ok_or_else(|| anyhow::anyhow!("Metal tanh-gate function is missing"))?;
-        let tanh_gate_pipeline = device
-            .newComputePipelineStateWithFunction_error(&gate_function)
-            .map_err(|error| {
-                anyhow::anyhow!("Metal tanh-gate pipeline creation failed: {error}")
-            })?;
-        let fp16_gate_name = NSString::from_str(TANH_GATE_FP16_KERNEL_NAME);
-        let fp16_gate_function = library
-            .newFunctionWithName(&fp16_gate_name)
-            .ok_or_else(|| anyhow::anyhow!("Metal FP16 tanh-gate function is missing"))?;
-        let tanh_gate_fp16_pipeline = device
-            .newComputePipelineStateWithFunction_error(&fp16_gate_function)
-            .map_err(|error| {
-                anyhow::anyhow!("Metal FP16 tanh-gate pipeline creation failed: {error}")
-            })?;
-        let make_pipeline = |kernel_name: &str| -> Result<_> {
-            let name = NSString::from_str(kernel_name);
-            let function = library
-                .newFunctionWithName(&name)
-                .ok_or_else(|| anyhow::anyhow!("Metal function {kernel_name} is missing"))?;
-            device
-                .newComputePipelineStateWithFunction_error(&function)
-                .map_err(|error| {
-                    anyhow::anyhow!("Metal pipeline {kernel_name} creation failed: {error}")
-                })
-        };
-        let ternary_row_scales_fp16_pipeline = make_pipeline(TERNARY_ROW_SCALES_FP16_KERNEL_NAME)?;
-        let refresh_ternary_codes_fp16_pipeline =
-            make_pipeline(REFRESH_TERNARY_CODES_FP16_KERNEL_NAME)?;
-        let pack_strided_real_pipeline = make_pipeline(PACK_STRIDED_REAL_KERNEL_NAME)?;
-        let pack_reverse_gradient_pipeline = make_pipeline(PACK_REVERSE_GRADIENT_KERNEL_NAME)?;
-        let pack_filter_pipeline = make_pipeline(PACK_FILTER_KERNEL_NAME)?;
-        let fft_extract_input_backward_pipeline =
-            make_pipeline(FFT_EXTRACT_INPUT_BACKWARD_KERNEL_NAME)?;
-        let pack_overlap_save_pipeline = make_pipeline(PACK_OVERLAP_SAVE_KERNEL_NAME)?;
-        let extract_overlap_save_pipeline = make_pipeline(EXTRACT_OVERLAP_SAVE_KERNEL_NAME)?;
-        let apply_gate_pipeline = make_pipeline(APPLY_GATE_KERNEL_NAME)?;
-        let apply_gate_fp16_pipeline = make_pipeline(APPLY_GATE_FP16_KERNEL_NAME)?;
-        let hyena_gate_backward_pipeline = make_pipeline(HYENA_GATE_BACKWARD_KERNEL_NAME)?;
-        let residual_add_pipeline = make_pipeline(RESIDUAL_ADD_KERNEL_NAME)?;
-        let residual_add_fp16_pipeline = make_pipeline(RESIDUAL_ADD_FP16_KERNEL_NAME)?;
-        let queue = device
-            .newCommandQueue()
-            .ok_or_else(|| anyhow::anyhow!("Metal command queue is unavailable"))?;
-        Ok(Self {
-            device,
-            queue,
-            identity_pipeline,
-            clipped_sgd_fp16_pipeline,
-            embedding_lookup_fp16_pipeline,
-            target_embedding_gradient_fp16_pipeline,
-            input_embedding_gradient_pipeline,
-            scale_fp32_pipeline,
-            add_fp32_pipeline,
-            fp16_to_fp32_pipeline,
-            streamed_cross_entropy_fp16_pipeline,
-            tied_logits_fp16_pipeline,
-            cross_entropy_logits_fp16_pipeline,
-            softmax_logits_fp16_pipeline,
-            finalize_cross_entropy_gradient_fp16_pipeline,
-            ternary_row_scales_fp16_pipeline,
-            refresh_ternary_codes_fp16_pipeline,
-            rms_norm_pipeline,
-            ternary_pipeline,
-            ternary_fp16_pipeline,
-            ternary_input_backward_pipeline,
-            ternary_ste_weight_backward_tiled_pipeline,
-            causal_conv_input_backward_pipeline,
-            causal_conv_filter_backward_pipeline,
-            extract_projection_signal_pipeline,
-            add_projection_signal_gradient_pipeline,
-            rms_norm_backward_pipeline,
-            fused_rms_norm_ternary_pipeline,
-            fft_bitreverse_pipeline,
-            fft_stage_pipeline,
-            fft_threadgroup_4096_pipeline,
-            fft_multiply_pipeline,
-            pack_reverse_gradient_pipeline,
-            pack_filter_pipeline,
-            fft_extract_input_backward_pipeline,
-            fft_extract_pipeline,
-            implicit_filter_pipeline,
-            implicit_filter_fp16_pipeline,
-            tanh_gate_pipeline,
-            tanh_gate_fp16_pipeline,
-            pack_strided_real_pipeline,
-            pack_overlap_save_pipeline,
-            extract_overlap_save_pipeline,
-            apply_gate_pipeline,
-            apply_gate_fp16_pipeline,
-            hyena_gate_backward_pipeline,
-            residual_add_pipeline,
-            residual_add_fp16_pipeline,
-            ternary_buffers: std::cell::RefCell::new(TernaryBuffers::default()),
-            fft_buffers: std::cell::RefCell::new(FftBuffers::default()),
-            filter_fft_buffers: std::cell::RefCell::new(FftBuffers::default()),
-            hyena_output_buffer: std::cell::RefCell::new(OutputBuffer::default()),
-            implicit_filter_parameters: std::cell::RefCell::new(ImplicitFilterParameters::default()),
-            gate_buffers: std::cell::RefCell::new(GateBuffers::default()),
-            activations: std::cell::RefCell::new(ActivationBuffers::default()),
-            gradient_activations: std::cell::RefCell::new(ActivationBuffers::default()),
-            fp16_activations: std::cell::RefCell::new(Fp16ActivationBuffers::default()),
-            resident_tokens: std::cell::RefCell::new(ResidentTokenBuffers::default()),
-            streamed_cross_entropy: std::cell::RefCell::new(StreamedCrossEntropyBuffers::default()),
-            backward_buffers: std::cell::RefCell::new(BackwardBuffers::default()),
-            block_backward_buffers: std::cell::RefCell::new(BlockBackwardBuffers::default()),
-        })
-    }
-
-    /// Reserves the two resident activation slots used to ping-pong residual
-    /// state between Hyena blocks. Allocation is grow-only and checked.
-    pub fn reserve_activations(&self, rows: usize, width: usize) -> Result<()> {
-        if rows == 0 || width == 0 {
-            bail!("Metal activation dimensions must be non-zero");
-        }
-        let bytes = rows
-            .checked_mul(width)
-            .and_then(|n| n.checked_mul(size_of::<f32>()))
-            .ok_or_else(|| anyhow::anyhow!("Metal activation size overflow"))?;
-        self.activations.borrow_mut().ensure(&self.device, bytes)
-    }
-
-    /// Reserves the independent FP32 reverse-mode ping-pong pair.
-    pub fn reserve_gradients(&self, rows: usize, width: usize) -> Result<()> {
-        if rows == 0 || width == 0 {
-            bail!("Metal gradient dimensions must be non-zero");
-        }
-        let bytes = rows
-            .checked_mul(width)
-            .and_then(|n| n.checked_mul(size_of::<f32>()))
-            .ok_or_else(|| anyhow::anyhow!("Metal gradient size overflow"))?;
-        self.gradient_activations
-            .borrow_mut()
-            .ensure(&self.device, bytes)
-    }
-
-    /// Reserves two FP16 resident activation slots. The slots are deliberately
-    /// independent from the legacy FP32 inference buffers.
-    pub fn reserve_fp16_activations(&self, rows: usize, width: usize) -> Result<()> {
-        if rows == 0 || width == 0 {
-            bail!("Metal FP16 activation dimensions must be non-zero");
-        }
-        let bytes = rows
-            .checked_mul(width)
-            .and_then(|elements| elements.checked_mul(size_of::<u16>()))
-            .ok_or_else(|| anyhow::anyhow!("Metal FP16 activation size overflow"))?;
-        self.fp16_activations
-            .borrow_mut()
-            .ensure(&self.device, bytes)
-    }
-
-    /// Reserves the complete FP32 cache and gradient set needed by one Hyena
-    /// block backward graph. No allocation occurs while the graph is encoded
-    /// when this is called at the training-shape boundary.
-    pub fn reserve_block_backward(
-        &self,
-        rows: usize,
-        channels: usize,
-        kernel_len: usize,
-    ) -> Result<()> {
-        if rows == 0 || channels == 0 || kernel_len == 0 {
-            bail!("Metal block-backward dimensions must be non-zero");
-        }
-        let activation = rows
-            .checked_mul(channels)
-            .and_then(|elements| elements.checked_mul(size_of::<f32>()))
-            .ok_or_else(|| anyhow::anyhow!("Metal block-backward activation overflow"))?;
-        let projection = activation
-            .checked_mul(2)
-            .ok_or_else(|| anyhow::anyhow!("Metal block-backward projection overflow"))?;
-        let filter = channels
-            .checked_mul(kernel_len)
-            .and_then(|elements| elements.checked_mul(size_of::<f32>()))
-            .ok_or_else(|| anyhow::anyhow!("Metal block-backward filter overflow"))?;
-        // input, normalized, gated projection, mixed, upstream, gated mixed,
-        // output-projection gradient, gate gradient, signal, signal gradient,
-        // normalized-input gradient, final input gradient, and three parameter
-        // gradients (output projection, input projection, filter), followed
-        // by the materialized bounded filter used by the direct reference
-        // adjoint.
-        let mut buffers = self.block_backward_buffers.borrow_mut();
-        buffers.ensure(
-            &self.device,
-            &[
-                activation,
-                activation,
-                projection,
-                activation,
-                activation,
-                activation,
-                activation,
-                projection,
-                activation,
-                activation,
-                activation,
-                activation,
-                channels
-                    .checked_mul(channels)
-                    .and_then(|elements| elements.checked_mul(size_of::<f32>()))
-                    .ok_or_else(|| anyhow::anyhow!("Metal output-weight gradient overflow"))?,
-                channels
-                    .checked_mul(channels)
-                    .and_then(|elements| elements.checked_mul(2))
-                    .and_then(|elements| elements.checked_mul(size_of::<f32>()))
-                    .ok_or_else(|| anyhow::anyhow!("Metal input-weight gradient overflow"))?,
-                filter,
-                filter,
-            ],
-        )?;
-        // Check that the first graph slot is immediately addressable; all
-        // remaining slots were allocated by the same checked requirements.
-        let _ = buffers.buffer(0)?;
-        Ok(())
-    }
-
-    /// Allocates the retained forward tape for one block.  This happens once
-    /// per live training microbatch; all capture dispatches merely write these
-    /// buffers, so subsequent blocks cannot invalidate earlier caches.
-    pub fn new_hyena_block_cache(
-        &self,
-        rows: usize,
-        channels: usize,
-    ) -> Result<ResidentHyenaBlockCache> {
+    fn alloc_shared(&self, bytes: usize) -> Result<MetalBuffer> {
         use objc2_metal::{MTLDevice, MTLResourceOptions};
 
-        if rows == 0 || channels == 0 {
-            bail!("Metal Hyena cache dimensions must be non-zero");
+        if bytes == 0 {
+            bail!("Metal buffer length must be positive");
         }
-        let activation_bytes = rows
-            .checked_mul(channels)
-            .and_then(|elements| elements.checked_mul(size_of::<f32>()))
-            .ok_or_else(|| anyhow::anyhow!("Metal Hyena cache activation overflow"))?;
-        let projection_bytes = activation_bytes
-            .checked_mul(2)
-            .ok_or_else(|| anyhow::anyhow!("Metal Hyena cache projection overflow"))?;
-        let shared = MTLResourceOptions::StorageModeShared;
-        let allocate = |bytes, name: &str| {
-            self.device
-                .newBufferWithLength_options(bytes, shared)
-                .ok_or_else(|| anyhow::anyhow!("Metal Hyena cache {name} allocation failed"))
-        };
-        Ok(ResidentHyenaBlockCache {
-            input: allocate(activation_bytes, "input")?,
-            normalized_input: allocate(activation_bytes, "normalized input")?,
-            gated_projection: allocate(projection_bytes, "gated projection")?,
-            mixed: allocate(activation_bytes, "mixed")?,
-            rows,
-            channels,
-        })
-    }
-
-    /// Encodes the complete exact-reference backward graph for one cached
-    /// Hyena block. The public compatibility boundary uploads and downloads
-    /// gradients once; stack training should use
-    /// [`Self::hyena_block_backward_cached_from_resident_gradient`] to keep
-    /// inter-block gradients on Metal.
-    #[allow(unsafe_code)]
-    pub fn hyena_block_backward_cached_reference(
-        &self,
-        cache: &ResidentHyenaBlockCache,
-        upstream: &[f32],
-        input_positive: &[u64],
-        input_negative: &[u64],
-        input_scales: &[f32],
-        output_positive: &[u64],
-        output_negative: &[u64],
-        output_scales: &[f32],
-        filter: &[f32],
-        batch: usize,
-        time: usize,
-        plan: HyenaChunkPlan,
-    ) -> Result<MetalHyenaBlockBackward> {
-        let rows = batch
-            .checked_mul(time)
-            .ok_or_else(|| anyhow::anyhow!("Metal block backward row overflow"))?;
-        let upstream_slot = self.upload_resident_gradient(upstream, rows, cache.channels)?;
-        self.hyena_block_backward_cached_from_resident_gradient(
-            cache,
-            upstream_slot,
-            upstream_slot.other(),
-            input_positive,
-            input_negative,
-            input_scales,
-            output_positive,
-            output_negative,
-            output_scales,
-            filter,
-            batch,
-            time,
-            plan,
-        )
-    }
-
-    /// Encodes one cached Hyena block backward pass with resident gradient
-    /// ping-pong. `upstream_slot` is consumed as GPU input and the residual
-    /// predecessor is written to `destination_slot`; no host gradient is used
-    /// to feed the preceding block. Parameter gradients remain explicit CPU
-    /// readbacks for the reference updater.
-    #[allow(unsafe_code)]
-    pub fn hyena_block_backward_cached_from_resident_gradient(
-        &self,
-        cache: &ResidentHyenaBlockCache,
-        upstream_slot: ResidentGradientSlot,
-        destination_slot: ResidentGradientSlot,
-        input_positive: &[u64],
-        input_negative: &[u64],
-        input_scales: &[f32],
-        output_positive: &[u64],
-        output_negative: &[u64],
-        output_scales: &[f32],
-        filter: &[f32],
-        batch: usize,
-        time: usize,
-        plan: HyenaChunkPlan,
-    ) -> Result<MetalHyenaBlockBackward> {
-        match self.hyena_block_backward_cached_impl(
-            cache,
-            upstream_slot,
-            destination_slot,
-            input_positive,
-            input_negative,
-            input_scales,
-            output_positive,
-            output_negative,
-            output_scales,
-            filter,
-            batch,
-            time,
-            plan,
-            None,
-            true,
-            true,
-            None,
-        )? {
-            CachedBlockBackwardResult::Reference(result) => Ok(result),
-            CachedBlockBackwardResult::Updated(_) => {
-                unreachable!("reference backward has no updates")
-            }
-        }
-    }
-
-    /// Runs cached block backward and applies its two ternary projection
-    /// gradients directly to resident FP16 masters.  Derived row scales and
-    /// packed codes are rebuilt in the same second command buffer, so neither
-    /// projection gradient is copied back to the CPU.
-    #[allow(unsafe_code)]
-    pub fn hyena_block_backward_cached_and_update_resident(
-        &self,
-        cache: &ResidentHyenaBlockCache,
-        upstream_slot: ResidentGradientSlot,
-        destination_slot: ResidentGradientSlot,
-        input_positive: &[u64],
-        input_negative: &[u64],
-        input_scales: &[f32],
-        output_positive: &[u64],
-        output_negative: &[u64],
-        output_scales: &[f32],
-        input_weights: &ResidentTrainableFp16TernaryWeights,
-        output_weights: &ResidentTrainableFp16TernaryWeights,
-        filter: &[f32],
-        batch: usize,
-        time: usize,
-        plan: HyenaChunkPlan,
-        learning_rate: f32,
-        compute_filter_gradient: bool,
-        readback: bool,
-    ) -> Result<MetalHyenaBlockUpdatedBackward> {
-        match self.hyena_block_backward_cached_impl(
-            cache,
-            upstream_slot,
-            destination_slot,
-            input_positive,
-            input_negative,
-            input_scales,
-            output_positive,
-            output_negative,
-            output_scales,
-            filter,
-            batch,
-            time,
-            plan,
-            Some(ResidentTernaryUpdates {
-                input: input_weights,
-                output: output_weights,
-                learning_rate,
-            }),
-            compute_filter_gradient,
-            readback,
-            None,
-        )? {
-            CachedBlockBackwardResult::Updated(result) => Ok(result),
-            CachedBlockBackwardResult::Reference(_) => unreachable!("resident update requested"),
-        }
-    }
-
-    /// Frozen-filter variant which reuses the resident adjoint spectrum.
-    #[allow(unsafe_code)]
-    pub fn hyena_block_backward_cached_and_update_resident_frozen(
-        &self,
-        cache: &ResidentHyenaBlockCache,
-        upstream_slot: ResidentGradientSlot,
-        destination_slot: ResidentGradientSlot,
-        input_weights: &ResidentTrainableFp16TernaryWeights,
-        output_weights: &ResidentTrainableFp16TernaryWeights,
-        batch: usize,
-        time: usize,
-        plan: HyenaChunkPlan,
-        learning_rate: f32,
-        spectrum: &ResidentFilterSpectrum,
-    ) -> Result<MetalHyenaBlockUpdatedBackward> {
-        match self.hyena_block_backward_cached_impl(
-            cache,
-            upstream_slot,
-            destination_slot,
-            &[],
-            &[],
-            &[],
-            &[],
-            &[],
-            &[],
-            &[],
-            batch,
-            time,
-            plan,
-            Some(ResidentTernaryUpdates {
-                input: input_weights,
-                output: output_weights,
-                learning_rate,
-            }),
-            false,
-            false,
-            Some(spectrum),
-        )? {
-            CachedBlockBackwardResult::Updated(result) => Ok(result),
-            CachedBlockBackwardResult::Reference(_) => unreachable!("resident update requested"),
-        }
-    }
-
-    #[allow(unsafe_code)]
-    fn hyena_block_backward_cached_impl(
-        &self,
-        cache: &ResidentHyenaBlockCache,
-        upstream_slot: ResidentGradientSlot,
-        destination_slot: ResidentGradientSlot,
-        input_positive: &[u64],
-        input_negative: &[u64],
-        input_scales: &[f32],
-        output_positive: &[u64],
-        output_negative: &[u64],
-        output_scales: &[f32],
-        filter: &[f32],
-        batch: usize,
-        time: usize,
-        plan: HyenaChunkPlan,
-        updates: Option<ResidentTernaryUpdates<'_>>,
-        compute_filter_gradient: bool,
-        readback: bool,
-        static_spectrum: Option<&ResidentFilterSpectrum>,
-    ) -> Result<CachedBlockBackwardResult> {
-        use objc2_metal::{
-            MTLBuffer, MTLCommandBuffer, MTLCommandEncoder, MTLCommandQueue,
-            MTLComputePipelineState,
-        };
-
-        let plan = plan.for_sequence(time)?;
-        let rows = batch
-            .checked_mul(time)
-            .ok_or_else(|| anyhow::anyhow!("Metal block backward row overflow"))?;
-        let channels = cache.channels;
-        let elements = rows
-            .checked_mul(channels)
-            .ok_or_else(|| anyhow::anyhow!("Metal block backward activation overflow"))?;
-        let projected = elements
-            .checked_mul(2)
-            .ok_or_else(|| anyhow::anyhow!("Metal block backward projection overflow"))?;
-        let filter_elements = channels
-            .checked_mul(plan.kernel_len)
-            .ok_or_else(|| anyhow::anyhow!("Metal block backward filter overflow"))?;
-        let input_shape = TernaryLinearShape::new(rows, channels, 2 * channels)?;
-        let output_shape = TernaryLinearShape::new(rows, channels, channels)?;
-        let host_weights = updates.is_none();
-        if cache.rows != rows
-            || (static_spectrum.is_none() && filter.len() != filter_elements)
-            || (host_weights
-                && (input_positive.len() != input_shape.packed_words()?
-                    || input_negative.len() != input_positive.len()
-                    || input_scales.len() != 2 * channels
-                    || output_positive.len() != output_shape.packed_words()?
-                    || output_negative.len() != output_positive.len()
-                    || output_scales.len() != channels))
-            || (static_spectrum.is_none() && filter.iter().any(|value| !value.is_finite()))
-        {
-            bail!("Metal cached block backward shape/value mismatch");
-        }
-        if let Some(spectrum) = static_spectrum
-            && (spectrum.channels != channels
-                || spectrum.time != time
-                || spectrum.kernel_len != plan.kernel_len
-                || spectrum.fft_len != HyenaFftPlan::new(time)?.fft_len)
-        {
-            bail!("Metal cached block backward filter spectrum shape mismatch");
-        }
-        if let Some(updates) = updates
-            && (!updates.learning_rate.is_finite()
-                || updates.learning_rate <= 0.0
-                || updates.input.in_features != channels
-                || updates.input.out_features != 2 * channels
-                || updates.output.in_features != channels
-                || updates.output.out_features != channels)
-        {
-            bail!("Metal cached block resident update shape/value mismatch");
-        }
-        self.reserve_gradients(rows, channels)?;
-        self.reserve_block_backward(rows, channels, plan.kernel_len)?;
-        // The adjoint of a causal convolution is a convolution of the
-        // time-reversed output gradient with the original filter. Keep that
-        // transform resident and reuse the grow-only forward FFT scratch.
-        let fft_plan = HyenaFftPlan::new(time)?;
-        let transforms = batch
-            .checked_mul(channels)
-            .ok_or_else(|| anyhow::anyhow!("Metal block backward transform overflow"))?;
-        let signal_fft_elements = transforms
-            .checked_mul(fft_plan.fft_len)
-            .ok_or_else(|| anyhow::anyhow!("Metal block backward signal FFT overflow"))?;
-        let filter_fft_elements = channels
-            .checked_mul(fft_plan.fft_len)
-            .ok_or_else(|| anyhow::anyhow!("Metal block backward filter FFT overflow"))?;
-        let signal_fft_bytes = signal_fft_elements
-            .checked_mul(size_of::<Complex32>())
-            .ok_or_else(|| anyhow::anyhow!("Metal block backward signal FFT size overflow"))?;
-        let filter_fft_bytes = filter_fft_elements
-            .checked_mul(size_of::<Complex32>())
-            .ok_or_else(|| anyhow::anyhow!("Metal block backward filter FFT size overflow"))?;
-        self.fft_buffers
-            .borrow_mut()
-            .ensure(&self.device, signal_fft_bytes)?;
-        self.filter_fft_buffers
-            .borrow_mut()
-            .ensure(&self.device, filter_fft_bytes)?;
-        let input_packed_bytes = input_positive
-            .len()
-            .checked_mul(size_of::<u64>())
-            .ok_or_else(|| anyhow::anyhow!("Metal block backward input code overflow"))?;
-        let output_packed_bytes = output_positive
-            .len()
-            .checked_mul(size_of::<u64>())
-            .ok_or_else(|| anyhow::anyhow!("Metal block backward output code overflow"))?;
-        let packed_bytes = input_packed_bytes.max(output_packed_bytes);
-        let scale_bytes = size_of_val(input_scales).max(size_of_val(output_scales));
-        let mut ternary = self.ternary_buffers.borrow_mut();
-        ternary.ensure(&self.device, 0, packed_bytes, scale_bytes, 0)?;
-        let positive = ternary.positive.as_ref();
-        let negative = ternary.negative.as_ref();
-        let scales = ternary.scales.as_ref();
-        let buffers = self.block_backward_buffers.borrow();
-        let upstream_buffer = buffers.buffer(4)?;
-        let gated_mixed = buffers.buffer(5)?;
-        let output_input_gradient = buffers.buffer(6)?;
-        let projection_gradient = buffers.buffer(7)?;
-        let signal = buffers.buffer(8)?;
-        let signal_gradient = buffers.buffer(9)?;
-        let normalized_gradient = buffers.buffer(10)?;
-        let input_gradient = buffers.buffer(11)?;
-        let output_weight_gradient = buffers.buffer(12)?;
-        let input_weight_gradient = buffers.buffer(13)?;
-        let filter_gradient = buffers.buffer(14)?;
-        let filter_buffer = buffers.buffer(15)?;
-        let gradients = self.gradient_activations.borrow();
-        let resident_upstream = match upstream_slot {
-            ResidentGradientSlot::First => gradients.first.as_ref(),
-            ResidentGradientSlot::Second => gradients.second.as_ref(),
-            ResidentGradientSlot::Third => gradients.third.as_ref(),
-        }
-        .expect("checked Metal resident gradient source");
-        let resident_destination = match destination_slot {
-            ResidentGradientSlot::First => gradients.first.as_ref(),
-            ResidentGradientSlot::Second => gradients.second.as_ref(),
-            ResidentGradientSlot::Third => gradients.third.as_ref(),
-        }
-        .expect("checked Metal resident gradient destination");
-        if std::ptr::eq(resident_upstream, resident_destination) {
-            bail!("Metal cached block backward gradient slots must differ");
-        }
-        // SAFETY: validated exact-size shared buffers are written before the
-        // command begins, and immutable filter values are uploaded once.
-        if static_spectrum.is_none() {
-            unsafe {
-                filter_buffer
-                    .contents()
-                    .cast::<f32>()
-                    .as_ptr()
-                    .copy_from_nonoverlapping(filter.as_ptr(), filter_elements);
-            }
-        }
-        let rows_u32 = u32::try_from(rows).map_err(|_| anyhow::anyhow!("Metal rows exceed u32"))?;
-        let channels_u32 =
-            u32::try_from(channels).map_err(|_| anyhow::anyhow!("Metal channels exceed u32"))?;
-        let elements_u32 =
-            u32::try_from(elements).map_err(|_| anyhow::anyhow!("Metal elements exceed u32"))?;
-        let kernel_u32 = u32::try_from(plan.kernel_len)
-            .map_err(|_| anyhow::anyhow!("Metal kernel length exceeds u32"))?;
-        let batch_u32 =
-            u32::try_from(batch).map_err(|_| anyhow::anyhow!("Metal batch exceeds u32"))?;
-        let time_u32 =
-            u32::try_from(time).map_err(|_| anyhow::anyhow!("Metal time exceeds u32"))?;
-        let fft_len_u32 = u32::try_from(fft_plan.fft_len)
-            .map_err(|_| anyhow::anyhow!("Metal backward FFT length exceeds u32"))?;
-        let transforms_u32 = u32::try_from(transforms)
-            .map_err(|_| anyhow::anyhow!("Metal backward transform count exceeds u32"))?;
-        let signal_fft_elements_u32 = u32::try_from(signal_fft_elements)
-            .map_err(|_| anyhow::anyhow!("Metal backward FFT elements exceed u32"))?;
-        let filter_fft_elements_u32 = u32::try_from(filter_fft_elements)
-            .map_err(|_| anyhow::anyhow!("Metal backward filter FFT elements exceed u32"))?;
-        let signal_fft = self.fft_buffers.borrow();
-        let filter_fft = self.filter_fft_buffers.borrow();
-        let signal_first = signal_fft
-            .first
-            .as_ref()
-            .expect("checked Metal backward signal FFT buffer");
-        let signal_second = signal_fft
-            .second
-            .as_ref()
-            .expect("checked Metal backward signal FFT scratch buffer");
-        let filter_first = filter_fft
-            .first
-            .as_ref()
-            .expect("checked Metal backward filter FFT buffer");
-        let filter_second = filter_fft
-            .second
-            .as_ref()
-            .expect("checked Metal backward filter FFT scratch buffer");
-        let command = self
-            .queue
-            .commandBuffer()
-            .ok_or_else(|| anyhow::anyhow!("Metal command buffer allocation failed"))?;
-        let encoder = command
-            .computeCommandEncoder()
-            .ok_or_else(|| anyhow::anyhow!("Metal compute encoder allocation failed"))?;
-        self.encode_identity(
-            encoder.as_ref(),
-            resident_upstream,
-            upstream_buffer,
-            elements,
-        )?;
-        self.encode_apply_gate(
-            encoder.as_ref(),
-            &cache.mixed,
-            &cache.gated_projection,
-            gated_mixed,
-            channels_u32,
-            channels_u32 * 2,
-            channels_u32,
-            elements_u32,
-        )?;
-        let (output_positive_buffer, output_negative_buffer, output_scale_buffer) =
-            if let Some(updates) = updates {
-                (
-                    &*updates.output.positive,
-                    &*updates.output.negative,
-                    &*updates.output.scales,
-                )
-            } else {
-                let positive = positive.expect("checked Metal positive codes");
-                let negative = negative.expect("checked Metal negative codes");
-                let scales = scales.expect("checked Metal scales");
-                // SAFETY: immutable host codes fit the checked shared buffers.
-                unsafe {
-                    positive
-                        .contents()
-                        .cast::<u64>()
-                        .as_ptr()
-                        .copy_from_nonoverlapping(output_positive.as_ptr(), output_positive.len());
-                    negative
-                        .contents()
-                        .cast::<u64>()
-                        .as_ptr()
-                        .copy_from_nonoverlapping(output_negative.as_ptr(), output_negative.len());
-                    scales
-                        .contents()
-                        .cast::<f32>()
-                        .as_ptr()
-                        .copy_from_nonoverlapping(output_scales.as_ptr(), output_scales.len());
-                }
-                (&**positive, &**negative, &**scales)
-            };
-        self.encode_tiled_ternary_ste_weight_backward(
-            encoder.as_ref(),
-            gated_mixed,
-            upstream_buffer,
-            output_scale_buffer,
-            output_weight_gradient,
-            rows_u32,
-            channels_u32,
-            channels_u32,
-        )?;
-        self.encode_elementwise_buffers(
-            encoder.as_ref(),
-            &self.ternary_input_backward_pipeline,
-            &[
-                upstream_buffer,
-                output_positive_buffer,
-                output_negative_buffer,
-                output_scale_buffer,
-                output_input_gradient,
-            ],
-            &[rows_u32, channels_u32, channels_u32],
-            elements,
-        )?;
-        self.encode_hyena_gate_backward(
-            encoder.as_ref(),
-            &cache.mixed,
-            &cache.gated_projection,
-            output_input_gradient,
-            signal_gradient,
-            projection_gradient,
-            channels_u32,
-            elements_u32,
-        )?;
-        self.encode_elementwise_buffers(
-            encoder.as_ref(),
-            &self.extract_projection_signal_pipeline,
-            &[&cache.gated_projection, signal],
-            &[channels_u32, elements_u32],
-            elements,
-        )?;
-        self.encode_elementwise_buffers(
-            encoder.as_ref(),
-            &self.pack_reverse_gradient_pipeline,
-            &[signal_gradient, signal_first],
-            &[time_u32, channels_u32, fft_len_u32, signal_fft_elements_u32],
-            signal_fft_elements,
-        )?;
-        if static_spectrum.is_none() {
-            self.encode_elementwise_buffers(
-                encoder.as_ref(),
-                &self.pack_filter_pipeline,
-                &[filter_buffer, filter_first],
-                &[
-                    channels_u32,
-                    kernel_u32,
-                    fft_len_u32,
-                    filter_fft_elements_u32,
-                ],
-                filter_fft_elements,
-            )?;
-        }
-        let dispatch_two = |pipeline: &objc2::runtime::ProtocolObject<
-            dyn MTLComputePipelineState,
-        >,
-                            input,
-                            output,
-                            total,
-                            scalars: &[u32]| {
-            self.encode_fft_two_buffer(encoder.as_ref(), pipeline, input, output, total, scalars)
-        };
-        let run_fft = |first, second, transform_count, total, inverse| -> Result<bool> {
-            if fft_plan.fft_len <= 4096 {
-                self.encode_fft_threadgroup_4096(
-                    encoder.as_ref(),
-                    first,
-                    second,
-                    fft_len_u32,
-                    transform_count,
-                    inverse,
-                )?;
-                return Ok(false);
-            }
-            dispatch_two(
-                &self.fft_bitreverse_pipeline,
-                first,
-                second,
-                total,
-                &[fft_len_u32, transform_count],
-            )?;
-            let mut source_is_first = false;
-            for stage in 1..=fft_plan.stages {
-                let (source, destination) = if source_is_first {
-                    (first, second)
-                } else {
-                    (second, first)
-                };
-                dispatch_two(
-                    &self.fft_stage_pipeline,
-                    source,
-                    destination,
-                    total,
-                    &[fft_len_u32, transform_count, stage, u32::from(inverse)],
-                )?;
-                source_is_first = !source_is_first;
-            }
-            Ok(source_is_first)
-        };
-        let signal_source_is_first = run_fft(
-            signal_first,
-            signal_second,
-            transforms_u32,
-            signal_fft_elements,
-            false,
-        )?;
-        let filter_source_is_first = if static_spectrum.is_none() {
-            Some(run_fft(
-                filter_first,
-                filter_second,
-                channels_u32,
-                filter_fft_elements,
-                false,
-            )?)
-        } else {
-            None
-        };
-        let signal_spectrum = if signal_source_is_first {
-            signal_first
-        } else {
-            signal_second
-        };
-        let filter_spectrum = if let Some(spectrum) = static_spectrum {
-            &*spectrum.buffer
-        } else if filter_source_is_first.expect("dynamic filter FFT is present") {
-            filter_first
-        } else {
-            filter_second
-        };
-        let product_is_first = !signal_source_is_first;
-        let product = if product_is_first {
-            signal_first
-        } else {
-            signal_second
-        };
-        self.encode_fft_multiply(
-            encoder.as_ref(),
-            signal_spectrum,
-            filter_spectrum,
-            product,
-            fft_len_u32,
-            channels_u32,
-            transforms_u32,
-            signal_fft_elements,
-        )?;
-        let inverse_bitreversed_is_first = !product_is_first;
-        let inverse_bitreversed = if inverse_bitreversed_is_first {
-            signal_first
-        } else {
-            signal_second
-        };
-        dispatch_two(
-            &self.fft_bitreverse_pipeline,
-            product,
-            inverse_bitreversed,
-            signal_fft_elements,
-            &[fft_len_u32, transforms_u32],
-        )?;
-        let mut inverse_source_is_first = inverse_bitreversed_is_first;
-        for stage in 1..=fft_plan.stages {
-            let (source, destination) = if inverse_source_is_first {
-                (signal_first, signal_second)
-            } else {
-                (signal_second, signal_first)
-            };
-            dispatch_two(
-                &self.fft_stage_pipeline,
-                source,
-                destination,
-                signal_fft_elements,
-                &[fft_len_u32, transforms_u32, stage, 1],
-            )?;
-            inverse_source_is_first = !inverse_source_is_first;
-        }
-        let inverse = if inverse_source_is_first {
-            signal_first
-        } else {
-            signal_second
-        };
-        self.encode_elementwise_buffers(
-            encoder.as_ref(),
-            &self.fft_extract_input_backward_pipeline,
-            &[inverse, normalized_gradient],
-            &[time_u32, channels_u32, fft_len_u32, elements_u32],
-            elements,
-        )?;
-        if compute_filter_gradient {
-            self.encode_elementwise_buffers(
-                encoder.as_ref(),
-                &self.causal_conv_filter_backward_pipeline,
-                &[signal, signal_gradient, filter_gradient],
-                &[batch_u32, time_u32, channels_u32, kernel_u32],
-                filter_elements,
-            )?;
-        }
-        self.encode_elementwise_buffers(
-            encoder.as_ref(),
-            &self.add_projection_signal_gradient_pipeline,
-            &[projection_gradient, normalized_gradient],
-            &[channels_u32, elements_u32],
-            projected,
-        )?;
-        encoder.endEncoding();
-        command.commit();
-        if readback {
-            command.waitUntilCompleted();
-            if let Some(error) = command.error() {
-                bail!("Metal cached block backward first command failed: {error}");
-            }
-        }
-        let (input_positive_buffer, input_negative_buffer, input_scale_buffer) =
-            if let Some(updates) = updates {
-                (
-                    &*updates.input.positive,
-                    &*updates.input.negative,
-                    &*updates.input.scales,
-                )
-            } else {
-                let positive = positive.expect("checked Metal positive codes");
-                let negative = negative.expect("checked Metal negative codes");
-                let scales = scales.expect("checked Metal scales");
-                // SAFETY: immutable host codes fit the checked shared buffers.
-                unsafe {
-                    positive
-                        .contents()
-                        .cast::<u64>()
-                        .as_ptr()
-                        .copy_from_nonoverlapping(input_positive.as_ptr(), input_positive.len());
-                    negative
-                        .contents()
-                        .cast::<u64>()
-                        .as_ptr()
-                        .copy_from_nonoverlapping(input_negative.as_ptr(), input_negative.len());
-                    scales
-                        .contents()
-                        .cast::<f32>()
-                        .as_ptr()
-                        .copy_from_nonoverlapping(input_scales.as_ptr(), input_scales.len());
-                }
-                (&**positive, &**negative, &**scales)
-            };
-        let command = self
-            .queue
-            .commandBuffer()
-            .ok_or_else(|| anyhow::anyhow!("Metal command buffer allocation failed"))?;
-        let encoder = command
-            .computeCommandEncoder()
-            .ok_or_else(|| anyhow::anyhow!("Metal compute encoder allocation failed"))?;
-        self.encode_tiled_ternary_ste_weight_backward(
-            encoder.as_ref(),
-            &cache.normalized_input,
-            projection_gradient,
-            input_scale_buffer,
-            input_weight_gradient,
-            rows_u32,
-            channels_u32,
-            channels_u32 * 2,
-        )?;
-        self.encode_elementwise_buffers(
-            encoder.as_ref(),
-            &self.ternary_input_backward_pipeline,
-            &[
-                projection_gradient,
-                input_positive_buffer,
-                input_negative_buffer,
-                input_scale_buffer,
-                normalized_gradient,
-            ],
-            &[rows_u32, channels_u32, channels_u32 * 2],
-            elements,
-        )?;
-        self.encode_elementwise_buffers(
-            encoder.as_ref(),
-            &self.rms_norm_backward_pipeline,
-            &[
-                &cache.input,
-                &cache.normalized_input,
-                normalized_gradient,
-                input_gradient,
-            ],
-            &[rows_u32, channels_u32],
-            rows,
-        )?;
-        self.encode_residual_add(
-            encoder.as_ref(),
-            upstream_buffer,
-            input_gradient,
-            input_gradient,
-            elements_u32,
-        )?;
-        self.encode_identity(
-            encoder.as_ref(),
-            input_gradient,
-            resident_destination,
-            elements,
-        )?;
-        if let Some(updates) = updates {
-            self.encode_trainable_fp16_ternary_stateless_sgd(
-                encoder.as_ref(),
-                updates.output,
-                output_weight_gradient,
-                updates.learning_rate,
-            )?;
-            self.encode_trainable_fp16_ternary_stateless_sgd(
-                encoder.as_ref(),
-                updates.input,
-                input_weight_gradient,
-                updates.learning_rate,
-            )?;
-        }
-        encoder.endEncoding();
-        command.commit();
-        if readback {
-            command.waitUntilCompleted();
-            if let Some(error) = command.error() {
-                bail!("Metal cached block backward command failed: {error}");
-            }
-        }
-        let read = |buffer: &objc2::runtime::ProtocolObject<dyn MTLBuffer>, len: usize| {
-            let mut values = vec![0.0; len];
-            unsafe {
-                values
-                    .as_mut_ptr()
-                    .copy_from_nonoverlapping(buffer.contents().cast::<f32>().as_ptr(), len);
-            }
-            values
-        };
-        let input_gradient = if readback {
-            read(resident_destination, elements)
-        } else {
-            Vec::new()
-        };
-        let filter_gradient = if readback && compute_filter_gradient {
-            read(filter_gradient, filter_elements)
-        } else {
-            Vec::new()
-        };
-        Ok(if updates.is_some() {
-            CachedBlockBackwardResult::Updated(MetalHyenaBlockUpdatedBackward {
-                input_gradient,
-                filter_gradient,
-            })
-        } else {
-            CachedBlockBackwardResult::Reference(MetalHyenaBlockBackward {
-                input_gradient,
-                input_projection_weight_gradient: read(
-                    input_weight_gradient,
-                    channels * channels * 2,
-                ),
-                output_projection_weight_gradient: read(
-                    output_weight_gradient,
-                    channels * channels,
-                ),
-                filter_gradient,
-            })
-        })
-    }
-
-    /// Uploads one FP16 stream to the first resident slot.
-    #[allow(unsafe_code)]
-    pub fn upload_resident_fp16_activations(
-        &self,
-        values: &crate::precision::Fp16Storage,
-        rows: usize,
-        width: usize,
-    ) -> Result<ResidentFp16ActivationSlot> {
-        use objc2_metal::MTLBuffer;
-
-        let elements = rows
-            .checked_mul(width)
-            .ok_or_else(|| anyhow::anyhow!("Metal FP16 activation shape overflow"))?;
-        if rows == 0 || width == 0 || values.len() != elements {
-            bail!("Metal resident FP16 activation shape mismatch");
-        }
-        self.reserve_fp16_activations(rows, width)?;
-        let activations = self.fp16_activations.borrow();
-        let destination = activations.buffer(ResidentFp16ActivationSlot::First)?;
-        // SAFETY: `reserve_fp16_activations` established exact capacity.
-        unsafe {
-            destination
-                .contents()
-                .cast::<u16>()
-                .as_ptr()
-                .copy_from_nonoverlapping(values.as_bits().as_ptr(), elements);
-        }
-        Ok(ResidentFp16ActivationSlot::First)
-    }
-
-    /// Downloads a resident FP16 stream only at an explicit graph boundary.
-    #[allow(unsafe_code)]
-    pub fn download_resident_fp16_activations(
-        &self,
-        slot: ResidentFp16ActivationSlot,
-        rows: usize,
-        width: usize,
-    ) -> Result<crate::precision::Fp16Storage> {
-        use objc2_metal::MTLBuffer;
-
-        let elements = rows
-            .checked_mul(width)
-            .ok_or_else(|| anyhow::anyhow!("Metal FP16 activation shape overflow"))?;
-        let activations = self.fp16_activations.borrow();
-        if activations.capacity < elements * size_of::<u16>() {
-            bail!("Metal resident FP16 activation download exceeds allocation");
-        }
-        let source = activations.buffer(slot)?;
-        let mut values = vec![0_u16; elements];
-        // SAFETY: allocation capacity and destination length were checked.
-        unsafe {
-            values
-                .as_mut_ptr()
-                .copy_from_nonoverlapping(source.contents().cast::<u16>().as_ptr(), elements);
-        }
-        Ok(crate::precision::Fp16Storage::from_bits(values))
-    }
-
-    /// Uploads the initial embedding stream once.  Subsequent resident blocks
-    /// exchange only GPU buffers; callers receive the slot token explicitly.
-    #[allow(unsafe_code)]
-    pub fn upload_resident_activations(
-        &self,
-        values: &[f32],
-        rows: usize,
-        width: usize,
-    ) -> Result<ResidentActivationSlot> {
-        use objc2_metal::MTLBuffer;
-        let elements = rows
-            .checked_mul(width)
-            .ok_or_else(|| anyhow::anyhow!("Metal resident activation shape overflow"))?;
-        if rows == 0 || width == 0 || values.len() != elements {
-            bail!("Metal resident activation shape mismatch");
-        }
-        self.reserve_activations(rows, width)?;
-        let activations = self.activations.borrow();
-        let first = activations
-            .first
-            .as_ref()
-            .expect("checked Metal activation buffer");
-        // SAFETY: `reserve_activations` admitted exactly this many FP32 values
-        // and no command can use the new input before this method returns.
-        unsafe {
-            first
-                .contents()
-                .cast::<f32>()
-                .as_ptr()
-                .copy_from_nonoverlapping(values.as_ptr(), elements);
-        }
-        Ok(ResidentActivationSlot::First)
-    }
-
-    /// Gathers an FP16 resident embedding into the FP32 activation stream.
-    ///
-    /// This is deliberately a GPU lookup rather than a CPU-built embedding
-    /// stream: a stateless update to the tied embedding must become visible to
-    /// the very next forward pass without downloading the master weights.
-    #[allow(unsafe_code)]
-    pub fn resident_embedding_lookup_fp16(
-        &self,
-        tokens: &[u32],
-        embedding: &ResidentFp16Parameters,
-        rows: usize,
-        channels: usize,
-        vocab: usize,
-    ) -> Result<ResidentActivationSlot> {
-        use core::ffi::c_void;
-        use core::ptr::NonNull;
-        use objc2_metal::{
-            MTLBuffer, MTLCommandBuffer, MTLCommandEncoder, MTLCommandQueue,
-            MTLComputeCommandEncoder, MTLComputePipelineState, MTLSize,
-        };
-
-        let elements = rows
-            .checked_mul(channels)
-            .ok_or_else(|| anyhow::anyhow!("Metal resident embedding lookup shape overflow"))?;
-        let embedding_elements = vocab.checked_mul(channels).ok_or_else(|| {
-            anyhow::anyhow!("Metal resident embedding lookup vocabulary overflow")
-        })?;
-        if rows == 0
-            || channels == 0
-            || vocab == 0
-            || tokens.len() != rows
-            || embedding.len != embedding_elements
-            || tokens.iter().any(|&token| token as usize >= vocab)
-        {
-            bail!("Metal resident embedding lookup shape/value mismatch");
-        }
-        self.reserve_activations(rows, channels)?;
-        let token_bytes = rows
-            .checked_mul(size_of::<u32>())
-            .ok_or_else(|| anyhow::anyhow!("Metal resident embedding token size overflow"))?;
-        let mut token_buffers = self.resident_tokens.borrow_mut();
-        token_buffers.ensure(&self.device, token_bytes)?;
-        let tokens_buffer = token_buffers
-            .tokens
-            .as_ref()
-            .expect("checked Metal resident token buffer");
-        // SAFETY: the shared allocation holds `rows` u32 IDs exactly.
-        unsafe {
-            tokens_buffer
-                .contents()
-                .cast::<u32>()
-                .as_ptr()
-                .copy_from_nonoverlapping(tokens.as_ptr(), rows);
-        }
-        let activations = self.activations.borrow();
-        let output = activations
-            .first
-            .as_ref()
-            .expect("checked Metal resident embedding activation buffer");
-        let rows_u32 = u32::try_from(rows)
-            .map_err(|_| anyhow::anyhow!("Metal resident embedding rows exceed u32"))?;
-        let channels_u32 = u32::try_from(channels)
-            .map_err(|_| anyhow::anyhow!("Metal resident embedding channels exceed u32"))?;
-        let vocab_u32 = u32::try_from(vocab)
-            .map_err(|_| anyhow::anyhow!("Metal resident embedding vocabulary exceeds u32"))?;
-        let command = self.queue.commandBuffer().ok_or_else(|| {
-            anyhow::anyhow!("Metal resident embedding lookup command buffer allocation failed")
-        })?;
-        let encoder = command.computeCommandEncoder().ok_or_else(|| {
-            anyhow::anyhow!("Metal resident embedding lookup encoder allocation failed")
-        })?;
-        encoder.setComputePipelineState(&self.embedding_lookup_fp16_pipeline);
-        // SAFETY: buffers and scalar ABI match `ullis_embedding_lookup_fp16`.
-        unsafe {
-            encoder.setBuffer_offset_atIndex(Some(embedding.parameters.as_ref()), 0, 0);
-            encoder.setBuffer_offset_atIndex(Some(tokens_buffer), 0, 1);
-            encoder.setBuffer_offset_atIndex(Some(output), 0, 2);
-            for (slot, scalar) in [rows_u32, channels_u32, vocab_u32].iter().enumerate() {
-                encoder.setBytes_length_atIndex(
-                    NonNull::from(scalar).cast::<c_void>(),
-                    size_of::<u32>(),
-                    slot + 3,
-                );
-            }
-        }
-        let width = self
-            .embedding_lookup_fp16_pipeline
-            .maxTotalThreadsPerThreadgroup()
-            .min(elements);
-        if width == 0 {
-            bail!("Metal resident embedding lookup pipeline reported zero threads");
-        }
-        encoder.dispatchThreads_threadsPerThreadgroup(
-            MTLSize {
-                width: elements,
-                height: 1,
-                depth: 1,
-            },
-            MTLSize {
-                width,
-                height: 1,
-                depth: 1,
-            },
-        );
-        encoder.endEncoding();
-        command.commit();
-        // Deliberately no wait: the single queue preserves this lookup before
-        // the block chain, and the input token allocation remains retained.
-        Ok(ResidentActivationSlot::First)
-    }
-
-    /// Reads a resident hidden stream only after the complete model forward.
-    #[allow(unsafe_code)]
-    pub fn download_resident_activations(
-        &self,
-        slot: ResidentActivationSlot,
-        rows: usize,
-        width: usize,
-    ) -> Result<Vec<f32>> {
-        use objc2_metal::MTLBuffer;
-        let elements = rows
-            .checked_mul(width)
-            .ok_or_else(|| anyhow::anyhow!("Metal resident activation shape overflow"))?;
-        let activations = self.activations.borrow();
-        if activations.capacity
-            < elements
-                .checked_mul(size_of::<f32>())
-                .ok_or_else(|| anyhow::anyhow!("Metal resident activation size overflow"))?
-        {
-            bail!("Metal resident activations were not initialized");
-        }
-        let buffer = match slot {
-            ResidentActivationSlot::First => activations.first.as_ref(),
-            ResidentActivationSlot::Second => activations.second.as_ref(),
-        }
-        .expect("checked Metal activation buffer");
-        let mut result = vec![0.0; elements];
-        // SAFETY: resident commands synchronously complete before this public
-        // extraction point, and the selected shared buffer has checked size.
-        unsafe {
-            result
-                .as_mut_ptr()
-                .copy_from_nonoverlapping(buffer.contents().cast::<f32>().as_ptr(), elements);
-        }
-        Ok(result)
-    }
-
-    /// Uploads the terminal reverse-mode gradient to the independent resident
-    /// pair. Later block-backward fusion writes each predecessor to `other()`.
-    #[allow(unsafe_code)]
-    pub fn upload_resident_gradient(
-        &self,
-        values: &[f32],
-        rows: usize,
-        width: usize,
-    ) -> Result<ResidentGradientSlot> {
-        use objc2_metal::MTLBuffer;
-
-        let elements = rows
-            .checked_mul(width)
-            .ok_or_else(|| anyhow::anyhow!("Metal resident gradient shape overflow"))?;
-        if values.len() != elements || values.iter().any(|value| !value.is_finite()) {
-            bail!("Metal resident gradient shape/value mismatch");
-        }
-        self.reserve_gradients(rows, width)?;
-        let gradients = self.gradient_activations.borrow();
-        let first = gradients
-            .first
-            .as_ref()
-            .expect("checked Metal resident gradient buffer");
-        // SAFETY: capacity and input length were validated before this copy.
-        unsafe {
-            first
-                .contents()
-                .cast::<f32>()
-                .as_ptr()
-                .copy_from_nonoverlapping(values.as_ptr(), elements);
-        }
-        Ok(ResidentGradientSlot::First)
-    }
-
-    /// Downloads a reverse-mode gradient only at an explicit graph boundary.
-    #[allow(unsafe_code)]
-    pub fn download_resident_gradient(
-        &self,
-        slot: ResidentGradientSlot,
-        rows: usize,
-        width: usize,
-    ) -> Result<Vec<f32>> {
-        use objc2_metal::MTLBuffer;
-
-        let elements = rows
-            .checked_mul(width)
-            .ok_or_else(|| anyhow::anyhow!("Metal resident gradient shape overflow"))?;
-        let bytes = elements
-            .checked_mul(size_of::<f32>())
-            .ok_or_else(|| anyhow::anyhow!("Metal resident gradient size overflow"))?;
-        let gradients = self.gradient_activations.borrow();
-        if gradients.capacity < bytes {
-            bail!("Metal resident gradients were not initialized");
-        }
-        let buffer = match slot {
-            ResidentGradientSlot::First => gradients.first.as_ref(),
-            ResidentGradientSlot::Second => gradients.second.as_ref(),
-            ResidentGradientSlot::Third => gradients.third.as_ref(),
-        }
-        .expect("checked Metal resident gradient buffer");
-        let mut result = vec![0.0; elements];
-        // SAFETY: allocation capacity and destination length were checked.
-        unsafe {
-            result
-                .as_mut_ptr()
-                .copy_from_nonoverlapping(buffer.contents().cast::<f32>().as_ptr(), elements);
-        }
-        Ok(result)
-    }
-
-    /// Second submission of a Hyena block: ternary output projection followed
-    /// by residual addition.  Both its input and result stay in the resident
-    /// ping-pong slots; only immutable packed weights are copied from host.
-    #[allow(unsafe_code)]
-    pub fn resident_output_projection(
-        &self,
-        residual_slot: ResidentActivationSlot,
-        rows: usize,
-        width: usize,
-        positive: &[u64],
-        negative: &[u64],
-        scales: &[f32],
-    ) -> Result<ResidentActivationSlot> {
-        use objc2_metal::{MTLBuffer, MTLCommandBuffer, MTLCommandEncoder, MTLCommandQueue};
-        let shape = TernaryLinearShape::new(rows, width, width)?;
-        let elements = rows
-            .checked_mul(width)
-            .ok_or_else(|| anyhow::anyhow!("Metal resident output shape overflow"))?;
-        if positive.len() != shape.packed_words()?
-            || negative.len() != positive.len()
-            || scales.len() != width
-        {
-            bail!("Metal resident output weight shape mismatch");
-        }
-        let bytes = elements
-            .checked_mul(size_of::<f32>())
-            .ok_or_else(|| anyhow::anyhow!("Metal resident output size overflow"))?;
-        let packed_bytes = positive
-            .len()
-            .checked_mul(size_of::<u64>())
-            .ok_or_else(|| anyhow::anyhow!("Metal resident packed size overflow"))?;
-        self.reserve_activations(rows, width)?;
-        let mut ternary = self.ternary_buffers.borrow_mut();
-        ternary.ensure(
-            &self.device,
-            bytes,
-            packed_bytes,
-            size_of_val(scales),
-            bytes,
-        )?;
-        let activations = self.activations.borrow();
-        let residual = match residual_slot {
-            ResidentActivationSlot::First => activations.first.as_ref(),
-            ResidentActivationSlot::Second => activations.second.as_ref(),
-        }
-        .expect("checked residual activation");
-        let next = match residual_slot.other() {
-            ResidentActivationSlot::First => activations.first.as_ref(),
-            ResidentActivationSlot::Second => activations.second.as_ref(),
-        }
-        .expect("checked next activation");
-        let positive_buffer = ternary.positive.as_ref().expect("checked positive weights");
-        let negative_buffer = ternary.negative.as_ref().expect("checked negative weights");
-        let scale_buffer = ternary.scales.as_ref().expect("checked scales");
-        let projected = ternary.output.as_ref().expect("checked ternary output");
-        // SAFETY: all shared buffers were grown to the checked dimensions.
-        unsafe {
-            positive_buffer
-                .contents()
-                .cast::<u64>()
-                .as_ptr()
-                .copy_from_nonoverlapping(positive.as_ptr(), positive.len());
-            negative_buffer
-                .contents()
-                .cast::<u64>()
-                .as_ptr()
-                .copy_from_nonoverlapping(negative.as_ptr(), negative.len());
-            scale_buffer
-                .contents()
-                .cast::<f32>()
-                .as_ptr()
-                .copy_from_nonoverlapping(scales.as_ptr(), scales.len());
-        }
-        let command = self
-            .queue
-            .commandBuffer()
-            .ok_or_else(|| anyhow::anyhow!("Metal command buffer allocation failed"))?;
-        let encoder = command
-            .computeCommandEncoder()
-            .ok_or_else(|| anyhow::anyhow!("Metal compute encoder allocation failed"))?;
-        self.encode_ternary(
-            encoder.as_ref(),
-            &self.ternary_pipeline,
-            next,
-            positive_buffer,
-            negative_buffer,
-            scale_buffer,
-            projected,
-            shape,
-            false,
-        )?;
-        self.encode_residual_add(
-            encoder.as_ref(),
-            residual,
-            projected,
-            next,
-            u32::try_from(elements)
-                .map_err(|_| anyhow::anyhow!("Metal resident elements exceed u32"))?,
-        )?;
-        encoder.endEncoding();
-        command.commit();
-        command.waitUntilCompleted();
-        if let Some(error) = command.error() {
-            bail!("Metal resident output command failed: {error}");
-        }
-        Ok(residual_slot.other())
-    }
-
-    /// Resident output projection using trainable packed weights directly.
-    /// Unlike [`Self::resident_output_projection`], this path neither uploads
-    /// codes nor scales from the CPU, so it remains valid after GPU updates.
-    #[allow(unsafe_code)]
-    pub fn resident_output_projection_trainable(
-        &self,
-        residual_slot: ResidentActivationSlot,
-        rows: usize,
-        width: usize,
-        weights: &ResidentTrainableFp16TernaryWeights,
-    ) -> Result<ResidentActivationSlot> {
-        use objc2_metal::{MTLCommandBuffer, MTLCommandEncoder, MTLCommandQueue};
-
-        if weights.in_features != width || weights.out_features != width {
-            bail!("Metal resident trainable output weight shape mismatch");
-        }
-        let shape = TernaryLinearShape::new(rows, width, width)?;
-        let elements = rows
-            .checked_mul(width)
-            .ok_or_else(|| anyhow::anyhow!("Metal resident output shape overflow"))?;
-        let bytes = elements
-            .checked_mul(size_of::<f32>())
-            .ok_or_else(|| anyhow::anyhow!("Metal resident output size overflow"))?;
-        self.reserve_activations(rows, width)?;
-        self.ternary_buffers
-            .borrow_mut()
-            .ensure(&self.device, bytes, 0, 0, bytes)?;
-        let activations = self.activations.borrow();
-        let ternary = self.ternary_buffers.borrow();
-        let residual = match residual_slot {
-            ResidentActivationSlot::First => activations.first.as_ref(),
-            ResidentActivationSlot::Second => activations.second.as_ref(),
-        }
-        .expect("checked residual activation");
-        let next = match residual_slot.other() {
-            ResidentActivationSlot::First => activations.first.as_ref(),
-            ResidentActivationSlot::Second => activations.second.as_ref(),
-        }
-        .expect("checked next activation");
-        let projected = ternary.output.as_ref().expect("checked ternary output");
-        let command = self
-            .queue
-            .commandBuffer()
-            .ok_or_else(|| anyhow::anyhow!("Metal command buffer allocation failed"))?;
-        let encoder = command
-            .computeCommandEncoder()
-            .ok_or_else(|| anyhow::anyhow!("Metal compute encoder allocation failed"))?;
-        self.encode_ternary(
-            encoder.as_ref(),
-            &self.ternary_pipeline,
-            next,
-            weights.positive.as_ref(),
-            weights.negative.as_ref(),
-            weights.scales.as_ref(),
-            projected,
-            shape,
-            false,
-        )?;
-        self.encode_residual_add(
-            encoder.as_ref(),
-            residual,
-            projected,
-            next,
-            u32::try_from(elements)
-                .map_err(|_| anyhow::anyhow!("Metal resident elements exceed u32"))?,
-        )?;
-        encoder.endEncoding();
-        command.commit();
-        // The training queue is in-order. Its next consumer establishes the
-        // completion boundary, so waiting here only serializes CPU submission.
-        Ok(residual_slot.other())
-    }
-
-    /// Applies a square resident ternary projection without a residual add.
-    /// This is the MTP-head forward primitive: the hidden stream stays in its
-    /// source slot and the head output occupies the other activation slot.
-    #[allow(unsafe_code)]
-    pub fn resident_ternary_head_forward_trainable(
-        &self,
-        input_slot: ResidentActivationSlot,
-        rows: usize,
-        width: usize,
-        weights: &ResidentTrainableFp16TernaryWeights,
-    ) -> Result<ResidentActivationSlot> {
-        use objc2_metal::{MTLCommandBuffer, MTLCommandEncoder, MTLCommandQueue};
-
-        if weights.in_features != width || weights.out_features != width {
-            bail!("Metal resident MTP-head weight shape mismatch");
-        }
-        let shape = TernaryLinearShape::new(rows, width, width)?;
-        self.reserve_activations(rows, width)?;
-        let activations = self.activations.borrow();
-        let input = match input_slot {
-            ResidentActivationSlot::First => activations.first.as_ref(),
-            ResidentActivationSlot::Second => activations.second.as_ref(),
-        }
-        .expect("checked resident MTP-head input");
-        let output = match input_slot.other() {
-            ResidentActivationSlot::First => activations.first.as_ref(),
-            ResidentActivationSlot::Second => activations.second.as_ref(),
-        }
-        .expect("checked resident MTP-head output");
-        let command = self.queue.commandBuffer().ok_or_else(|| {
-            anyhow::anyhow!("Metal resident MTP-head command buffer allocation failed")
-        })?;
-        let encoder = command
-            .computeCommandEncoder()
-            .ok_or_else(|| anyhow::anyhow!("Metal resident MTP-head encoder allocation failed"))?;
-        self.encode_ternary(
-            encoder.as_ref(),
-            &self.ternary_pipeline,
-            input,
-            weights.positive.as_ref(),
-            weights.negative.as_ref(),
-            weights.scales.as_ref(),
-            output,
-            shape,
-            false,
-        )?;
-        encoder.endEncoding();
-        command.commit();
-        // Streamed cross-entropy consumes this slot on the same in-order
-        // queue and waits before its scalar loss is read back.
-        Ok(input_slot.other())
-    }
-
-    /// Backpropagates one resident MTP head and refreshes its FP16 ternary
-    /// master in the same submission. With `accumulate` the predecessor from
-    /// the first head is added in-place, yielding the terminal Hyena gradient
-    /// without a CPU gradient tensor or an extra D-wide workspace.
-    #[allow(unsafe_code)]
-    pub fn resident_ternary_head_backward_update(
-        &self,
-        input_slot: ResidentActivationSlot,
-        output_gradient: ResidentGradientSlot,
-        destination: ResidentGradientSlot,
-        rows: usize,
-        width: usize,
-        weights: &ResidentTrainableFp16TernaryWeights,
-        learning_rate: f32,
-        accumulate: bool,
-    ) -> Result<ResidentGradientSlot> {
-        use objc2_metal::{MTLCommandBuffer, MTLCommandEncoder, MTLCommandQueue};
-
-        if weights.in_features != width
-            || weights.out_features != width
-            || !learning_rate.is_finite()
-            || learning_rate <= 0.0
-        {
-            bail!("Metal resident MTP-head backward shape/value mismatch");
-        }
-        let elements = rows.checked_mul(width).ok_or_else(|| {
-            anyhow::anyhow!("Metal resident MTP-head backward activation overflow")
-        })?;
-        let parameter_bytes = width
-            .checked_mul(width)
-            .and_then(|count| count.checked_mul(size_of::<f32>()))
-            .ok_or_else(|| {
-                anyhow::anyhow!("Metal resident MTP-head backward parameter overflow")
-            })?;
-        self.reserve_activations(rows, width)?;
-        self.reserve_gradients(rows, width)?;
-        self.backward_buffers
-            .borrow_mut()
-            .ensure(&self.device, 0, 0, 0, 0, parameter_bytes)?;
-        let activations = self.activations.borrow();
-        let input = match input_slot {
-            ResidentActivationSlot::First => activations.first.as_ref(),
-            ResidentActivationSlot::Second => activations.second.as_ref(),
-        }
-        .expect("checked resident MTP-head backward input");
-        let gradients = self.gradient_activations.borrow();
-        let output = match output_gradient {
-            ResidentGradientSlot::First => gradients.first.as_ref(),
-            ResidentGradientSlot::Second => gradients.second.as_ref(),
-            ResidentGradientSlot::Third => gradients.third.as_ref(),
-        }
-        .expect("checked resident MTP-head output gradient");
-        let destination_buffer = match destination {
-            ResidentGradientSlot::First => gradients.first.as_ref(),
-            ResidentGradientSlot::Second => gradients.second.as_ref(),
-            ResidentGradientSlot::Third => gradients.third.as_ref(),
-        }
-        .expect("checked resident MTP-head input gradient");
-        let previous = match destination.other() {
-            ResidentGradientSlot::First => gradients.first.as_ref(),
-            ResidentGradientSlot::Second => gradients.second.as_ref(),
-            ResidentGradientSlot::Third => gradients.third.as_ref(),
-        }
-        .expect("checked resident MTP-head accumulated gradient");
-        let backward = self.backward_buffers.borrow();
-        let parameter_gradient = backward
-            .parameter_gradient
-            .as_ref()
-            .expect("checked resident MTP-head parameter gradient");
-        let rows_u32 = u32::try_from(rows)
-            .map_err(|_| anyhow::anyhow!("Metal resident MTP-head rows exceed u32"))?;
-        let width_u32 = u32::try_from(width)
-            .map_err(|_| anyhow::anyhow!("Metal resident MTP-head width exceeds u32"))?;
-        let elements_u32 = u32::try_from(elements)
-            .map_err(|_| anyhow::anyhow!("Metal resident MTP-head elements exceed u32"))?;
-        let command = self.queue.commandBuffer().ok_or_else(|| {
-            anyhow::anyhow!("Metal resident MTP-head backward command buffer allocation failed")
-        })?;
-        let encoder = command.computeCommandEncoder().ok_or_else(|| {
-            anyhow::anyhow!("Metal resident MTP-head backward encoder allocation failed")
-        })?;
-        self.encode_tiled_ternary_ste_weight_backward(
-            encoder.as_ref(),
-            input,
-            output,
-            weights.scales.as_ref(),
-            parameter_gradient,
-            rows_u32,
-            width_u32,
-            width_u32,
-        )?;
-        self.encode_elementwise_buffers(
-            encoder.as_ref(),
-            &self.ternary_input_backward_pipeline,
-            &[
-                output,
-                weights.positive.as_ref(),
-                weights.negative.as_ref(),
-                weights.scales.as_ref(),
-                destination_buffer,
-            ],
-            &[rows_u32, width_u32, width_u32],
-            elements,
-        )?;
-        if accumulate {
-            self.encode_residual_add(
-                encoder.as_ref(),
-                destination_buffer,
-                previous,
-                destination_buffer,
-                elements_u32,
-            )?;
-        }
-        self.encode_trainable_fp16_ternary_stateless_sgd(
-            encoder.as_ref(),
-            weights,
-            parameter_gradient,
-            learning_rate,
-        )?;
-        encoder.endEncoding();
-        command.commit();
-        command.waitUntilCompleted();
-        if let Some(error) = command.error() {
-            bail!("Metal resident MTP-head backward command failed: {error}");
-        }
-        Ok(destination)
-    }
-
-    /// Starts the first block submission with fused RMSNorm/ternary input
-    /// projection and the in-place Hyena gate.  The projection is retained in
-    /// `gate_buffers.output` for the following FFT mixer; no activation leaves
-    /// Metal at this boundary.
-    #[allow(unsafe_code)]
-    pub fn resident_input_projection(
-        &self,
-        slot: ResidentActivationSlot,
-        rows: usize,
-        width: usize,
-        positive: &[u64],
-        negative: &[u64],
-        scales: &[f32],
-        cache: Option<&ResidentHyenaBlockCache>,
-    ) -> Result<()> {
-        use objc2_metal::{MTLBuffer, MTLCommandBuffer, MTLCommandEncoder, MTLCommandQueue};
-        let out_width = width
-            .checked_mul(2)
-            .ok_or_else(|| anyhow::anyhow!("Metal resident input width overflow"))?;
-        let shape = TernaryLinearShape::new(rows, width, out_width)?;
-        if positive.len() != shape.packed_words()?
-            || negative.len() != positive.len()
-            || scales.len() != out_width
-        {
-            bail!("Metal resident input weight shape mismatch");
-        }
-        let input_bytes = rows
-            .checked_mul(width)
-            .and_then(|n| n.checked_mul(size_of::<f32>()))
-            .ok_or_else(|| anyhow::anyhow!("Metal resident input size overflow"))?;
-        let output_bytes = rows
-            .checked_mul(out_width)
-            .and_then(|n| n.checked_mul(size_of::<f32>()))
-            .ok_or_else(|| anyhow::anyhow!("Metal resident projection size overflow"))?;
-        let packed_bytes = size_of_val(positive);
-        self.reserve_activations(rows, width)?;
-        self.ternary_buffers.borrow_mut().ensure(
-            &self.device,
-            input_bytes,
-            packed_bytes,
-            size_of_val(scales),
-            output_bytes,
-        )?;
-        self.gate_buffers
-            .borrow_mut()
-            .ensure(&self.device, output_bytes)?;
-        let activations = self.activations.borrow();
-        let ternary = self.ternary_buffers.borrow();
-        let gates = self.gate_buffers.borrow();
-        let input = match slot {
-            ResidentActivationSlot::First => activations.first.as_ref(),
-            ResidentActivationSlot::Second => activations.second.as_ref(),
-        }
-        .expect("checked resident input");
-        let positive_buffer = ternary.positive.as_ref().expect("checked positive weights");
-        let negative_buffer = ternary.negative.as_ref().expect("checked negative weights");
-        let scale_buffer = ternary.scales.as_ref().expect("checked scales");
-        let projected = ternary.output.as_ref().expect("checked projection output");
-        let gated = gates.output.as_ref().expect("checked gate output");
-        if let Some(cache) = cache
-            && (cache.rows != rows || cache.channels != width)
-        {
-            bail!("Metal Hyena cache shape mismatch");
-        }
-        // SAFETY: immutable packed weights fit the persistent shared buffers.
-        unsafe {
-            positive_buffer
-                .contents()
-                .cast::<u64>()
-                .as_ptr()
-                .copy_from_nonoverlapping(positive.as_ptr(), positive.len());
-            negative_buffer
-                .contents()
-                .cast::<u64>()
-                .as_ptr()
-                .copy_from_nonoverlapping(negative.as_ptr(), negative.len());
-            scale_buffer
-                .contents()
-                .cast::<f32>()
-                .as_ptr()
-                .copy_from_nonoverlapping(scales.as_ptr(), scales.len());
-        }
-        let command = self
-            .queue
-            .commandBuffer()
-            .ok_or_else(|| anyhow::anyhow!("Metal command buffer allocation failed"))?;
-        let encoder = command
-            .computeCommandEncoder()
-            .ok_or_else(|| anyhow::anyhow!("Metal compute encoder allocation failed"))?;
-        if let Some(cache) = cache {
-            self.encode_identity(encoder.as_ref(), input, &cache.input, rows * width)?;
-            self.encode_rms_norm(
-                encoder.as_ref(),
-                input,
-                &cache.normalized_input,
-                rows,
-                width,
-            )?;
-            self.encode_ternary(
-                encoder.as_ref(),
-                &self.ternary_pipeline,
-                &cache.normalized_input,
-                positive_buffer,
-                negative_buffer,
-                scale_buffer,
-                projected,
-                shape,
-                false,
-            )?;
-            self.encode_tanh_gate(
-                encoder.as_ref(),
-                &self.tanh_gate_pipeline,
-                projected,
-                &cache.gated_projection,
-                rows,
-                width,
-            )?;
-        } else {
-            self.encode_ternary(
-                encoder.as_ref(),
-                &self.fused_rms_norm_ternary_pipeline,
-                input,
-                positive_buffer,
-                negative_buffer,
-                scale_buffer,
-                projected,
-                shape,
-                true,
-            )?;
-            self.encode_tanh_gate(
-                encoder.as_ref(),
-                &self.tanh_gate_pipeline,
-                projected,
-                gated,
-                rows,
-                width,
-            )?;
-        }
-        encoder.endEncoding();
-        command.commit();
-        command.waitUntilCompleted();
-        if let Some(error) = command.error() {
-            bail!("Metal resident input command failed: {error}");
-        }
-        Ok(())
-    }
-
-    /// Resident fused RMSNorm/input projection using persistent trainable
-    /// ternary state. Codes and scales are consumed directly from Metal.
-    #[allow(unsafe_code)]
-    pub fn resident_input_projection_trainable(
-        &self,
-        slot: ResidentActivationSlot,
-        rows: usize,
-        width: usize,
-        weights: &ResidentTrainableFp16TernaryWeights,
-        cache: Option<&ResidentHyenaBlockCache>,
-    ) -> Result<()> {
-        use objc2_metal::{MTLCommandBuffer, MTLCommandEncoder, MTLCommandQueue};
-
-        let out_width = width
-            .checked_mul(2)
-            .ok_or_else(|| anyhow::anyhow!("Metal resident input width overflow"))?;
-        if weights.in_features != width || weights.out_features != out_width {
-            bail!("Metal resident trainable input weight shape mismatch");
-        }
-        let shape = TernaryLinearShape::new(rows, width, out_width)?;
-        let input_bytes = rows
-            .checked_mul(width)
-            .and_then(|n| n.checked_mul(size_of::<f32>()))
-            .ok_or_else(|| anyhow::anyhow!("Metal resident input size overflow"))?;
-        let output_bytes = rows
-            .checked_mul(out_width)
-            .and_then(|n| n.checked_mul(size_of::<f32>()))
-            .ok_or_else(|| anyhow::anyhow!("Metal resident projection size overflow"))?;
-        self.reserve_activations(rows, width)?;
-        self.ternary_buffers
-            .borrow_mut()
-            .ensure(&self.device, input_bytes, 0, 0, output_bytes)?;
-        self.gate_buffers
-            .borrow_mut()
-            .ensure(&self.device, output_bytes)?;
-        let activations = self.activations.borrow();
-        let ternary = self.ternary_buffers.borrow();
-        let gates = self.gate_buffers.borrow();
-        let input = match slot {
-            ResidentActivationSlot::First => activations.first.as_ref(),
-            ResidentActivationSlot::Second => activations.second.as_ref(),
-        }
-        .expect("checked resident input");
-        let projected = ternary.output.as_ref().expect("checked projection output");
-        let gated = gates.output.as_ref().expect("checked gate output");
-        if let Some(cache) = cache
-            && (cache.rows != rows || cache.channels != width)
-        {
-            bail!("Metal Hyena cache shape mismatch");
-        }
-        let command = self
-            .queue
-            .commandBuffer()
-            .ok_or_else(|| anyhow::anyhow!("Metal command buffer allocation failed"))?;
-        let encoder = command
-            .computeCommandEncoder()
-            .ok_or_else(|| anyhow::anyhow!("Metal compute encoder allocation failed"))?;
-        if let Some(cache) = cache {
-            self.encode_identity(encoder.as_ref(), input, &cache.input, rows * width)?;
-            self.encode_rms_norm(
-                encoder.as_ref(),
-                input,
-                &cache.normalized_input,
-                rows,
-                width,
-            )?;
-            self.encode_ternary(
-                encoder.as_ref(),
-                &self.ternary_pipeline,
-                &cache.normalized_input,
-                weights.positive.as_ref(),
-                weights.negative.as_ref(),
-                weights.scales.as_ref(),
-                projected,
-                shape,
-                false,
-            )?;
-            self.encode_tanh_gate(
-                encoder.as_ref(),
-                &self.tanh_gate_pipeline,
-                projected,
-                &cache.gated_projection,
-                rows,
-                width,
-            )?;
-        } else {
-            self.encode_ternary(
-                encoder.as_ref(),
-                &self.fused_rms_norm_ternary_pipeline,
-                input,
-                weights.positive.as_ref(),
-                weights.negative.as_ref(),
-                weights.scales.as_ref(),
-                projected,
-                shape,
-                true,
-            )?;
-            self.encode_tanh_gate(
-                encoder.as_ref(),
-                &self.tanh_gate_pipeline,
-                projected,
-                gated,
-                rows,
-                width,
-            )?;
-        }
-        encoder.endEncoding();
-        command.commit();
-        // The following resident mixer is ordered after this submission.
-        Ok(())
-    }
-
-    /// Completes the resident Hyena mixer after `resident_input_projection`.
-    /// The gated `[B*T, 2D]` projection is packed directly into the signal
-    /// FFT buffer, convolved with an on-device implicit filter, and written
-    /// into the opposite activation slot. No `[B, T, D]` value is materialized
-    /// on the host along this path.
-    #[allow(unsafe_code)]
-    pub fn resident_hyena_mixer(
-        &self,
-        slot: ResidentActivationSlot,
-        batch: usize,
-        time: usize,
-        channels: usize,
-        filter: &crate::hyena::ImplicitFilter,
-        plan: HyenaChunkPlan,
-        cache: Option<&ResidentHyenaBlockCache>,
-    ) -> Result<()> {
-        self.resident_hyena_mixer_impl(
-            slot,
-            batch,
-            time,
-            channels,
-            ResidentImplicitFilterSource::Host(filter),
-            plan,
-            cache,
-            None,
-            true,
-        )
-    }
-
-    /// Same resident mixer, but consumes compact FP16 parameters owned by the
-    /// persistent training state instead of uploading a CPU filter each pass.
-    pub fn resident_hyena_mixer_trainable(
-        &self,
-        slot: ResidentActivationSlot,
-        batch: usize,
-        time: usize,
-        channels: usize,
-        filter: &ResidentImplicitFilterParameters,
-        plan: HyenaChunkPlan,
-        cache: Option<&ResidentHyenaBlockCache>,
-    ) -> Result<()> {
-        self.resident_hyena_mixer_impl(
-            slot,
-            batch,
-            time,
-            channels,
-            ResidentImplicitFilterSource::Trainable(filter),
-            plan,
-            cache,
-            None,
-            // The mixer reuses shared FFT work buffers that are initialized
-            // by the CPU before submission. They cannot be repopulated for
-            // the next block until this command has consumed them.
-            true,
-        )
-    }
-
-    /// Frozen-filter training mixer. `spectrum` was built for this exact
-    /// shape and lets the command skip implicit-filter generation plus its FFT.
-    pub fn resident_hyena_mixer_trainable_frozen(
-        &self,
-        slot: ResidentActivationSlot,
-        batch: usize,
-        time: usize,
-        channels: usize,
-        filter: &ResidentImplicitFilterParameters,
-        plan: HyenaChunkPlan,
-        cache: Option<&ResidentHyenaBlockCache>,
-        spectrum: &ResidentFilterSpectrum,
-    ) -> Result<()> {
-        self.resident_hyena_mixer_impl(
-            slot,
-            batch,
-            time,
-            channels,
-            ResidentImplicitFilterSource::Trainable(filter),
-            plan,
-            cache,
-            Some(spectrum),
-            true,
-        )
-    }
-
-    #[allow(unsafe_code)]
-    fn resident_hyena_mixer_impl(
-        &self,
-        slot: ResidentActivationSlot,
-        batch: usize,
-        time: usize,
-        channels: usize,
-        filter_source: ResidentImplicitFilterSource<'_>,
-        plan: HyenaChunkPlan,
-        cache: Option<&ResidentHyenaBlockCache>,
-        static_spectrum: Option<&ResidentFilterSpectrum>,
-        wait_for_completion: bool,
-    ) -> Result<()> {
-        use objc2_metal::{
-            MTLBuffer, MTLCommandBuffer, MTLCommandEncoder, MTLCommandQueue,
-            MTLComputePipelineState,
-        };
-
-        let shape = MetalDispatchShape::new(batch, time, channels)?;
-        let plan = plan.for_sequence(time)?;
-        if let Some(spectrum) = static_spectrum
-            && (spectrum.channels != channels
-                || spectrum.time != time
-                || spectrum.kernel_len != plan.kernel_len
-                || spectrum.fft_len != plan.fft_len)
-        {
-            bail!("Metal resident filter spectrum shape mismatch");
-        }
-        let chunks = time.div_ceil(plan.chunk_len);
-        let transforms = batch
-            .checked_mul(chunks)
-            .and_then(|n| n.checked_mul(channels))
-            .ok_or_else(|| anyhow::anyhow!("Metal resident transform shape overflow"))?;
-        let signal_elements = transforms
-            .checked_mul(plan.fft_len)
-            .ok_or_else(|| anyhow::anyhow!("Metal resident signal FFT shape overflow"))?;
-        let filter_elements = channels
-            .checked_mul(plan.kernel_len)
-            .ok_or_else(|| anyhow::anyhow!("Metal resident filter shape overflow"))?;
-        let filter_fft_elements = channels
-            .checked_mul(plan.fft_len)
-            .ok_or_else(|| anyhow::anyhow!("Metal resident filter FFT shape overflow"))?;
-        let signal_bytes = signal_elements
-            .checked_mul(size_of::<Complex32>())
-            .ok_or_else(|| anyhow::anyhow!("Metal resident signal size overflow"))?;
-        let filter_bytes = filter_fft_elements
-            .checked_mul(size_of::<Complex32>())
-            .ok_or_else(|| anyhow::anyhow!("Metal resident filter size overflow"))?;
-        let output_bytes = shape
-            .elements()
-            .checked_mul(size_of::<f32>())
-            .ok_or_else(|| anyhow::anyhow!("Metal resident mixer output size overflow"))?;
-        let (host_parameters, order) = match filter_source {
-            ResidentImplicitFilterSource::Host(filter) => {
-                let (freq, phase, decay, order) = filter.parameter_slices(channels)?;
-                (Some((freq, phase, decay)), order)
-            }
-            ResidentImplicitFilterSource::Trainable(parameters) => {
-                if parameters.channels != channels {
-                    bail!("Metal resident implicit-filter channel mismatch");
-                }
-                (None, parameters.order)
-            }
-        };
-        let parameter_bytes = host_parameters
-            .as_ref()
-            .and_then(|(freq, _, _)| freq.len().checked_mul(size_of::<f32>()))
-            .unwrap_or(0);
-        self.reserve_activations(batch * time, channels)?;
-        self.fft_buffers
-            .borrow_mut()
-            .ensure(&self.device, signal_bytes)?;
-        self.filter_fft_buffers
-            .borrow_mut()
-            .ensure(&self.device, filter_bytes)?;
-        self.hyena_output_buffer
-            .borrow_mut()
-            .ensure(&self.device, output_bytes)?;
-        if parameter_bytes != 0 {
-            self.implicit_filter_parameters
-                .borrow_mut()
-                .ensure(&self.device, parameter_bytes)?;
-        }
-
-        let fft_len = u32::try_from(plan.fft_len)
-            .map_err(|_| anyhow::anyhow!("Metal resident FFT length exceeds u32"))?;
-        let transforms_u32 = u32::try_from(transforms)
-            .map_err(|_| anyhow::anyhow!("Metal resident transform count exceeds u32"))?;
-        let channels_u32 = u32::try_from(channels)
-            .map_err(|_| anyhow::anyhow!("Metal resident channel count exceeds u32"))?;
-        let time_u32 =
-            u32::try_from(time).map_err(|_| anyhow::anyhow!("Metal resident time exceeds u32"))?;
-        let chunk_u32 = u32::try_from(plan.chunk_len)
-            .map_err(|_| anyhow::anyhow!("Metal resident chunk length exceeds u32"))?;
-        let kernel_u32 = u32::try_from(plan.kernel_len)
-            .map_err(|_| anyhow::anyhow!("Metal resident kernel length exceeds u32"))?;
-        let chunks_u32 = u32::try_from(chunks)
-            .map_err(|_| anyhow::anyhow!("Metal resident chunk count exceeds u32"))?;
-        let elements_u32 = u32::try_from(shape.elements())
-            .map_err(|_| anyhow::anyhow!("Metal resident element count exceeds u32"))?;
-        let order_u32 = u32::try_from(order)
-            .map_err(|_| anyhow::anyhow!("Metal resident filter order exceeds u32"))?;
-        let filter_elements_u32 = u32::try_from(filter_elements)
-            .map_err(|_| anyhow::anyhow!("Metal resident filter elements exceed u32"))?;
-
-        let activations = self.activations.borrow();
-        let gates = self.gate_buffers.borrow();
-        let signal_buffers = self.fft_buffers.borrow();
-        let filter_buffers = self.filter_fft_buffers.borrow();
-        let mixer_output = self.hyena_output_buffer.borrow();
-        let parameters = self.implicit_filter_parameters.borrow();
-        let scratch_gated = gates
-            .output
-            .as_ref()
-            .ok_or_else(|| anyhow::anyhow!("Metal resident gate is not initialized"))?;
-        let gated: &objc2::runtime::ProtocolObject<dyn MTLBuffer> = if let Some(cache) = cache {
-            if cache.rows != batch * time || cache.channels != channels {
-                bail!("Metal Hyena cache shape mismatch");
-            }
-            &cache.gated_projection
-        } else {
-            scratch_gated
-        };
-        let next = match slot.other() {
-            ResidentActivationSlot::First => activations.first.as_ref(),
-            ResidentActivationSlot::Second => activations.second.as_ref(),
-        }
-        .expect("checked next resident activation");
-        let signal_first = signal_buffers
-            .first
-            .as_ref()
-            .expect("checked resident signal buffer");
-        let signal_second = signal_buffers
-            .second
-            .as_ref()
-            .expect("checked resident signal scratch buffer");
-        let filter_first = filter_buffers
-            .first
-            .as_ref()
-            .expect("checked resident filter buffer");
-        let filter_second = filter_buffers
-            .second
-            .as_ref()
-            .expect("checked resident filter scratch buffer");
-        let mixed = mixer_output
-            .buffer
-            .as_ref()
-            .expect("checked resident mixer output");
-        let (freq_buffer, phase_buffer, decay_buffer) = match filter_source {
-            ResidentImplicitFilterSource::Host(_) => (
-                &**parameters
-                    .freq
-                    .as_ref()
-                    .expect("checked resident frequency buffer"),
-                &**parameters
-                    .phase
-                    .as_ref()
-                    .expect("checked resident phase buffer"),
-                &**parameters
-                    .decay
-                    .as_ref()
-                    .expect("checked resident decay buffer"),
-            ),
-            ResidentImplicitFilterSource::Trainable(parameters) => (
-                &*parameters.freq.parameters,
-                &*parameters.phase.parameters,
-                &*parameters.decay.parameters,
-            ),
-        };
-        // SAFETY: the capacity checks above cover every copied parameter and
-        // complex padding lane. These buffers stay borrowed through completion.
-        unsafe {
-            signal_first
-                .contents()
-                .cast::<Complex32>()
-                .as_ptr()
-                .write_bytes(0, signal_elements);
-            if static_spectrum.is_none() {
-                filter_first
-                    .contents()
-                    .cast::<Complex32>()
-                    .as_ptr()
-                    .write_bytes(0, filter_fft_elements);
-                if let Some((freq, phase, decay)) = host_parameters {
-                    freq_buffer
-                        .contents()
-                        .cast::<f32>()
-                        .as_ptr()
-                        .copy_from_nonoverlapping(freq.as_ptr(), freq.len());
-                    phase_buffer
-                        .contents()
-                        .cast::<f32>()
-                        .as_ptr()
-                        .copy_from_nonoverlapping(phase.as_ptr(), phase.len());
-                    decay_buffer
-                        .contents()
-                        .cast::<f32>()
-                        .as_ptr()
-                        .copy_from_nonoverlapping(decay.as_ptr(), decay.len());
-                }
-            }
-        }
-        let command = self
-            .queue
-            .commandBuffer()
-            .ok_or_else(|| anyhow::anyhow!("Metal command buffer allocation failed"))?;
-        let encoder = command
-            .computeCommandEncoder()
-            .ok_or_else(|| anyhow::anyhow!("Metal compute encoder allocation failed"))?;
-        self.encode_pack_overlap_save(
-            encoder.as_ref(),
-            gated,
-            signal_first,
-            [
-                time_u32,
-                channels_u32,
-                channels_u32
-                    .checked_mul(2)
-                    .ok_or_else(|| anyhow::anyhow!("Metal resident stride exceeds u32"))?,
-                0,
-                chunk_u32,
-                kernel_u32,
-                fft_len,
-                chunks_u32,
-                u32::try_from(signal_elements)
-                    .map_err(|_| anyhow::anyhow!("Metal resident FFT elements exceed u32"))?,
-            ],
-            signal_elements,
-        )?;
-        if static_spectrum.is_none() {
-            match filter_source {
-                ResidentImplicitFilterSource::Host(_) => self.encode_implicit_filter(
-                    encoder.as_ref(),
-                    freq_buffer,
-                    phase_buffer,
-                    decay_buffer,
-                    filter_first,
-                    kernel_u32,
-                    time_u32,
-                    order_u32,
-                    fft_len,
-                    filter_elements_u32,
-                )?,
-                ResidentImplicitFilterSource::Trainable(_) => self.encode_implicit_filter_fp16(
-                    encoder.as_ref(),
-                    freq_buffer,
-                    phase_buffer,
-                    decay_buffer,
-                    filter_first,
-                    kernel_u32,
-                    time_u32,
-                    order_u32,
-                    fft_len,
-                    filter_elements_u32,
-                )?,
-            }
-        }
-        let dispatch_two = |pipeline: &objc2::runtime::ProtocolObject<
-            dyn MTLComputePipelineState,
-        >,
-                            input,
-                            output,
-                            total,
-                            scalars: &[u32]| {
-            self.encode_fft_two_buffer(encoder.as_ref(), pipeline, input, output, total, scalars)
-        };
-        let run_fft = |first, second, transform_count, total, inverse| -> Result<bool> {
-            if plan.fft_len <= 4096 {
-                self.encode_fft_threadgroup_4096(
-                    encoder.as_ref(),
-                    first,
-                    second,
-                    fft_len,
-                    transform_count,
-                    inverse,
-                )?;
-                return Ok(false);
-            }
-            dispatch_two(
-                &self.fft_bitreverse_pipeline,
-                first,
-                second,
-                total,
-                &[fft_len, transform_count],
-            )?;
-            let mut source_is_first = false;
-            for stage in 1..=plan.stages {
-                let (source, destination) = if source_is_first {
-                    (first, second)
-                } else {
-                    (second, first)
-                };
-                dispatch_two(
-                    &self.fft_stage_pipeline,
-                    source,
-                    destination,
-                    total,
-                    &[fft_len, transform_count, stage, u32::from(inverse)],
-                )?;
-                source_is_first = !source_is_first;
-            }
-            Ok(source_is_first)
-        };
-        let signal_source_is_first = run_fft(
-            signal_first,
-            signal_second,
-            transforms_u32,
-            signal_elements,
-            false,
-        )?;
-        let filter_source_is_first = if static_spectrum.is_none() {
-            Some(run_fft(
-                filter_first,
-                filter_second,
-                channels_u32,
-                filter_fft_elements,
-                false,
-            )?)
-        } else {
-            None
-        };
-        let signal_spectrum = if signal_source_is_first {
-            signal_first
-        } else {
-            signal_second
-        };
-        let filter_spectrum = if let Some(spectrum) = static_spectrum {
-            &*spectrum.buffer
-        } else if filter_source_is_first.expect("dynamic filter FFT is present") {
-            filter_first
-        } else {
-            filter_second
-        };
-        let product_is_first = !signal_source_is_first;
-        let product = if product_is_first {
-            signal_first
-        } else {
-            signal_second
-        };
-        self.encode_fft_multiply(
-            encoder.as_ref(),
-            signal_spectrum,
-            filter_spectrum,
-            product,
-            fft_len,
-            channels_u32,
-            transforms_u32,
-            signal_elements,
-        )?;
-        let inverse_bitreversed_is_first = !product_is_first;
-        let inverse_bitreversed = if inverse_bitreversed_is_first {
-            signal_first
-        } else {
-            signal_second
-        };
-        let inverse_source_is_first = if plan.fft_len <= 4096 {
-            self.encode_fft_threadgroup_4096(
-                encoder.as_ref(),
-                product,
-                inverse_bitreversed,
-                fft_len,
-                transforms_u32,
-                true,
-            )?;
-            inverse_bitreversed_is_first
-        } else {
-            dispatch_two(
-                &self.fft_bitreverse_pipeline,
-                product,
-                inverse_bitreversed,
-                signal_elements,
-                &[fft_len, transforms_u32],
-            )?;
-            let mut source_is_first = inverse_bitreversed_is_first;
-            for stage in 1..=plan.stages {
-                let (source, destination) = if source_is_first {
-                    (signal_first, signal_second)
-                } else {
-                    (signal_second, signal_first)
-                };
-                dispatch_two(
-                    &self.fft_stage_pipeline,
-                    source,
-                    destination,
-                    signal_elements,
-                    &[fft_len, transforms_u32, stage, 1],
-                )?;
-                source_is_first = !source_is_first;
-            }
-            source_is_first
-        };
-        let inverse = if inverse_source_is_first {
-            signal_first
-        } else {
-            signal_second
-        };
-        self.encode_extract_overlap_save(
-            encoder.as_ref(),
-            inverse,
-            mixed,
-            [
-                time_u32,
-                channels_u32,
-                chunk_u32,
-                kernel_u32,
-                fft_len,
-                chunks_u32,
-                elements_u32,
-            ],
-            shape.elements(),
-        )?;
-        if let Some(cache) = cache {
-            self.encode_identity(encoder.as_ref(), mixed, &cache.mixed, shape.elements())?;
-        }
-        self.encode_apply_gate(
-            encoder.as_ref(),
-            mixed,
-            gated,
-            next,
-            channels_u32,
-            channels_u32
-                .checked_mul(2)
-                .ok_or_else(|| anyhow::anyhow!("Metal resident stride exceeds u32"))?,
-            channels_u32,
-            elements_u32,
-        )?;
-        encoder.endEncoding();
-        command.commit();
-        if wait_for_completion {
-            command.waitUntilCompleted();
-            if let Some(error) = command.error() {
-                bail!("Metal resident Hyena mixer failed: {error}");
-            }
-        }
-        Ok(())
-    }
-
-    /// Runs a projection without recompiling MSL or reallocating buffers when
-    /// the existing capacities already fit the requested shape.
-    #[allow(unsafe_code)]
-    fn dispatch_ternary(
-        &self,
-        input: &[f32],
-        positive: &[u64],
-        negative: &[u64],
-        scales: &[f32],
-        shape: TernaryLinearShape,
-        pipeline: &objc2::runtime::ProtocolObject<dyn objc2_metal::MTLComputePipelineState>,
-        fused_rms_norm: bool,
-    ) -> Result<Vec<f32>> {
-        use objc2_metal::{MTLBuffer, MTLCommandBuffer, MTLCommandEncoder, MTLCommandQueue};
-
-        let input_len = shape
-            .rows
-            .checked_mul(shape.in_features)
-            .ok_or_else(|| anyhow::anyhow!("ternary input shape overflow"))?;
-        let output_len = shape
-            .rows
-            .checked_mul(shape.out_features)
-            .ok_or_else(|| anyhow::anyhow!("ternary output shape overflow"))?;
-        let packed_words = shape.packed_words()?;
-        if input.len() != input_len
-            || positive.len() != packed_words
-            || negative.len() != packed_words
-            || scales.len() != shape.out_features
-        {
-            bail!("Metal ternary projection shape mismatch");
-        }
-        let input_bytes = input_len
-            .checked_mul(size_of::<f32>())
-            .ok_or_else(|| anyhow::anyhow!("Metal input buffer byte size overflow"))?;
-        let packed_bytes = packed_words
-            .checked_mul(size_of::<u64>())
-            .ok_or_else(|| anyhow::anyhow!("Metal ternary buffer byte size overflow"))?;
-        let scale_bytes = scales
-            .len()
-            .checked_mul(size_of::<f32>())
-            .ok_or_else(|| anyhow::anyhow!("Metal scale buffer byte size overflow"))?;
-        let output_bytes = output_len
-            .checked_mul(size_of::<f32>())
-            .ok_or_else(|| anyhow::anyhow!("Metal output buffer byte size overflow"))?;
-        let mut buffers = self.ternary_buffers.borrow_mut();
-        buffers.ensure(
-            &self.device,
-            input_bytes,
-            packed_bytes,
-            scale_bytes,
-            output_bytes,
-        )?;
-        let input_buffer = buffers.input.as_ref().expect("checked Metal input buffer");
-        let positive_buffer = buffers
-            .positive
-            .as_ref()
-            .expect("checked Metal positive buffer");
-        let negative_buffer = buffers
-            .negative
-            .as_ref()
-            .expect("checked Metal negative buffer");
-        let scale_buffer = buffers.scales.as_ref().expect("checked Metal scale buffer");
-        let output_buffer = buffers
-            .output
-            .as_ref()
-            .expect("checked Metal output buffer");
-        // SAFETY: Capacities were checked above; host writes complete before
-        // submission and the mutable scratch borrow lasts through completion.
-        unsafe {
-            input_buffer
-                .contents()
-                .cast::<f32>()
-                .as_ptr()
-                .copy_from_nonoverlapping(input.as_ptr(), input_len);
-            positive_buffer
-                .contents()
-                .cast::<u64>()
-                .as_ptr()
-                .copy_from_nonoverlapping(positive.as_ptr(), packed_words);
-            negative_buffer
-                .contents()
-                .cast::<u64>()
-                .as_ptr()
-                .copy_from_nonoverlapping(negative.as_ptr(), packed_words);
-            scale_buffer
-                .contents()
-                .cast::<f32>()
-                .as_ptr()
-                .copy_from_nonoverlapping(scales.as_ptr(), scales.len());
-        }
-        let command = self
-            .queue
-            .commandBuffer()
-            .ok_or_else(|| anyhow::anyhow!("Metal command buffer allocation failed"))?;
-        let encoder = command
-            .computeCommandEncoder()
-            .ok_or_else(|| anyhow::anyhow!("Metal compute encoder allocation failed"))?;
-        self.encode_ternary(
-            encoder.as_ref(),
-            pipeline,
-            input_buffer,
-            positive_buffer,
-            negative_buffer,
-            scale_buffer,
-            output_buffer,
-            shape,
-            fused_rms_norm,
-        )?;
-        encoder.endEncoding();
-        command.commit();
-        command.waitUntilCompleted();
-        if let Some(error) = command.error() {
-            bail!("Metal ternary command failed: {error}");
-        }
-        let mut output = vec![0.0; output_len];
-        // SAFETY: Command completion makes the output shared buffer readable;
-        // its initialized elements exactly match the destination allocation.
-        unsafe {
-            output.as_mut_ptr().copy_from_nonoverlapping(
-                output_buffer.contents().cast::<f32>().as_ptr(),
-                output_len,
-            );
-        }
-        Ok(output)
-    }
-
-    #[allow(unsafe_code)]
-    fn encode_ternary(
-        &self,
-        encoder: &objc2::runtime::ProtocolObject<dyn objc2_metal::MTLComputeCommandEncoder>,
-        pipeline: &objc2::runtime::ProtocolObject<dyn objc2_metal::MTLComputePipelineState>,
-        input: &objc2::runtime::ProtocolObject<dyn objc2_metal::MTLBuffer>,
-        positive: &objc2::runtime::ProtocolObject<dyn objc2_metal::MTLBuffer>,
-        negative: &objc2::runtime::ProtocolObject<dyn objc2_metal::MTLBuffer>,
-        scales: &objc2::runtime::ProtocolObject<dyn objc2_metal::MTLBuffer>,
-        output: &objc2::runtime::ProtocolObject<dyn objc2_metal::MTLBuffer>,
-        shape: TernaryLinearShape,
-        fused_rms_norm: bool,
-    ) -> Result<()> {
-        use core::ffi::c_void;
-        use core::ptr::NonNull;
-        use objc2_metal::{MTLComputeCommandEncoder, MTLComputePipelineState, MTLSize};
-        let rows =
-            u32::try_from(shape.rows).map_err(|_| anyhow::anyhow!("Metal rows exceed u32"))?;
-        let input_width = u32::try_from(shape.in_features)
-            .map_err(|_| anyhow::anyhow!("Metal input width exceeds u32"))?;
-        let output_width = u32::try_from(shape.out_features)
-            .map_err(|_| anyhow::anyhow!("Metal output width exceeds u32"))?;
-        let output_elements = shape
-            .rows
-            .checked_mul(shape.out_features)
-            .ok_or_else(|| anyhow::anyhow!("Metal ternary output shape overflow"))?;
-        encoder.setComputePipelineState(pipeline);
-        // SAFETY: slots and scalar offsets exactly match both ternary MSL declarations.
-        unsafe {
-            encoder.setBuffer_offset_atIndex(Some(input), 0, 0);
-            encoder.setBuffer_offset_atIndex(Some(positive), 0, 1);
-            encoder.setBuffer_offset_atIndex(Some(negative), 0, 2);
-            encoder.setBuffer_offset_atIndex(Some(scales), 0, 3);
-            encoder.setBuffer_offset_atIndex(Some(output), 0, 4);
-            for (slot, scalar) in [rows, input_width, output_width].iter().enumerate() {
-                encoder.setBytes_length_atIndex(
-                    NonNull::from(scalar).cast::<c_void>(),
-                    size_of::<u32>(),
-                    slot + 5,
-                );
-            }
-        }
-        let width = if fused_rms_norm {
-            pipeline.maxTotalThreadsPerThreadgroup().min(256)
-        } else {
-            pipeline
-                .maxTotalThreadsPerThreadgroup()
-                .min(output_elements)
-        };
-        if width == 0 {
-            bail!("Metal ternary pipeline reported zero threads per threadgroup");
-        }
-        if fused_rms_norm {
-            encoder.dispatchThreadgroups_threadsPerThreadgroup(
-                MTLSize {
-                    width: shape.rows,
-                    height: 1,
-                    depth: 1,
-                },
-                MTLSize {
-                    width,
-                    height: 1,
-                    depth: 1,
-                },
-            );
-        } else {
-            encoder.dispatchThreads_threadsPerThreadgroup(
-                MTLSize {
-                    width: output_elements,
-                    height: 1,
-                    depth: 1,
-                },
-                MTLSize {
-                    width,
-                    height: 1,
-                    depth: 1,
-                },
-            );
-        }
-        Ok(())
-    }
-
-    /// Runs the unfused packed ternary projection through cached Metal state.
-    #[allow(unsafe_code)]
-    pub fn ternary_linear_forward(
-        &self,
-        input: &[f32],
-        positive: &[u64],
-        negative: &[u64],
-        scales: &[f32],
-        shape: TernaryLinearShape,
-    ) -> Result<Vec<f32>> {
-        self.dispatch_ternary(
-            input,
-            positive,
-            negative,
-            scales,
-            shape,
-            &self.ternary_pipeline,
-            false,
-        )
-    }
-
-    /// Runs both packed ternary backward kernels using the runtime's grow-only
-    /// forward and backward workspaces. Results cross the host boundary only
-    /// because this is still a numerical-reference API.
-    #[allow(unsafe_code)]
-    pub fn ternary_linear_backward_reference(
-        &self,
-        input: &[f32],
-        output_gradient: &[f32],
-        positive: &[u64],
-        negative: &[u64],
-        scales: &[f32],
-        shape: TernaryLinearShape,
-    ) -> Result<MetalTernaryLinearBackward> {
-        use objc2_metal::{MTLBuffer, MTLCommandBuffer, MTLCommandEncoder, MTLCommandQueue};
-        let input_len = shape
-            .rows
-            .checked_mul(shape.in_features)
-            .ok_or_else(|| anyhow::anyhow!("Metal ternary backward input shape overflow"))?;
-        let output_len = shape
-            .rows
-            .checked_mul(shape.out_features)
-            .ok_or_else(|| anyhow::anyhow!("Metal ternary backward output shape overflow"))?;
-        let weight_len = shape
-            .in_features
-            .checked_mul(shape.out_features)
-            .ok_or_else(|| anyhow::anyhow!("Metal ternary backward weight shape overflow"))?;
-        let packed_words = shape.packed_words()?;
-        if input.len() != input_len
-            || output_gradient.len() != output_len
-            || positive.len() != packed_words
-            || negative.len() != packed_words
-            || scales.len() != shape.out_features
-            || input
-                .iter()
-                .chain(output_gradient)
-                .chain(scales)
-                .any(|value| !value.is_finite())
-        {
-            bail!("Metal ternary backward shape/value mismatch");
-        }
-        let input_bytes = input_len
-            .checked_mul(size_of::<f32>())
-            .ok_or_else(|| anyhow::anyhow!("Metal ternary backward input bytes overflow"))?;
-        let output_bytes = output_len
-            .checked_mul(size_of::<f32>())
-            .ok_or_else(|| anyhow::anyhow!("Metal ternary backward output bytes overflow"))?;
-        let packed_bytes = packed_words
-            .checked_mul(size_of::<u64>())
-            .ok_or_else(|| anyhow::anyhow!("Metal ternary backward code bytes overflow"))?;
-        let scale_bytes = scales
-            .len()
-            .checked_mul(size_of::<f32>())
-            .ok_or_else(|| anyhow::anyhow!("Metal ternary backward scale bytes overflow"))?;
-        let weight_bytes = weight_len
-            .checked_mul(size_of::<f32>())
-            .ok_or_else(|| anyhow::anyhow!("Metal ternary backward weight bytes overflow"))?;
-        let mut buffers = self.ternary_buffers.borrow_mut();
-        buffers.ensure(&self.device, input_bytes, packed_bytes, scale_bytes, 0)?;
-        let input_buffer = buffers.input.as_ref().expect("checked Metal ternary input");
-        let positive_buffer = buffers
-            .positive
-            .as_ref()
-            .expect("checked Metal positive codes");
-        let negative_buffer = buffers
-            .negative
-            .as_ref()
-            .expect("checked Metal negative codes");
-        let scale_buffer = buffers
-            .scales
-            .as_ref()
-            .expect("checked Metal ternary scales");
-        let mut backward = self.backward_buffers.borrow_mut();
-        backward.ensure(&self.device, 0, 0, output_bytes, input_bytes, weight_bytes)?;
-        let output_gradient_buffer = backward
-            .output_gradient
-            .as_ref()
-            .expect("checked Metal ternary output gradient");
-        let input_gradient = backward
-            .input_gradient
-            .as_ref()
-            .expect("checked Metal ternary input gradient");
-        let weight_gradient = backward
-            .parameter_gradient
-            .as_ref()
-            .expect("checked Metal ternary weight gradient");
-        // SAFETY: every shared allocation has exactly the validated source
-        // capacity and no command is submitted until these copies complete.
-        unsafe {
-            input_buffer
-                .contents()
-                .cast::<f32>()
-                .as_ptr()
-                .copy_from_nonoverlapping(input.as_ptr(), input_len);
-            positive_buffer
-                .contents()
-                .cast::<u64>()
-                .as_ptr()
-                .copy_from_nonoverlapping(positive.as_ptr(), packed_words);
-            negative_buffer
-                .contents()
-                .cast::<u64>()
-                .as_ptr()
-                .copy_from_nonoverlapping(negative.as_ptr(), packed_words);
-            scale_buffer
-                .contents()
-                .cast::<f32>()
-                .as_ptr()
-                .copy_from_nonoverlapping(scales.as_ptr(), scales.len());
-            output_gradient_buffer
-                .contents()
-                .cast::<f32>()
-                .as_ptr()
-                .copy_from_nonoverlapping(output_gradient.as_ptr(), output_len);
-        }
-        let rows =
-            u32::try_from(shape.rows).map_err(|_| anyhow::anyhow!("Metal rows exceed u32"))?;
-        let in_features = u32::try_from(shape.in_features)
-            .map_err(|_| anyhow::anyhow!("Metal input width exceeds u32"))?;
-        let out_features = u32::try_from(shape.out_features)
-            .map_err(|_| anyhow::anyhow!("Metal output width exceeds u32"))?;
-        let command = self
-            .queue
-            .commandBuffer()
-            .ok_or_else(|| anyhow::anyhow!("Metal command buffer allocation failed"))?;
-        let encoder = command
-            .computeCommandEncoder()
-            .ok_or_else(|| anyhow::anyhow!("Metal compute encoder allocation failed"))?;
-        self.encode_elementwise_buffers(
-            encoder.as_ref(),
-            &self.ternary_input_backward_pipeline,
-            &[
-                output_gradient_buffer,
-                positive_buffer,
-                negative_buffer,
-                scale_buffer,
-                input_gradient,
-            ],
-            &[rows, in_features, out_features],
-            input_len,
-        )?;
-        self.encode_tiled_ternary_ste_weight_backward(
-            encoder.as_ref(),
-            input_buffer,
-            output_gradient_buffer,
-            scale_buffer,
-            weight_gradient,
-            rows,
-            in_features,
-            out_features,
-        )?;
-        encoder.endEncoding();
-        command.commit();
-        command.waitUntilCompleted();
-        if let Some(error) = command.error() {
-            bail!("Metal ternary backward command failed: {error}");
-        }
-        let mut input_gradient_result = vec![0.0; input_len];
-        let mut weight_gradient_result = vec![0.0; weight_len];
-        // SAFETY: command completion makes both shared result buffers readable.
-        unsafe {
-            input_gradient_result.as_mut_ptr().copy_from_nonoverlapping(
-                input_gradient.contents().cast::<f32>().as_ptr(),
-                input_len,
-            );
-            weight_gradient_result
-                .as_mut_ptr()
-                .copy_from_nonoverlapping(
-                    weight_gradient.contents().cast::<f32>().as_ptr(),
-                    weight_len,
-                );
-        }
-        Ok(MetalTernaryLinearBackward {
-            input_gradient: input_gradient_result,
-            latent_weight_gradient: weight_gradient_result,
-        })
-    }
-
-    /// Exact direct bounded-convolution backward on Metal. This intentionally
-    /// mirrors the CPU reference before replacing its reductions with FFT
-    /// adjoints, so the training graph has a stable causal contract.
-    #[allow(unsafe_code)]
-    pub fn causal_chunked_conv_backward_reference(
-        &self,
-        input: &[f32],
-        filter: &[f32],
-        output_gradient: &[f32],
-        batch: usize,
-        time: usize,
-        channels: usize,
-        plan: HyenaChunkPlan,
-    ) -> Result<MetalCausalConvBackward> {
-        use objc2_metal::{MTLBuffer, MTLCommandBuffer, MTLCommandEncoder, MTLCommandQueue};
-        let plan = plan.for_sequence(time)?;
-        let elements = batch
-            .checked_mul(time)
-            .and_then(|rows| rows.checked_mul(channels))
-            .ok_or_else(|| anyhow::anyhow!("Metal causal backward shape overflow"))?;
-        let filter_elements = channels
-            .checked_mul(plan.kernel_len)
-            .ok_or_else(|| anyhow::anyhow!("Metal causal backward filter overflow"))?;
-        if batch == 0
-            || channels == 0
-            || channels > 256
-            || input.len() != elements
-            || filter.len() != filter_elements
-            || output_gradient.len() != elements
-            || input
-                .iter()
-                .chain(filter)
-                .chain(output_gradient)
-                .any(|value| !value.is_finite())
-        {
-            bail!("Metal causal backward shape/value mismatch");
-        }
-        let element_bytes = elements
-            .checked_mul(size_of::<f32>())
-            .ok_or_else(|| anyhow::anyhow!("Metal causal backward activation bytes overflow"))?;
-        let filter_bytes = filter_elements
-            .checked_mul(size_of::<f32>())
-            .ok_or_else(|| anyhow::anyhow!("Metal causal backward filter bytes overflow"))?;
-        let mut buffers = self.backward_buffers.borrow_mut();
-        buffers.ensure(
-            &self.device,
-            element_bytes,
-            filter_bytes,
-            element_bytes,
-            element_bytes,
-            filter_bytes,
-        )?;
-        let input_buffer = buffers.source.as_ref().expect("checked Metal causal input");
-        let filter_buffer = buffers
-            .auxiliary
-            .as_ref()
-            .expect("checked Metal causal filter");
-        let output_gradient_buffer = buffers
-            .output_gradient
-            .as_ref()
-            .expect("checked Metal causal output gradient");
-        let input_gradient_buffer = buffers
-            .input_gradient
-            .as_ref()
-            .expect("checked Metal causal input gradient");
-        let filter_gradient_buffer = buffers
-            .parameter_gradient
-            .as_ref()
-            .expect("checked Metal causal filter gradient");
-        // SAFETY: each shared allocation has exactly its validated slice size.
-        unsafe {
-            input_buffer
-                .contents()
-                .cast::<f32>()
-                .as_ptr()
-                .copy_from_nonoverlapping(input.as_ptr(), elements);
-            filter_buffer
-                .contents()
-                .cast::<f32>()
-                .as_ptr()
-                .copy_from_nonoverlapping(filter.as_ptr(), filter_elements);
-            output_gradient_buffer
-                .contents()
-                .cast::<f32>()
-                .as_ptr()
-                .copy_from_nonoverlapping(output_gradient.as_ptr(), elements);
-        }
-        let batch = u32::try_from(batch).map_err(|_| anyhow::anyhow!("Metal batch exceeds u32"))?;
-        let time = u32::try_from(time).map_err(|_| anyhow::anyhow!("Metal time exceeds u32"))?;
-        let channels =
-            u32::try_from(channels).map_err(|_| anyhow::anyhow!("Metal channels exceed u32"))?;
-        let kernel_len = u32::try_from(plan.kernel_len)
-            .map_err(|_| anyhow::anyhow!("Metal kernel length exceeds u32"))?;
-        let command = self
-            .queue
-            .commandBuffer()
-            .ok_or_else(|| anyhow::anyhow!("Metal command buffer allocation failed"))?;
-        let encoder = command
-            .computeCommandEncoder()
-            .ok_or_else(|| anyhow::anyhow!("Metal compute encoder allocation failed"))?;
-        self.encode_elementwise_buffers(
-            encoder.as_ref(),
-            &self.causal_conv_input_backward_pipeline,
-            &[filter_buffer, output_gradient_buffer, input_gradient_buffer],
-            &[batch, time, channels, kernel_len],
-            elements,
-        )?;
-        self.encode_elementwise_buffers(
-            encoder.as_ref(),
-            &self.causal_conv_filter_backward_pipeline,
-            &[input_buffer, output_gradient_buffer, filter_gradient_buffer],
-            &[batch, time, channels, kernel_len],
-            filter_elements,
-        )?;
-        encoder.endEncoding();
-        command.commit();
-        command.waitUntilCompleted();
-        if let Some(error) = command.error() {
-            bail!("Metal causal backward command failed: {error}");
-        }
-        let mut input_gradient = vec![0.0; elements];
-        let mut filter_gradient = vec![0.0; filter_elements];
-        // SAFETY: completion makes both exact-size shared outputs readable.
-        unsafe {
-            input_gradient.as_mut_ptr().copy_from_nonoverlapping(
-                input_gradient_buffer.contents().cast::<f32>().as_ptr(),
-                elements,
-            );
-            filter_gradient.as_mut_ptr().copy_from_nonoverlapping(
-                filter_gradient_buffer.contents().cast::<f32>().as_ptr(),
-                filter_elements,
-            );
-        }
-        Ok(MetalCausalConvBackward {
-            input_gradient,
-            filter_gradient,
-        })
-    }
-
-    /// Exact row-wise RMSNorm backward reference on Metal. The normalized
-    /// input is caller-owned cache from the matching forward block.
-    #[allow(unsafe_code)]
-    pub fn rms_norm_backward_reference(
-        &self,
-        input: &[f32],
-        normalized: &[f32],
-        output_gradient: &[f32],
-        rows: usize,
-        channels: usize,
-    ) -> Result<Vec<f32>> {
-        use objc2_metal::{MTLBuffer, MTLCommandBuffer, MTLCommandEncoder, MTLCommandQueue};
-        let elements = rows
-            .checked_mul(channels)
-            .ok_or_else(|| anyhow::anyhow!("Metal RMSNorm backward shape overflow"))?;
-        if rows == 0
-            || channels == 0
-            || input.len() != elements
-            || normalized.len() != elements
-            || output_gradient.len() != elements
-            || input
-                .iter()
-                .chain(normalized)
-                .chain(output_gradient)
-                .any(|value| !value.is_finite())
-        {
-            bail!("Metal RMSNorm backward shape/value mismatch");
-        }
-        let bytes = elements
-            .checked_mul(size_of::<f32>())
-            .ok_or_else(|| anyhow::anyhow!("Metal RMSNorm backward byte size overflow"))?;
-        let mut buffers = self.backward_buffers.borrow_mut();
-        buffers.ensure(&self.device, bytes, bytes, bytes, bytes, 0)?;
-        let input_buffer = buffers
-            .source
-            .as_ref()
-            .expect("checked Metal RMSNorm input");
-        let normalized_buffer = buffers
-            .auxiliary
-            .as_ref()
-            .expect("checked Metal RMSNorm normalized input");
-        let output_gradient_buffer = buffers
-            .output_gradient
-            .as_ref()
-            .expect("checked Metal RMSNorm output gradient");
-        let input_gradient_buffer = buffers
-            .input_gradient
-            .as_ref()
-            .expect("checked Metal RMSNorm input gradient");
-        // SAFETY: each shared allocation has exactly the checked source size.
-        unsafe {
-            input_buffer
-                .contents()
-                .cast::<f32>()
-                .as_ptr()
-                .copy_from_nonoverlapping(input.as_ptr(), elements);
-            normalized_buffer
-                .contents()
-                .cast::<f32>()
-                .as_ptr()
-                .copy_from_nonoverlapping(normalized.as_ptr(), elements);
-            output_gradient_buffer
-                .contents()
-                .cast::<f32>()
-                .as_ptr()
-                .copy_from_nonoverlapping(output_gradient.as_ptr(), elements);
-        }
-        let rows =
-            u32::try_from(rows).map_err(|_| anyhow::anyhow!("Metal RMSNorm rows exceed u32"))?;
-        let channels = u32::try_from(channels)
-            .map_err(|_| anyhow::anyhow!("Metal RMSNorm channels exceed u32"))?;
-        let command = self
-            .queue
-            .commandBuffer()
-            .ok_or_else(|| anyhow::anyhow!("Metal command buffer allocation failed"))?;
-        let encoder = command
-            .computeCommandEncoder()
-            .ok_or_else(|| anyhow::anyhow!("Metal compute encoder allocation failed"))?;
-        self.encode_elementwise_buffers(
-            encoder.as_ref(),
-            &self.rms_norm_backward_pipeline,
-            &[
-                input_buffer,
-                normalized_buffer,
-                output_gradient_buffer,
-                input_gradient_buffer,
-            ],
-            &[rows, channels],
-            rows as usize,
-        )?;
-        encoder.endEncoding();
-        command.commit();
-        command.waitUntilCompleted();
-        if let Some(error) = command.error() {
-            bail!("Metal RMSNorm backward command failed: {error}");
-        }
-        let mut input_gradient = vec![0.0; elements];
-        // SAFETY: command completion makes the exact-size shared output readable.
-        unsafe {
-            input_gradient.as_mut_ptr().copy_from_nonoverlapping(
-                input_gradient_buffer.contents().cast::<f32>().as_ptr(),
-                elements,
-            );
-        }
-        Ok(input_gradient)
-    }
-
-    /// Keeps the convolution-to-projection join on Metal: extracts the
-    /// signal half of a gated projection and adds its derivative to a gate
-    /// derivative in one command buffer. This is the layout boundary used by
-    /// the resident block-backward graph.
-    #[allow(unsafe_code)]
-    pub fn projection_signal_backward_reference(
-        &self,
-        gated_projection: &[f32],
-        gate_gradient: &[f32],
-        signal_gradient: &[f32],
-        rows: usize,
-        channels: usize,
-    ) -> Result<(Vec<f32>, Vec<f32>)> {
-        use objc2_metal::{MTLBuffer, MTLCommandBuffer, MTLCommandEncoder, MTLCommandQueue};
-        let elements = rows
-            .checked_mul(channels)
-            .ok_or_else(|| anyhow::anyhow!("Metal projection join shape overflow"))?;
-        let projected = elements
-            .checked_mul(2)
-            .ok_or_else(|| anyhow::anyhow!("Metal projection join width overflow"))?;
-        if rows == 0
-            || channels == 0
-            || gated_projection.len() != projected
-            || gate_gradient.len() != projected
-            || signal_gradient.len() != elements
-            || gated_projection
-                .iter()
-                .chain(gate_gradient)
-                .chain(signal_gradient)
-                .any(|value| !value.is_finite())
-        {
-            bail!("Metal projection join shape/value mismatch");
-        }
-        let activation_bytes = elements
-            .checked_mul(size_of::<f32>())
-            .ok_or_else(|| anyhow::anyhow!("Metal projection join activation overflow"))?;
-        let projected_bytes = projected
-            .checked_mul(size_of::<f32>())
-            .ok_or_else(|| anyhow::anyhow!("Metal projection join bytes overflow"))?;
-        let mut buffers = self.backward_buffers.borrow_mut();
-        buffers.ensure(
-            &self.device,
-            projected_bytes,
-            activation_bytes,
-            projected_bytes,
-            activation_bytes,
-            0,
-        )?;
-        let projection = buffers.source.as_ref().expect("checked Metal projection");
-        let signal_gradient_buffer = buffers
-            .auxiliary
-            .as_ref()
-            .expect("checked Metal signal gradient");
-        let projection_gradient = buffers
-            .output_gradient
-            .as_ref()
-            .expect("checked Metal projection gradient");
-        let signal = buffers
-            .input_gradient
-            .as_ref()
-            .expect("checked Metal signal");
-        // SAFETY: grow-only capacities exactly cover the checked source slices.
-        unsafe {
-            projection
-                .contents()
-                .cast::<f32>()
-                .as_ptr()
-                .copy_from_nonoverlapping(gated_projection.as_ptr(), projected);
-            signal_gradient_buffer
-                .contents()
-                .cast::<f32>()
-                .as_ptr()
-                .copy_from_nonoverlapping(signal_gradient.as_ptr(), elements);
-            projection_gradient
-                .contents()
-                .cast::<f32>()
-                .as_ptr()
-                .copy_from_nonoverlapping(gate_gradient.as_ptr(), projected);
-        }
-        let channels =
-            u32::try_from(channels).map_err(|_| anyhow::anyhow!("Metal channels exceed u32"))?;
-        let elements =
-            u32::try_from(elements).map_err(|_| anyhow::anyhow!("Metal elements exceed u32"))?;
-        let command = self
-            .queue
-            .commandBuffer()
-            .ok_or_else(|| anyhow::anyhow!("Metal command buffer allocation failed"))?;
-        let encoder = command
-            .computeCommandEncoder()
-            .ok_or_else(|| anyhow::anyhow!("Metal compute encoder allocation failed"))?;
-        self.encode_elementwise_buffers(
-            encoder.as_ref(),
-            &self.extract_projection_signal_pipeline,
-            &[projection, signal],
-            &[channels, elements],
-            elements as usize,
-        )?;
-        self.encode_elementwise_buffers(
-            encoder.as_ref(),
-            &self.add_projection_signal_gradient_pipeline,
-            &[projection_gradient, signal_gradient_buffer],
-            &[channels, elements],
-            elements as usize,
-        )?;
-        encoder.endEncoding();
-        command.commit();
-        command.waitUntilCompleted();
-        if let Some(error) = command.error() {
-            bail!("Metal projection join command failed: {error}");
-        }
-        let mut signal_result = vec![0.0; elements as usize];
-        let mut projection_gradient_result = vec![0.0; projected];
-        // SAFETY: command completion makes both shared results readable.
-        unsafe {
-            signal_result.as_mut_ptr().copy_from_nonoverlapping(
-                signal.contents().cast::<f32>().as_ptr(),
-                signal_result.len(),
-            );
-            projection_gradient_result
-                .as_mut_ptr()
-                .copy_from_nonoverlapping(
-                    projection_gradient.contents().cast::<f32>().as_ptr(),
-                    projection_gradient_result.len(),
-                );
-        }
-        Ok((signal_result, projection_gradient_result))
-    }
-
-    /// Executes the packed ternary projection with FP16 input, scales, and
-    /// output buffers. Dot products accumulate in FP32 inside the shader.
-    #[allow(unsafe_code)]
-    pub fn ternary_linear_forward_fp16(
-        &self,
-        input: &crate::precision::Fp16Storage,
-        positive: &[u64],
-        negative: &[u64],
-        scales: &crate::precision::Fp16Storage,
-        shape: TernaryLinearShape,
-    ) -> Result<crate::precision::Fp16Storage> {
-        use objc2_metal::{MTLBuffer, MTLCommandBuffer, MTLCommandEncoder, MTLCommandQueue};
-
-        let input_len = shape
-            .rows
-            .checked_mul(shape.in_features)
-            .ok_or_else(|| anyhow::anyhow!("FP16 ternary input shape overflow"))?;
-        let output_len = shape
-            .rows
-            .checked_mul(shape.out_features)
-            .ok_or_else(|| anyhow::anyhow!("FP16 ternary output shape overflow"))?;
-        let packed_words = shape.packed_words()?;
-        if input.len() != input_len
-            || positive.len() != packed_words
-            || negative.len() != packed_words
-            || scales.len() != shape.out_features
-        {
-            bail!("Metal FP16 ternary projection shape mismatch");
-        }
-        let input_bytes = input.bytes();
-        let packed_bytes = packed_words
-            .checked_mul(size_of::<u64>())
-            .ok_or_else(|| anyhow::anyhow!("Metal FP16 ternary buffer byte size overflow"))?;
-        let scale_bytes = scales.bytes();
-        let output_bytes = output_len
-            .checked_mul(size_of::<u16>())
-            .ok_or_else(|| anyhow::anyhow!("Metal FP16 output buffer byte size overflow"))?;
-        let mut buffers = self.ternary_buffers.borrow_mut();
-        buffers.ensure(
-            &self.device,
-            input_bytes,
-            packed_bytes,
-            scale_bytes,
-            output_bytes,
-        )?;
-        let input_buffer = buffers
-            .input
-            .as_ref()
-            .expect("checked Metal FP16 input buffer");
-        let positive_buffer = buffers
-            .positive
-            .as_ref()
-            .expect("checked Metal positive buffer");
-        let negative_buffer = buffers
-            .negative
-            .as_ref()
-            .expect("checked Metal negative buffer");
-        let scale_buffer = buffers
-            .scales
-            .as_ref()
-            .expect("checked Metal FP16 scale buffer");
-        let output_buffer = buffers
-            .output
-            .as_ref()
-            .expect("checked Metal FP16 output buffer");
-        // SAFETY: each destination has at least the checked byte capacity and
-        // host writes finish before GPU submission.
-        unsafe {
-            input_buffer
-                .contents()
-                .cast::<u16>()
-                .as_ptr()
-                .copy_from_nonoverlapping(input.as_bits().as_ptr(), input_len);
-            positive_buffer
-                .contents()
-                .cast::<u64>()
-                .as_ptr()
-                .copy_from_nonoverlapping(positive.as_ptr(), packed_words);
-            negative_buffer
-                .contents()
-                .cast::<u64>()
-                .as_ptr()
-                .copy_from_nonoverlapping(negative.as_ptr(), packed_words);
-            scale_buffer
-                .contents()
-                .cast::<u16>()
-                .as_ptr()
-                .copy_from_nonoverlapping(scales.as_bits().as_ptr(), scales.len());
-        }
-        let command = self.queue.commandBuffer().ok_or_else(|| {
-            anyhow::anyhow!("Metal FP16 ternary command buffer allocation failed")
-        })?;
-        let encoder = command.computeCommandEncoder().ok_or_else(|| {
-            anyhow::anyhow!("Metal FP16 ternary compute encoder allocation failed")
-        })?;
-        self.encode_ternary(
-            encoder.as_ref(),
-            &self.ternary_fp16_pipeline,
-            input_buffer,
-            positive_buffer,
-            negative_buffer,
-            scale_buffer,
-            output_buffer,
-            shape,
-            false,
-        )?;
-        encoder.endEncoding();
-        command.commit();
-        command.waitUntilCompleted();
-        if let Some(error) = command.error() {
-            bail!("Metal FP16 ternary command failed: {error}");
-        }
-        let mut output = vec![0_u16; output_len];
-        // SAFETY: command completion makes exactly `output_len` initialized
-        // half values visible in the shared output buffer.
-        unsafe {
-            output.as_mut_ptr().copy_from_nonoverlapping(
-                output_buffer.contents().cast::<u16>().as_ptr(),
-                output_len,
-            );
-        }
-        Ok(crate::precision::Fp16Storage::from_bits(output))
-    }
-
-    /// Uploads immutable packed ternary codes and FP16 scales once. The result
-    /// can be reused for every microbatch until the optimizer refreshes codes.
-    #[allow(unsafe_code)]
-    pub fn upload_fp16_ternary_weights(
-        &self,
-        positive: &[u64],
-        negative: &[u64],
-        scales: &crate::precision::Fp16Storage,
-        shape: TernaryLinearShape,
-    ) -> Result<ResidentFp16TernaryWeights> {
-        use objc2_metal::{MTLBuffer, MTLDevice, MTLResourceOptions};
-
-        let packed_words = shape.packed_words()?;
-        if positive.len() != packed_words
-            || negative.len() != packed_words
-            || scales.len() != shape.out_features
-        {
-            bail!("Metal resident FP16 ternary weight shape mismatch");
-        }
-        let packed_bytes = packed_words
-            .checked_mul(size_of::<u64>())
-            .ok_or_else(|| anyhow::anyhow!("Metal resident ternary code size overflow"))?;
-        let scale_bytes = scales.bytes();
-        let options = MTLResourceOptions::StorageModeShared;
-        let positive_buffer = self
-            .device
-            .newBufferWithLength_options(packed_bytes, options)
-            .ok_or_else(|| anyhow::anyhow!("Metal resident positive code allocation failed"))?;
-        let negative_buffer = self
-            .device
-            .newBufferWithLength_options(packed_bytes, options)
-            .ok_or_else(|| anyhow::anyhow!("Metal resident negative code allocation failed"))?;
-        let scale_buffer = self
-            .device
-            .newBufferWithLength_options(scale_bytes, options)
-            .ok_or_else(|| anyhow::anyhow!("Metal resident FP16 scale allocation failed"))?;
-        // SAFETY: buffer lengths exactly match validated source slice lengths.
-        unsafe {
-            positive_buffer
-                .contents()
-                .cast::<u64>()
-                .as_ptr()
-                .copy_from_nonoverlapping(positive.as_ptr(), packed_words);
-            negative_buffer
-                .contents()
-                .cast::<u64>()
-                .as_ptr()
-                .copy_from_nonoverlapping(negative.as_ptr(), packed_words);
-            scale_buffer
-                .contents()
-                .cast::<u16>()
-                .as_ptr()
-                .copy_from_nonoverlapping(scales.as_bits().as_ptr(), scales.len());
-        }
-        Ok(ResidentFp16TernaryWeights {
-            positive: positive_buffer,
-            negative: negative_buffer,
-            scales: scale_buffer,
-            shape,
-        })
-    }
-
-    /// Uploads FP16 master parameters once for repeated stateless optimizer
-    /// steps. Unlike Lion, this object carries no optimizer state beyond the
-    /// model parameters themselves.
-    #[allow(unsafe_code)]
-    pub fn upload_resident_fp16_parameters(
-        &self,
-        values: &crate::precision::Fp16Storage,
-    ) -> Result<ResidentFp16Parameters> {
-        use objc2_metal::{MTLBuffer, MTLDevice, MTLResourceOptions};
-
-        if values.is_empty() || (0..values.len()).any(|index| !values.get(index).is_finite()) {
-            bail!("Metal resident FP16 parameter values are invalid");
-        }
-        let buffer = self
-            .device
-            .newBufferWithLength_options(values.bytes(), MTLResourceOptions::StorageModeShared)
-            .ok_or_else(|| anyhow::anyhow!("Metal resident FP16 parameter allocation failed"))?;
-        // SAFETY: allocation is exactly `values.bytes()` and the source has
-        // `values.len()` initialized half values.
-        unsafe {
-            buffer
-                .contents()
-                .cast::<u16>()
-                .as_ptr()
-                .copy_from_nonoverlapping(values.as_bits().as_ptr(), values.len());
-        }
-        Ok(ResidentFp16Parameters {
-            parameters: buffer,
-            len: values.len(),
-        })
-    }
-
-    /// Creates the immutable FP32 embedding view used by the MPS expected-value GEMM.
-    #[allow(unsafe_code)]
-    pub fn upload_resident_mps_expected_embedding(
-        &self,
-        embedding: &crate::precision::Fp16Storage,
-        rows: usize,
-        vocab: usize,
-        channels: usize,
-    ) -> Result<ResidentMpsExpectedEmbedding> {
-        use objc2::AnyThread;
-        use objc2_metal::{MTLBuffer, MTLDevice, MTLResourceOptions};
-        use objc2_metal_performance_shaders::MPSMatrixMultiplication;
-
-        let elements = vocab
-            .checked_mul(channels)
-            .ok_or_else(|| anyhow::anyhow!("MPS tied embedding shape overflow"))?;
-        if rows == 0
-            || vocab == 0
-            || channels == 0
-            || embedding.len() != elements
-            || (0..embedding.len()).any(|index| !embedding.get(index).is_finite())
-        {
-            bail!("MPS tied embedding shape/value mismatch");
-        }
-        let bytes = elements
-            .checked_mul(size_of::<f32>())
-            .ok_or_else(|| anyhow::anyhow!("MPS tied embedding size overflow"))?;
-        let buffer = self
+        let inner = self
             .device
             .newBufferWithLength_options(bytes, MTLResourceOptions::StorageModeShared)
-            .ok_or_else(|| anyhow::anyhow!("MPS tied embedding allocation failed"))?;
-        let gradient = self
-            .device
-            .newBufferWithLength_options(bytes, MTLResourceOptions::StorageModeShared)
-            .ok_or_else(|| anyhow::anyhow!("MPS tied embedding-gradient allocation failed"))?;
-        let accumulator = self
-            .device
-            .newBufferWithLength_options(bytes, MTLResourceOptions::StorageModeShared)
-            .ok_or_else(|| anyhow::anyhow!("MPS tied embedding accumulator allocation failed"))?;
-        // SAFETY: the allocation has exactly `elements` FP32 slots.
-        unsafe {
-            let destination = buffer.contents().cast::<f32>().as_ptr();
-            for index in 0..elements {
-                destination.add(index).write(embedding.get(index));
-            }
-        }
-        let multiplication = unsafe {
-            MPSMatrixMultiplication::initWithDevice_transposeLeft_transposeRight_resultRows_resultColumns_interiorColumns_alpha_beta(
-                MPSMatrixMultiplication::alloc(),
-                self.device.as_ref(), false, false, rows, channels, vocab, 1.0, 0.0,
-            )
+            .ok_or_else(|| anyhow::anyhow!("Metal buffer allocation failed"))?;
+        Ok(MetalBuffer::from_retained(inner, bytes))
+    }
+
+    fn shared_buffer(&self, bytes: usize) -> Result<RecycledBuffer<'_>> {
+        let recycled = {
+            let mut free = self.scratch.borrow_mut();
+            free.iter()
+                .position(|buffer| buffer.len() >= bytes)
+                .map(|index| free.swap_remove(index))
         };
-        let output_gradient_multiplication = unsafe {
-            MPSMatrixMultiplication::initWithDevice_transposeLeft_transposeRight_resultRows_resultColumns_interiorColumns_alpha_beta(
-                MPSMatrixMultiplication::alloc(),
-                self.device.as_ref(), true, false, vocab, channels, rows, 1.0, 0.0,
-            )
+        let inner = match recycled {
+            Some(buffer) => buffer,
+            None => self.alloc_shared(bytes.next_power_of_two().max(bytes))?,
         };
-        Ok(ResidentMpsExpectedEmbedding {
-            embedding: buffer,
-            gradient,
-            accumulator,
-            rows,
-            vocab,
-            channels,
-            multiplication,
-            output_gradient_multiplication,
+        Ok(RecycledBuffer {
+            inner: Some(inner),
+            scratch: &self.scratch,
         })
     }
 
-    /// Applies clipped stateless SGD to FP16 master parameters on Metal.
-    /// Gradients are temporary FP32 values in a grow-only shared workspace;
-    /// no momentum or variance allocation is created.
-    #[allow(unsafe_code)]
-    pub fn resident_fp16_stateless_sgd(
-        &self,
-        parameters: &ResidentFp16Parameters,
-        gradient: &[f32],
-        learning_rate: f32,
-    ) -> Result<()> {
-        use objc2_metal::{MTLBuffer, MTLCommandBuffer, MTLCommandEncoder, MTLCommandQueue};
-
-        if gradient.len() != parameters.len
-            || !learning_rate.is_finite()
-            || learning_rate <= 0.0
-            || gradient.iter().any(|value| !value.is_finite())
-        {
-            bail!("Metal resident FP16 SGD shape/value mismatch");
-        }
-        let gradient_bytes = gradient
-            .len()
-            .checked_mul(size_of::<f32>())
-            .ok_or_else(|| anyhow::anyhow!("Metal resident FP16 SGD gradient overflow"))?;
-        let mut buffers = self.backward_buffers.borrow_mut();
-        buffers.ensure(&self.device, 0, gradient_bytes, 0, 0, 0)?;
-        let gradient_buffer = buffers
-            .auxiliary
-            .as_ref()
-            .expect("checked Metal SGD gradient workspace");
-        // SAFETY: the grow-only workspace has at least `gradient_bytes`.
-        unsafe {
-            gradient_buffer
-                .contents()
-                .cast::<f32>()
-                .as_ptr()
-                .copy_from_nonoverlapping(gradient.as_ptr(), gradient.len());
-        }
-        let command = self
-            .queue
-            .commandBuffer()
-            .ok_or_else(|| anyhow::anyhow!("Metal FP16 SGD command buffer allocation failed"))?;
-        let encoder = command
-            .computeCommandEncoder()
-            .ok_or_else(|| anyhow::anyhow!("Metal FP16 SGD compute encoder allocation failed"))?;
-        self.encode_clipped_sgd_fp16(
-            encoder.as_ref(),
-            parameters.parameters.as_ref(),
-            gradient_buffer,
-            learning_rate,
-            parameters.len,
-        )?;
-        encoder.endEncoding();
-        command.commit();
-        command.waitUntilCompleted();
-        if let Some(error) = command.error() {
-            bail!("Metal FP16 SGD command failed: {error}");
-        }
-        Ok(())
-    }
-
-    /// Applies the GPU-built tied output-embedding gradient and refreshes the
-    /// transient FP32 MPS view. The FP16 master remains the sole persistent
-    /// parameter copy; `mps.embedding` is a compute-only expansion.
-    #[allow(unsafe_code)]
-    pub fn resident_tied_embedding_stateless_sgd(
-        &self,
-        parameters: &ResidentFp16Parameters,
-        mps: &ResidentMpsExpectedEmbedding,
-        learning_rate: f32,
-    ) -> Result<()> {
-        use core::ffi::c_void;
-        use core::ptr::NonNull;
-        use objc2_metal::{
-            MTLCommandBuffer, MTLCommandEncoder, MTLCommandQueue, MTLComputeCommandEncoder,
-            MTLComputePipelineState, MTLSize,
-        };
-
-        if parameters.len != mps.vocab.checked_mul(mps.channels).unwrap_or(0)
-            || !learning_rate.is_finite()
-            || learning_rate <= 0.0
-        {
-            bail!("Metal tied embedding SGD shape/value mismatch");
-        }
-        let elements = u32::try_from(parameters.len)
-            .map_err(|_| anyhow::anyhow!("Metal tied embedding SGD elements exceed u32"))?;
-        let command = self.queue.commandBuffer().ok_or_else(|| {
-            anyhow::anyhow!("Metal tied embedding SGD command buffer allocation failed")
-        })?;
-        let encoder = command
-            .computeCommandEncoder()
-            .ok_or_else(|| anyhow::anyhow!("Metal tied embedding SGD encoder allocation failed"))?;
-        self.encode_clipped_sgd_fp16(
-            encoder.as_ref(),
-            parameters.parameters.as_ref(),
-            mps.accumulator.as_ref(),
-            learning_rate,
-            parameters.len,
-        )?;
-        encoder.endEncoding();
-        let encoder = command.computeCommandEncoder().ok_or_else(|| {
-            anyhow::anyhow!("Metal tied embedding refresh encoder allocation failed")
-        })?;
-        encoder.setComputePipelineState(&self.fp16_to_fp32_pipeline);
-        unsafe {
-            encoder.setBuffer_offset_atIndex(Some(parameters.parameters.as_ref()), 0, 0);
-            encoder.setBuffer_offset_atIndex(Some(mps.embedding.as_ref()), 0, 1);
-            encoder.setBytes_length_atIndex(
-                NonNull::from(&elements).cast::<c_void>(),
-                size_of::<u32>(),
-                2,
-            );
-        }
-        let width = self
-            .fp16_to_fp32_pipeline
-            .maxTotalThreadsPerThreadgroup()
-            .min(parameters.len);
-        if width == 0 {
-            bail!("Metal tied embedding refresh pipeline reported zero threads");
-        }
-        encoder.dispatchThreads_threadsPerThreadgroup(
-            MTLSize {
-                width: parameters.len,
-                height: 1,
-                depth: 1,
-            },
-            MTLSize {
-                width,
-                height: 1,
-                depth: 1,
-            },
-        );
-        encoder.endEncoding();
-        command.commit();
-        command.waitUntilCompleted();
-        if let Some(error) = command.error() {
-            bail!("Metal tied embedding SGD command failed: {error}");
-        }
-        Ok(())
-    }
-
-    /// Applies the input-side contribution of a tied embedding. This consumes
-    /// the final resident Hyena gradient, so no `[B*T,D]` tensor crosses CPU.
-    #[allow(unsafe_code)]
-    pub fn resident_input_embedding_stateless_sgd(
-        &self,
-        parameters: &ResidentFp16Parameters,
-        mps: &ResidentMpsExpectedEmbedding,
-        input_gradient_slot: ResidentGradientSlot,
-        tokens: &[u32],
-        rows: usize,
-        channels: usize,
-        vocab: usize,
-        learning_rate: f32,
-    ) -> Result<()> {
-        use core::ffi::c_void;
-        use core::ptr::NonNull;
-        use objc2_metal::{
-            MTLBuffer, MTLCommandBuffer, MTLCommandEncoder, MTLCommandQueue,
-            MTLComputeCommandEncoder, MTLSize,
-        };
-
-        let elements = rows
-            .checked_mul(channels)
-            .ok_or_else(|| anyhow::anyhow!("Metal input embedding gradient shape overflow"))?;
-        let embedding_elements = vocab
-            .checked_mul(channels)
-            .ok_or_else(|| anyhow::anyhow!("Metal input embedding gradient vocabulary overflow"))?;
-        if rows == 0
-            || channels == 0
-            || vocab == 0
-            || tokens.len() != rows
-            || parameters.len != embedding_elements
-            || mps.vocab != vocab
-            || mps.channels != channels
-            || !learning_rate.is_finite()
-            || learning_rate <= 0.0
-            || tokens.iter().any(|&token| token as usize >= vocab)
-        {
-            bail!("Metal input embedding gradient shape/value mismatch");
-        }
-        self.reserve_gradients(rows, channels)?;
-        let token_bytes = rows
-            .checked_mul(size_of::<u32>())
-            .ok_or_else(|| anyhow::anyhow!("Metal input embedding token size overflow"))?;
-        let mut token_buffers = self.resident_tokens.borrow_mut();
-        token_buffers.ensure(&self.device, token_bytes)?;
-        let tokens_buffer = token_buffers
-            .tokens
-            .as_ref()
-            .expect("checked Metal resident token buffer");
-        unsafe {
-            tokens_buffer
-                .contents()
-                .cast::<u32>()
-                .as_ptr()
-                .copy_from_nonoverlapping(tokens.as_ptr(), rows);
-        }
-        let gradients = self.gradient_activations.borrow();
-        let input_gradient = match input_gradient_slot {
-            ResidentGradientSlot::First => gradients.first.as_ref(),
-            ResidentGradientSlot::Second => gradients.second.as_ref(),
-            ResidentGradientSlot::Third => gradients.third.as_ref(),
-        }
-        .expect("checked Metal input embedding gradient activation");
-        let rows_u32 = u32::try_from(rows)
-            .map_err(|_| anyhow::anyhow!("Metal input embedding rows exceed u32"))?;
-        let channels_u32 = u32::try_from(channels)
-            .map_err(|_| anyhow::anyhow!("Metal input embedding channels exceed u32"))?;
-        let vocab_u32 = u32::try_from(vocab)
-            .map_err(|_| anyhow::anyhow!("Metal input embedding vocabulary exceeds u32"))?;
-        let command = self.queue.commandBuffer().ok_or_else(|| {
-            anyhow::anyhow!("Metal input embedding gradient command buffer allocation failed")
-        })?;
-        let encoder = command.computeCommandEncoder().ok_or_else(|| {
-            anyhow::anyhow!("Metal input embedding gradient encoder allocation failed")
-        })?;
-        encoder.setComputePipelineState(&self.input_embedding_gradient_pipeline);
-        unsafe {
-            encoder.setBuffer_offset_atIndex(Some(mps.accumulator.as_ref()), 0, 0);
-            encoder.setBuffer_offset_atIndex(Some(input_gradient), 0, 1);
-            encoder.setBuffer_offset_atIndex(Some(tokens_buffer), 0, 2);
-            for (slot, scalar) in [rows_u32, channels_u32, vocab_u32].iter().enumerate() {
-                encoder.setBytes_length_atIndex(
-                    NonNull::from(scalar).cast::<c_void>(),
-                    size_of::<u32>(),
-                    slot + 3,
-                );
-            }
-        }
-        encoder.dispatchThreads_threadsPerThreadgroup(
-            MTLSize {
-                width: elements,
-                height: 1,
-                depth: 1,
-            },
-            MTLSize {
-                width: 256,
-                height: 1,
-                depth: 1,
-            },
-        );
-        encoder.endEncoding();
-        command.commit();
-        command.waitUntilCompleted();
-        if let Some(error) = command.error() {
-            bail!("Metal input embedding gradient command failed: {error}");
-        }
-        self.resident_tied_embedding_stateless_sgd(parameters, mps, learning_rate)
-    }
-
-    /// Reads resident master parameters at an explicit validation or
-    /// checkpoint boundary.
-    #[allow(unsafe_code)]
-    pub fn download_resident_fp16_parameters(
-        &self,
-        parameters: &ResidentFp16Parameters,
-    ) -> Result<crate::precision::Fp16Storage> {
-        use objc2_metal::MTLBuffer;
-
-        let mut bits = vec![0_u16; parameters.len];
-        // SAFETY: the retained allocation has exactly `len` half elements and
-        // public optimizer commands wait for completion before returning.
-        unsafe {
-            bits.as_mut_ptr().copy_from_nonoverlapping(
-                parameters.parameters.contents().cast::<u16>().as_ptr(),
-                parameters.len,
-            );
-        }
-        Ok(crate::precision::Fp16Storage::from_bits(bits))
-    }
-
-    /// Computes exact streamed cross-entropy on Metal using a resident FP16
-    /// tied embedding. Each row scans vocabulary twice and emits only its
-    /// D-wide gradient and scalar loss; `[rows, vocab]` logits never exist.
-    #[allow(unsafe_code)]
-    pub fn streamed_cross_entropy_fp16_resident(
-        &self,
-        head: &[f32],
-        embedding: &ResidentFp16Parameters,
-        tokens: &[u32],
-        batch: usize,
-        time: usize,
-        channels: usize,
-        vocab: usize,
-        horizon: usize,
-    ) -> Result<MetalStreamedCrossEntropy> {
-        use core::ffi::c_void;
-        use core::ptr::NonNull;
-        use objc2_metal::{
-            MTLBuffer, MTLCommandBuffer, MTLCommandEncoder, MTLCommandQueue,
-            MTLComputeCommandEncoder, MTLSize,
-        };
-
-        let rows = batch
-            .checked_mul(time)
-            .ok_or_else(|| anyhow::anyhow!("Metal cross-entropy row overflow"))?;
-        let elements = rows
-            .checked_mul(channels)
-            .ok_or_else(|| anyhow::anyhow!("Metal cross-entropy activation overflow"))?;
-        let embedding_elements = vocab
-            .checked_mul(channels)
-            .ok_or_else(|| anyhow::anyhow!("Metal cross-entropy embedding overflow"))?;
-        if rows == 0
-            || channels == 0
-            || channels > 256
-            || vocab == 0
-            || horizon == 0
-            || horizon >= time
-            || head.len() != elements
-            || tokens.len() != rows
-            || embedding.len != embedding_elements
-            || head.iter().any(|value| !value.is_finite())
-            || tokens.iter().any(|&token| token as usize >= vocab)
-        {
-            bail!("Metal tiled streamed cross-entropy requires valid shapes and d_model <= 256");
-        }
-        let head_bytes = elements
-            .checked_mul(size_of::<f32>())
-            .ok_or_else(|| anyhow::anyhow!("Metal cross-entropy head size overflow"))?;
-        let token_bytes = rows
-            .checked_mul(size_of::<u32>())
-            .ok_or_else(|| anyhow::anyhow!("Metal cross-entropy token size overflow"))?;
-        let loss_bytes = rows
-            .checked_mul(size_of::<f32>())
-            .ok_or_else(|| anyhow::anyhow!("Metal cross-entropy loss size overflow"))?;
-        let mut buffers = self.streamed_cross_entropy.borrow_mut();
-        buffers.ensure(
-            &self.device,
-            head_bytes,
-            token_bytes,
-            head_bytes,
-            loss_bytes,
-            0,
-        )?;
-        let head_buffer = buffers
-            .head
-            .as_ref()
-            .expect("checked Metal streamed head buffer");
-        let token_buffer = buffers
-            .tokens
-            .as_ref()
-            .expect("checked Metal streamed token buffer");
-        let gradient_buffer = buffers
-            .gradient
-            .as_ref()
-            .expect("checked Metal streamed gradient buffer");
-        let loss_buffer = buffers
-            .loss
-            .as_ref()
-            .expect("checked Metal streamed loss buffer");
-        unsafe {
-            head_buffer
-                .contents()
-                .cast::<f32>()
-                .as_ptr()
-                .copy_from_nonoverlapping(head.as_ptr(), elements);
-            token_buffer
-                .contents()
-                .cast::<u32>()
-                .as_ptr()
-                .copy_from_nonoverlapping(tokens.as_ptr(), rows);
-        }
-        let scalars = [
-            u32::try_from(rows)
-                .map_err(|_| anyhow::anyhow!("Metal cross-entropy rows exceed u32"))?,
-            u32::try_from(time)
-                .map_err(|_| anyhow::anyhow!("Metal cross-entropy time exceeds u32"))?,
-            u32::try_from(channels)
-                .map_err(|_| anyhow::anyhow!("Metal cross-entropy channels exceed u32"))?,
-            u32::try_from(vocab)
-                .map_err(|_| anyhow::anyhow!("Metal cross-entropy vocabulary exceeds u32"))?,
-            u32::try_from(horizon)
-                .map_err(|_| anyhow::anyhow!("Metal cross-entropy horizon exceeds u32"))?,
-        ];
-        let command = self.queue.commandBuffer().ok_or_else(|| {
-            anyhow::anyhow!("Metal streamed cross-entropy command buffer allocation failed")
-        })?;
-        let encoder = command.computeCommandEncoder().ok_or_else(|| {
-            anyhow::anyhow!("Metal streamed cross-entropy encoder allocation failed")
-        })?;
-        encoder.setComputePipelineState(&self.streamed_cross_entropy_fp16_pipeline);
-        unsafe {
-            encoder.setBuffer_offset_atIndex(Some(head_buffer), 0, 0);
-            encoder.setBuffer_offset_atIndex(Some(embedding.parameters.as_ref()), 0, 1);
-            encoder.setBuffer_offset_atIndex(Some(token_buffer), 0, 2);
-            encoder.setBuffer_offset_atIndex(Some(gradient_buffer), 0, 3);
-            encoder.setBuffer_offset_atIndex(Some(loss_buffer), 0, 4);
-            for (slot, scalar) in scalars.iter().enumerate() {
-                encoder.setBytes_length_atIndex(
-                    NonNull::from(scalar).cast::<c_void>(),
-                    size_of::<u32>(),
-                    slot + 5,
-                );
-            }
-            let gradient_scale = 1.0f32;
-            encoder.setBytes_length_atIndex(
-                NonNull::from(&gradient_scale).cast::<c_void>(),
-                size_of::<f32>(),
-                10,
-            );
-        }
-        encoder.dispatchThreadgroups_threadsPerThreadgroup(
-            MTLSize {
-                width: rows,
-                height: 1,
-                depth: 1,
-            },
-            MTLSize {
-                width: 16,
-                height: 1,
-                depth: 1,
-            },
-        );
-        encoder.endEncoding();
-        command.commit();
-        command.waitUntilCompleted();
-        if let Some(error) = command.error() {
-            bail!("Metal streamed cross-entropy command failed: {error}");
-        }
-        let mut gradient = vec![0.0; elements];
-        let mut losses = vec![0.0; rows];
-        unsafe {
-            gradient.as_mut_ptr().copy_from_nonoverlapping(
-                gradient_buffer.contents().cast::<f32>().as_ptr(),
-                elements,
-            );
-            losses
-                .as_mut_ptr()
-                .copy_from_nonoverlapping(loss_buffer.contents().cast::<f32>().as_ptr(), rows);
-        }
-        Ok(MetalStreamedCrossEntropy {
-            loss_sum: losses.into_iter().sum(),
-            token_count: batch * (time - horizon),
-            head_gradient: gradient,
-        })
-    }
-
-    /// Resident form of streamed tied-embedding cross-entropy. The head is
-    /// read directly from the forward ping-pong stream and its exact `D`-wide
-    /// derivative is written to the reverse ping-pong stream. Thus the graph
-    /// never round-trips a terminal `[B*T,D]` gradient through CPU memory.
-    #[allow(unsafe_code)]
-    pub fn streamed_cross_entropy_fp16_from_activation(
-        &self,
-        head_slot: ResidentActivationSlot,
-        embedding: &ResidentFp16Parameters,
-        mps_expected_embedding: Option<&ResidentMpsExpectedEmbedding>,
-        reset_tied_embedding_gradient: bool,
-        tokens: &[u32],
-        batch: usize,
-        time: usize,
-        channels: usize,
-        vocab: usize,
-        horizon: usize,
-    ) -> Result<MetalResidentCrossEntropy> {
-        use core::ffi::c_void;
-        use core::ptr::NonNull;
-        use objc2_metal::{
-            MTLBuffer, MTLCommandBuffer, MTLCommandEncoder, MTLCommandQueue,
-            MTLComputeCommandEncoder, MTLSize,
-        };
-
-        let rows = batch
-            .checked_mul(time)
-            .ok_or_else(|| anyhow::anyhow!("Metal resident cross-entropy row overflow"))?;
-        let elements = rows
-            .checked_mul(channels)
-            .ok_or_else(|| anyhow::anyhow!("Metal resident cross-entropy activation overflow"))?;
-        let embedding_elements = vocab
-            .checked_mul(channels)
-            .ok_or_else(|| anyhow::anyhow!("Metal resident cross-entropy embedding overflow"))?;
-        if rows == 0
-            || channels == 0
-            || vocab == 0
-            || horizon == 0
-            || horizon >= time
-            || tokens.len() != rows
-            || embedding.len != embedding_elements
-            || tokens.iter().any(|&token| token as usize >= vocab)
-        {
-            bail!("Metal resident cross-entropy requires valid shapes");
-        }
-        let activation_bytes = elements.checked_mul(size_of::<f32>()).ok_or_else(|| {
-            anyhow::anyhow!("Metal resident cross-entropy activation size overflow")
-        })?;
-        let token_bytes = rows
-            .checked_mul(size_of::<u32>())
-            .ok_or_else(|| anyhow::anyhow!("Metal resident cross-entropy token size overflow"))?;
-        let loss_bytes = rows
-            .checked_mul(size_of::<f32>())
-            .ok_or_else(|| anyhow::anyhow!("Metal resident cross-entropy loss size overflow"))?;
-        let logits_bytes = rows
-            .checked_mul(vocab)
-            .and_then(|count| count.checked_mul(size_of::<f32>()))
-            .ok_or_else(|| anyhow::anyhow!("Metal resident cross-entropy logits size overflow"))?;
-        self.reserve_activations(rows, channels)?;
-        self.reserve_gradients(rows, channels)?;
-        let mut ce_buffers = self.streamed_cross_entropy.borrow_mut();
-        ce_buffers.ensure(
-            &self.device,
-            activation_bytes,
-            token_bytes,
-            activation_bytes,
-            loss_bytes,
-            logits_bytes,
-        )?;
-        let tokens_buffer = ce_buffers.tokens.as_ref().expect("checked CE token buffer");
-        let loss_buffer = ce_buffers.loss.as_ref().expect("checked CE loss buffer");
-        let logits_buffer = ce_buffers
-            .logits
-            .as_ref()
-            .expect("checked CE logits buffer");
-        unsafe {
-            tokens_buffer
-                .contents()
-                .cast::<u32>()
-                .as_ptr()
-                .copy_from_nonoverlapping(tokens.as_ptr(), rows);
-        }
-        let activations = self.activations.borrow();
-        let head = match head_slot {
-            ResidentActivationSlot::First => activations.first.as_ref(),
-            ResidentActivationSlot::Second => activations.second.as_ref(),
-        }
-        .expect("checked resident CE head activation");
-        let gradients = self.gradient_activations.borrow();
-        let gradient = gradients
-            .first
-            .as_ref()
-            .expect("checked resident CE gradient");
-        let scalars = [
-            u32::try_from(rows).map_err(|_| anyhow::anyhow!("Metal CE rows exceed u32"))?,
-            u32::try_from(time).map_err(|_| anyhow::anyhow!("Metal CE time exceeds u32"))?,
-            u32::try_from(channels).map_err(|_| anyhow::anyhow!("Metal CE channels exceed u32"))?,
-            u32::try_from(vocab).map_err(|_| anyhow::anyhow!("Metal CE vocabulary exceeds u32"))?,
-            u32::try_from(horizon).map_err(|_| anyhow::anyhow!("Metal CE horizon exceeds u32"))?,
-        ];
-        let gradient_scale = 1.0f32 / (batch * (time - horizon)) as f32;
-        let command = self.queue.commandBuffer().ok_or_else(|| {
-            anyhow::anyhow!(
-                "Metal resident streamed cross-entropy command buffer allocation failed"
-            )
-        })?;
-        if let Some(mps) = mps_expected_embedding
-            && (mps.rows != rows || mps.vocab != vocab || mps.channels != channels)
-        {
-            bail!("MPS expected-embedding plan does not match resident cross-entropy shape");
-        }
-        let encoder = command.computeCommandEncoder().ok_or_else(|| {
-            anyhow::anyhow!("Metal resident streamed cross-entropy encoder allocation failed")
-        })?;
-        encoder.setComputePipelineState(&self.tied_logits_fp16_pipeline);
-        unsafe {
-            encoder.setBuffer_offset_atIndex(Some(head), 0, 0);
-            encoder.setBuffer_offset_atIndex(Some(embedding.parameters.as_ref()), 0, 1);
-            encoder.setBuffer_offset_atIndex(Some(logits_buffer), 0, 2);
-            for (slot, scalar) in [scalars[0], scalars[2], scalars[3]].iter().enumerate() {
-                encoder.setBytes_length_atIndex(
-                    NonNull::from(scalar).cast::<c_void>(),
-                    size_of::<u32>(),
-                    slot + 3,
-                );
-            }
-        }
-        encoder.dispatchThreadgroups_threadsPerThreadgroup(
-            MTLSize {
-                width: vocab.div_ceil(16),
-                height: rows.div_ceil(16),
-                depth: 1,
-            },
-            MTLSize {
-                width: 16,
-                height: 16,
-                depth: 1,
-            },
-        );
-        encoder.endEncoding();
-        if let Some(mps) = mps_expected_embedding {
-            use objc2::AnyThread;
-            use objc2_metal_performance_shaders::{MPSDataType, MPSMatrix, MPSMatrixDescriptor};
-
-            let encoder = command.computeCommandEncoder().ok_or_else(|| {
-                anyhow::anyhow!("Metal resident softmax encoder allocation failed")
-            })?;
-            encoder.setComputePipelineState(&self.softmax_logits_fp16_pipeline);
-            unsafe {
-                encoder.setBuffer_offset_atIndex(Some(logits_buffer), 0, 0);
-                encoder.setBuffer_offset_atIndex(Some(tokens_buffer), 0, 1);
-                encoder.setBuffer_offset_atIndex(Some(loss_buffer), 0, 2);
-                for (slot, scalar) in [scalars[0], scalars[1], scalars[3], scalars[4]]
-                    .iter()
-                    .enumerate()
-                {
-                    encoder.setBytes_length_atIndex(
-                        NonNull::from(scalar).cast::<c_void>(),
-                        size_of::<u32>(),
-                        slot + 3,
-                    );
-                }
-            }
-            encoder.dispatchThreadgroups_threadsPerThreadgroup(
-                MTLSize {
-                    width: rows,
-                    height: 1,
-                    depth: 1,
-                },
-                MTLSize {
-                    width: 16,
-                    height: 1,
-                    depth: 1,
-                },
-            );
-            encoder.endEncoding();
-            let probability_descriptor = unsafe {
-                MPSMatrixDescriptor::matrixDescriptorWithRows_columns_rowBytes_dataType(
-                    rows,
-                    vocab,
-                    vocab * size_of::<f32>(),
-                    MPSDataType::Float32,
-                )
-            };
-            let embedding_descriptor = unsafe {
-                MPSMatrixDescriptor::matrixDescriptorWithRows_columns_rowBytes_dataType(
-                    vocab,
-                    channels,
-                    channels * size_of::<f32>(),
-                    MPSDataType::Float32,
-                )
-            };
-            let gradient_descriptor = unsafe {
-                MPSMatrixDescriptor::matrixDescriptorWithRows_columns_rowBytes_dataType(
-                    rows,
-                    channels,
-                    channels * size_of::<f32>(),
-                    MPSDataType::Float32,
-                )
-            };
-            let probability_matrix = unsafe {
-                MPSMatrix::initWithBuffer_descriptor(
-                    MPSMatrix::alloc(),
-                    logits_buffer,
-                    &probability_descriptor,
-                )
-            };
-            let embedding_matrix = unsafe {
-                MPSMatrix::initWithBuffer_descriptor(
-                    MPSMatrix::alloc(),
-                    mps.embedding.as_ref(),
-                    &embedding_descriptor,
-                )
-            };
-            let gradient_matrix = unsafe {
-                MPSMatrix::initWithBuffer_descriptor(
-                    MPSMatrix::alloc(),
-                    gradient,
-                    &gradient_descriptor,
-                )
-            };
-            unsafe {
-                mps.multiplication
-                    .encodeToCommandBuffer_leftMatrix_rightMatrix_resultMatrix(
-                        command.as_ref(),
-                        &probability_matrix,
-                        &embedding_matrix,
-                        &gradient_matrix,
-                    );
-            }
-            let output_gradient_descriptor = unsafe {
-                MPSMatrixDescriptor::matrixDescriptorWithRows_columns_rowBytes_dataType(
-                    vocab,
-                    channels,
-                    channels * size_of::<f32>(),
-                    MPSDataType::Float32,
-                )
-            };
-            let head_matrix = unsafe {
-                MPSMatrix::initWithBuffer_descriptor(MPSMatrix::alloc(), head, &gradient_descriptor)
-            };
-            let output_gradient_matrix = unsafe {
-                MPSMatrix::initWithBuffer_descriptor(
-                    MPSMatrix::alloc(),
-                    mps.gradient.as_ref(),
-                    &output_gradient_descriptor,
-                )
-            };
-            unsafe {
-                mps.output_gradient_multiplication
-                    .encodeToCommandBuffer_leftMatrix_rightMatrix_resultMatrix(
-                        command.as_ref(),
-                        &probability_matrix,
-                        &head_matrix,
-                        &output_gradient_matrix,
-                    );
-            }
-            let encoder = command.computeCommandEncoder().ok_or_else(|| {
-                anyhow::anyhow!("Metal resident tied embedding-gradient encoder allocation failed")
-            })?;
-            encoder.setComputePipelineState(&self.target_embedding_gradient_fp16_pipeline);
-            unsafe {
-                encoder.setBuffer_offset_atIndex(Some(mps.gradient.as_ref()), 0, 0);
-                encoder.setBuffer_offset_atIndex(Some(head), 0, 1);
-                encoder.setBuffer_offset_atIndex(Some(tokens_buffer), 0, 2);
-                for (slot, scalar) in scalars.iter().enumerate() {
-                    encoder.setBytes_length_atIndex(
-                        NonNull::from(scalar).cast::<c_void>(),
-                        size_of::<u32>(),
-                        slot + 3,
-                    );
-                }
-            }
-            encoder.dispatchThreads_threadsPerThreadgroup(
-                MTLSize {
-                    width: elements,
-                    height: 1,
-                    depth: 1,
-                },
-                MTLSize {
-                    width: 256,
-                    height: 1,
-                    depth: 1,
-                },
-            );
-            encoder.endEncoding();
-            let embedding_elements_u32 = u32::try_from(embedding_elements).map_err(|_| {
-                anyhow::anyhow!("Metal tied embedding gradient elements exceed u32")
-            })?;
-            let encoder = command.computeCommandEncoder().ok_or_else(|| {
-                anyhow::anyhow!(
-                    "Metal resident tied embedding-gradient scale encoder allocation failed"
-                )
-            })?;
-            encoder.setComputePipelineState(&self.scale_fp32_pipeline);
-            unsafe {
-                encoder.setBuffer_offset_atIndex(Some(mps.gradient.as_ref()), 0, 0);
-                encoder.setBytes_length_atIndex(
-                    NonNull::from(&gradient_scale).cast::<c_void>(),
-                    size_of::<f32>(),
-                    1,
-                );
-                encoder.setBytes_length_atIndex(
-                    NonNull::from(&embedding_elements_u32).cast::<c_void>(),
-                    size_of::<u32>(),
-                    2,
-                );
-            }
-            encoder.dispatchThreads_threadsPerThreadgroup(
-                MTLSize {
-                    width: embedding_elements,
-                    height: 1,
-                    depth: 1,
-                },
-                MTLSize {
-                    width: 256,
-                    height: 1,
-                    depth: 1,
-                },
-            );
-            encoder.endEncoding();
-            let encoder = command.computeCommandEncoder().ok_or_else(|| {
-                anyhow::anyhow!("Metal tied embedding accumulator encoder allocation failed")
-            })?;
-            if reset_tied_embedding_gradient {
-                let zero = 0.0f32;
-                let elements_u32 = u32::try_from(embedding_elements)
-                    .map_err(|_| anyhow::anyhow!("Metal tied embedding accumulator exceeds u32"))?;
-                encoder.setComputePipelineState(&self.scale_fp32_pipeline);
-                unsafe {
-                    encoder.setBuffer_offset_atIndex(Some(mps.accumulator.as_ref()), 0, 0);
-                    encoder.setBytes_length_atIndex(
-                        NonNull::from(&zero).cast::<c_void>(),
-                        size_of::<f32>(),
-                        1,
-                    );
-                    encoder.setBytes_length_atIndex(
-                        NonNull::from(&elements_u32).cast::<c_void>(),
-                        size_of::<u32>(),
-                        2,
-                    );
-                }
-                encoder.dispatchThreads_threadsPerThreadgroup(
-                    MTLSize {
-                        width: embedding_elements,
-                        height: 1,
-                        depth: 1,
-                    },
-                    MTLSize {
-                        width: 256,
-                        height: 1,
-                        depth: 1,
-                    },
-                );
-            }
-            let elements_u32 = u32::try_from(embedding_elements)
-                .map_err(|_| anyhow::anyhow!("Metal tied embedding accumulator exceeds u32"))?;
-            encoder.setComputePipelineState(&self.add_fp32_pipeline);
-            unsafe {
-                encoder.setBuffer_offset_atIndex(Some(mps.accumulator.as_ref()), 0, 0);
-                encoder.setBuffer_offset_atIndex(Some(mps.gradient.as_ref()), 0, 1);
-                encoder.setBytes_length_atIndex(
-                    NonNull::from(&elements_u32).cast::<c_void>(),
-                    size_of::<u32>(),
-                    2,
-                );
-            }
-            encoder.dispatchThreads_threadsPerThreadgroup(
-                MTLSize {
-                    width: embedding_elements,
-                    height: 1,
-                    depth: 1,
-                },
-                MTLSize {
-                    width: 256,
-                    height: 1,
-                    depth: 1,
-                },
-            );
-            encoder.endEncoding();
-            let encoder = command.computeCommandEncoder().ok_or_else(|| {
-                anyhow::anyhow!("Metal resident final CE-gradient encoder allocation failed")
-            })?;
-            encoder.setComputePipelineState(&self.finalize_cross_entropy_gradient_fp16_pipeline);
-            unsafe {
-                encoder.setBuffer_offset_atIndex(Some(gradient), 0, 0);
-                encoder.setBuffer_offset_atIndex(Some(embedding.parameters.as_ref()), 0, 1);
-                encoder.setBuffer_offset_atIndex(Some(tokens_buffer), 0, 2);
-                for (slot, scalar) in [scalars[0], scalars[1], scalars[2], scalars[4]]
-                    .iter()
-                    .enumerate()
-                {
-                    encoder.setBytes_length_atIndex(
-                        NonNull::from(scalar).cast::<c_void>(),
-                        size_of::<u32>(),
-                        slot + 3,
-                    );
-                }
-                encoder.setBytes_length_atIndex(
-                    NonNull::from(&gradient_scale).cast::<c_void>(),
-                    size_of::<f32>(),
-                    7,
-                );
-            }
-            encoder.dispatchThreads_threadsPerThreadgroup(
-                MTLSize {
-                    width: elements,
-                    height: 1,
-                    depth: 1,
-                },
-                MTLSize {
-                    width: 256,
-                    height: 1,
-                    depth: 1,
-                },
-            );
-            encoder.endEncoding();
-            command.commit();
-            command.waitUntilCompleted();
-            if let Some(error) = command.error() {
-                bail!("Metal resident MPS cross-entropy command failed: {error}");
-            }
-            let mut losses = vec![0.0; rows];
-            unsafe {
-                losses
-                    .as_mut_ptr()
-                    .copy_from_nonoverlapping(loss_buffer.contents().cast::<f32>().as_ptr(), rows);
-            }
-            return Ok(MetalResidentCrossEntropy {
-                loss_sum: losses.into_iter().sum(),
-                token_count: batch * (time - horizon),
-                gradient_slot: ResidentGradientSlot::First,
-            });
-        }
-        let encoder = command.computeCommandEncoder().ok_or_else(|| {
-            anyhow::anyhow!("Metal resident logits cross-entropy encoder allocation failed")
-        })?;
-        encoder.setComputePipelineState(&self.cross_entropy_logits_fp16_pipeline);
-        unsafe {
-            encoder.setBuffer_offset_atIndex(Some(logits_buffer), 0, 0);
-            encoder.setBuffer_offset_atIndex(Some(embedding.parameters.as_ref()), 0, 1);
-            encoder.setBuffer_offset_atIndex(Some(tokens_buffer), 0, 2);
-            encoder.setBuffer_offset_atIndex(Some(gradient), 0, 3);
-            encoder.setBuffer_offset_atIndex(Some(loss_buffer), 0, 4);
-            for (slot, scalar) in scalars.iter().enumerate() {
-                encoder.setBytes_length_atIndex(
-                    NonNull::from(scalar).cast::<c_void>(),
-                    size_of::<u32>(),
-                    slot + 5,
-                );
-            }
-            encoder.setBytes_length_atIndex(
-                NonNull::from(&gradient_scale).cast::<c_void>(),
-                size_of::<f32>(),
-                10,
-            );
-        }
-        encoder.dispatchThreadgroups_threadsPerThreadgroup(
-            MTLSize {
-                width: rows,
-                height: 1,
-                depth: 1,
-            },
-            MTLSize {
-                width: 16,
-                height: 1,
-                depth: 1,
-            },
-        );
-        encoder.endEncoding();
-        command.commit();
-        command.waitUntilCompleted();
-        if let Some(error) = command.error() {
-            bail!("Metal resident streamed cross-entropy command failed: {error}");
-        }
-        let mut losses = vec![0.0; rows];
-        unsafe {
-            losses
-                .as_mut_ptr()
-                .copy_from_nonoverlapping(loss_buffer.contents().cast::<f32>().as_ptr(), rows);
-        }
-        Ok(MetalResidentCrossEntropy {
-            loss_sum: losses.into_iter().sum(),
-            token_count: batch * (time - horizon),
-            gradient_slot: ResidentGradientSlot::First,
-        })
-    }
-
-    /// Uploads the three compact implicit-filter vectors once for a resident
-    /// training run. Their FP16 representation is the sole persistent master
-    /// state; gradients are supplied only for the duration of an update.
-    pub fn upload_resident_implicit_filter_parameters(
-        &self,
-        filter: &crate::hyena::ImplicitFilter,
-        channels: usize,
-    ) -> Result<ResidentImplicitFilterParameters> {
-        let (freq, phase, decay, order) = filter.parameter_slices(channels)?;
-        Ok(ResidentImplicitFilterParameters {
-            freq: self.upload_resident_fp16_parameters(
-                &crate::precision::Fp16Storage::from_f32(freq.iter().copied()),
-            )?,
-            phase: self.upload_resident_fp16_parameters(
-                &crate::precision::Fp16Storage::from_f32(phase.iter().copied()),
-            )?,
-            decay: self.upload_resident_fp16_parameters(
-                &crate::precision::Fp16Storage::from_f32(decay.iter().copied()),
-            )?,
-            channels,
-            order,
-        })
-    }
-
-    /// Builds one immutable filter spectrum for a frozen-filter training run.
-    /// The CPU work happens once during state construction; every later mixer
-    /// reuses this resident buffer instead of generating and FFTing a filter.
-    #[allow(unsafe_code)]
-    pub fn upload_resident_filter_spectrum(
-        &self,
-        filter: &crate::hyena::ImplicitFilter,
-        channels: usize,
-        time: usize,
-        plan: HyenaChunkPlan,
-        full_sequence_fft: bool,
-    ) -> Result<ResidentFilterSpectrum> {
-        use objc2_metal::{MTLBuffer, MTLDevice, MTLResourceOptions};
-
-        let plan = plan.for_sequence(time)?;
-        let fft_len = if full_sequence_fft {
-            HyenaFftPlan::new(time)?.fft_len
-        } else {
-            plan.fft_len
-        };
-        let values = filter.generate(channels, plan.kernel_len)?;
-        let elements = channels
-            .checked_mul(fft_len)
-            .ok_or_else(|| anyhow::anyhow!("Metal resident filter spectrum overflow"))?;
-        let bytes = elements
-            .checked_mul(size_of::<Complex32>())
-            .ok_or_else(|| anyhow::anyhow!("Metal resident filter spectrum bytes overflow"))?;
-        let mut spectrum = vec![Complex32::default(); elements];
-        for channel in 0..channels {
-            let start = channel * fft_len;
-            let mut fft_values = spectrum[start..start + fft_len]
-                .iter()
-                .map(|value| (value.real, value.imaginary))
-                .collect::<Vec<_>>();
-            for (destination, &value) in fft_values
-                .iter_mut()
-                .zip(&values[channel * plan.kernel_len..(channel + 1) * plan.kernel_len])
-            {
-                destination.0 = value;
-            }
-            crate::hyena::fft(&mut fft_values, false);
-            for (destination, (real, imaginary)) in
-                spectrum[start..start + fft_len].iter_mut().zip(fft_values)
-            {
-                *destination = Complex32 { real, imaginary };
-            }
-        }
-        let buffer = self
-            .device
-            .newBufferWithLength_options(bytes, MTLResourceOptions::StorageModeShared)
-            .ok_or_else(|| anyhow::anyhow!("Metal resident filter spectrum allocation failed"))?;
-        unsafe {
-            buffer
-                .contents()
-                .cast::<Complex32>()
-                .as_ptr()
-                .copy_from_nonoverlapping(spectrum.as_ptr(), elements);
-        }
-        Ok(ResidentFilterSpectrum {
-            buffer,
-            channels,
-            time,
-            kernel_len: plan.kernel_len,
-            fft_len,
-        })
-    }
-
-    /// Stateless update for resident compact filter parameters. No momentum,
-    /// variance, or CPU master copy is retained.
-    pub fn resident_implicit_filter_stateless_sgd(
-        &self,
-        parameters: &ResidentImplicitFilterParameters,
-        gradient: &crate::hyena::ImplicitFilterBackward,
-        learning_rate: f32,
-    ) -> Result<()> {
-        let len = parameters
-            .channels
-            .checked_mul(parameters.order)
-            .ok_or_else(|| anyhow::anyhow!("Metal resident implicit-filter parameter overflow"))?;
-        if gradient.freq_gradient.len() != len
-            || gradient.phase_gradient.len() != len
-            || gradient.decay_gradient.len() != len
-        {
-            bail!("Metal resident implicit-filter gradient shape mismatch");
-        }
-        self.resident_fp16_stateless_sgd(&parameters.freq, &gradient.freq_gradient, learning_rate)?;
-        self.resident_fp16_stateless_sgd(
-            &parameters.phase,
-            &gradient.phase_gradient,
-            learning_rate,
-        )?;
-        self.resident_fp16_stateless_sgd(&parameters.decay, &gradient.decay_gradient, learning_rate)
-    }
-
-    /// Explicit checkpoint/validation readback for compact resident filter
-    /// parameters. Normal training never calls this method.
-    pub fn download_resident_implicit_filter_parameters(
-        &self,
-        parameters: &ResidentImplicitFilterParameters,
-    ) -> Result<(
-        crate::precision::Fp16Storage,
-        crate::precision::Fp16Storage,
-        crate::precision::Fp16Storage,
-    )> {
-        Ok((
-            self.download_resident_fp16_parameters(&parameters.freq)?,
-            self.download_resident_fp16_parameters(&parameters.phase)?,
-            self.download_resident_fp16_parameters(&parameters.decay)?,
-        ))
-    }
-
-    /// Uploads one trainable ternary projection and immediately builds its
-    /// packed inference representation on Metal.
-    #[allow(unsafe_code)]
-    pub fn upload_trainable_fp16_ternary_weights(
-        &self,
-        master: &crate::precision::Fp16Storage,
-        in_features: usize,
-        out_features: usize,
-        threshold_ratio: f32,
-    ) -> Result<ResidentTrainableFp16TernaryWeights> {
-        use objc2_metal::{MTLDevice, MTLResourceOptions};
-
-        let parameter_count = in_features
-            .checked_mul(out_features)
-            .ok_or_else(|| anyhow::anyhow!("Metal trainable ternary parameter overflow"))?;
-        if in_features == 0
-            || out_features == 0
-            || master.len() != parameter_count
-            || !threshold_ratio.is_finite()
-            || threshold_ratio < 0.0
-        {
-            bail!("Metal trainable ternary weight shape/value mismatch");
-        }
-        let packed_bytes = parameter_count
-            .div_ceil(64)
-            .checked_mul(size_of::<u64>())
-            .ok_or_else(|| anyhow::anyhow!("Metal trainable ternary code overflow"))?;
-        let scale_bytes = out_features
-            .checked_mul(size_of::<f32>())
-            .ok_or_else(|| anyhow::anyhow!("Metal trainable ternary scale overflow"))?;
-        let shared = MTLResourceOptions::StorageModeShared;
-        let allocate = |bytes, name: &str| {
-            self.device
-                .newBufferWithLength_options(bytes, shared)
-                .ok_or_else(|| anyhow::anyhow!("Metal trainable ternary {name} allocation failed"))
-        };
-        let weights = ResidentTrainableFp16TernaryWeights {
-            master: self.upload_resident_fp16_parameters(master)?,
-            positive: allocate(packed_bytes, "positive codes")?,
-            negative: allocate(packed_bytes, "negative codes")?,
-            scales: allocate(scale_bytes, "scales")?,
-            in_features,
-            out_features,
-            threshold_ratio,
-        };
-        self.refresh_trainable_fp16_ternary_weights(&weights)?;
-        Ok(weights)
-    }
-
-    /// Updates a resident ternary master tensor and refreshes all derived
-    /// inference state before returning. The gradient workspace is transient.
-    pub fn resident_trainable_fp16_ternary_stateless_sgd(
-        &self,
-        weights: &ResidentTrainableFp16TernaryWeights,
-        gradient: &[f32],
-        learning_rate: f32,
-    ) -> Result<()> {
-        self.resident_fp16_stateless_sgd(&weights.master, gradient, learning_rate)?;
-        self.refresh_trainable_fp16_ternary_weights(weights)
-    }
-
-    /// Reads trainable projection state only for validation/checkpointing.
-    #[allow(unsafe_code)]
-    pub fn download_trainable_fp16_ternary_weights(
-        &self,
-        weights: &ResidentTrainableFp16TernaryWeights,
-    ) -> Result<(crate::precision::Fp16Storage, Vec<u64>, Vec<u64>, Vec<f32>)> {
-        use objc2_metal::MTLBuffer;
-
-        let parameter_count = weights
-            .in_features
-            .checked_mul(weights.out_features)
-            .ok_or_else(|| anyhow::anyhow!("Metal trainable ternary parameter overflow"))?;
-        let packed_words = parameter_count.div_ceil(64);
-        let mut positive = vec![0_u64; packed_words];
-        let mut negative = vec![0_u64; packed_words];
-        let mut scales = vec![0.0; weights.out_features];
-        // SAFETY: every retained buffer was allocated from these exact lengths
-        // and all public update commands complete before returning.
-        unsafe {
-            positive.as_mut_ptr().copy_from_nonoverlapping(
-                weights.positive.contents().cast::<u64>().as_ptr(),
-                packed_words,
-            );
-            negative.as_mut_ptr().copy_from_nonoverlapping(
-                weights.negative.contents().cast::<u64>().as_ptr(),
-                packed_words,
-            );
-            scales.as_mut_ptr().copy_from_nonoverlapping(
-                weights.scales.contents().cast::<f32>().as_ptr(),
-                weights.out_features,
-            );
-        }
-        Ok((
-            self.download_resident_fp16_parameters(&weights.master)?,
-            positive,
-            negative,
-            scales,
-        ))
-    }
-
-    /// Downloads only packed ternary codes for periodic learning diagnostics.
-    #[allow(unsafe_code)]
-    pub fn download_trainable_fp16_ternary_codes(
-        &self,
-        weights: &ResidentTrainableFp16TernaryWeights,
-    ) -> Result<MetalTernaryCodeSnapshot> {
-        use objc2_metal::MTLBuffer;
-
-        let parameters = weights
-            .in_features
-            .checked_mul(weights.out_features)
-            .ok_or_else(|| anyhow::anyhow!("Metal trainable ternary parameter overflow"))?;
-        let words = parameters.div_ceil(64);
-        let mut positive = vec![0_u64; words];
-        let mut negative = vec![0_u64; words];
-        // SAFETY: both shared buffers have exactly `words` packed u64 entries.
-        unsafe {
-            positive.as_mut_ptr().copy_from_nonoverlapping(
-                weights.positive.contents().cast::<u64>().as_ptr(),
-                words,
-            );
-            negative.as_mut_ptr().copy_from_nonoverlapping(
-                weights.negative.contents().cast::<u64>().as_ptr(),
-                words,
-            );
-        }
-        Ok(MetalTernaryCodeSnapshot {
-            parameters,
-            positive,
-            negative,
-        })
-    }
-
-    #[allow(unsafe_code)]
-    fn refresh_trainable_fp16_ternary_weights(
-        &self,
-        weights: &ResidentTrainableFp16TernaryWeights,
-    ) -> Result<()> {
-        use objc2_metal::{MTLCommandBuffer, MTLCommandEncoder, MTLCommandQueue};
-
-        let command = self.queue.commandBuffer().ok_or_else(|| {
-            anyhow::anyhow!("Metal trainable ternary refresh command buffer allocation failed")
-        })?;
-        let encoder = command.computeCommandEncoder().ok_or_else(|| {
-            anyhow::anyhow!("Metal trainable ternary refresh compute encoder allocation failed")
-        })?;
-        self.encode_refresh_trainable_fp16_ternary_weights(encoder.as_ref(), weights)?;
-        encoder.endEncoding();
-        command.commit();
-        command.waitUntilCompleted();
-        if let Some(error) = command.error() {
-            bail!("Metal trainable ternary refresh command failed: {error}");
-        }
-        Ok(())
-    }
-
-    #[allow(unsafe_code)]
-    fn encode_refresh_trainable_fp16_ternary_weights(
-        &self,
-        encoder: &objc2::runtime::ProtocolObject<dyn objc2_metal::MTLComputeCommandEncoder>,
-        weights: &ResidentTrainableFp16TernaryWeights,
-    ) -> Result<()> {
-        let parameter_count = weights
-            .in_features
-            .checked_mul(weights.out_features)
-            .ok_or_else(|| anyhow::anyhow!("Metal trainable ternary parameter overflow"))?;
-        let in_features = u32::try_from(weights.in_features)
-            .map_err(|_| anyhow::anyhow!("Metal trainable ternary input width exceeds u32"))?;
-        let out_features = u32::try_from(weights.out_features)
-            .map_err(|_| anyhow::anyhow!("Metal trainable ternary output width exceeds u32"))?;
-        self.encode_elementwise_buffers(
-            encoder,
-            &self.ternary_row_scales_fp16_pipeline,
-            &[weights.master.parameters.as_ref(), weights.scales.as_ref()],
-            &[in_features, out_features],
-            weights.out_features,
-        )?;
-        self.encode_refresh_ternary_codes_fp16(encoder, weights, parameter_count)
-    }
-
-    #[allow(unsafe_code)]
-    fn encode_trainable_fp16_ternary_stateless_sgd(
-        &self,
-        encoder: &objc2::runtime::ProtocolObject<dyn objc2_metal::MTLComputeCommandEncoder>,
-        weights: &ResidentTrainableFp16TernaryWeights,
-        gradient: &objc2::runtime::ProtocolObject<dyn objc2_metal::MTLBuffer>,
-        learning_rate: f32,
-    ) -> Result<()> {
-        let parameter_count = weights
-            .in_features
-            .checked_mul(weights.out_features)
-            .ok_or_else(|| anyhow::anyhow!("Metal trainable ternary parameter overflow"))?;
-        self.encode_clipped_sgd_fp16(
-            encoder,
-            weights.master.parameters.as_ref(),
-            gradient,
-            learning_rate,
-            parameter_count,
-        )?;
-        self.encode_refresh_trainable_fp16_ternary_weights(encoder, weights)
-    }
-
-    /// FP16 projection using a previously uploaded immutable weight object.
-    #[allow(unsafe_code)]
-    pub fn ternary_linear_forward_fp16_resident(
-        &self,
-        input: &crate::precision::Fp16Storage,
-        weights: &ResidentFp16TernaryWeights,
-    ) -> Result<crate::precision::Fp16Storage> {
-        use objc2_metal::{MTLBuffer, MTLCommandBuffer, MTLCommandEncoder, MTLCommandQueue};
-
-        let shape = weights.shape;
-        let input_len = shape
-            .rows
-            .checked_mul(shape.in_features)
-            .ok_or_else(|| anyhow::anyhow!("resident FP16 ternary input shape overflow"))?;
-        let output_len = shape
-            .rows
-            .checked_mul(shape.out_features)
-            .ok_or_else(|| anyhow::anyhow!("resident FP16 ternary output shape overflow"))?;
-        if input.len() != input_len {
-            bail!("Metal resident FP16 ternary input shape mismatch");
-        }
-        let input_bytes = input.bytes();
-        let output_bytes = output_len
-            .checked_mul(size_of::<u16>())
-            .ok_or_else(|| anyhow::anyhow!("Metal resident FP16 output size overflow"))?;
-        let mut buffers = self.ternary_buffers.borrow_mut();
-        buffers.ensure(&self.device, input_bytes, 0, 0, output_bytes)?;
-        let input_buffer = buffers
-            .input
-            .as_ref()
-            .expect("checked resident FP16 input buffer");
-        let output_buffer = buffers
-            .output
-            .as_ref()
-            .expect("checked resident FP16 output buffer");
-        // SAFETY: capacity was ensured and host write precedes command submit.
-        unsafe {
-            input_buffer
-                .contents()
-                .cast::<u16>()
-                .as_ptr()
-                .copy_from_nonoverlapping(input.as_bits().as_ptr(), input_len);
-        }
-        let command = self.queue.commandBuffer().ok_or_else(|| {
-            anyhow::anyhow!("Metal resident FP16 ternary command buffer allocation failed")
-        })?;
-        let encoder = command.computeCommandEncoder().ok_or_else(|| {
-            anyhow::anyhow!("Metal resident FP16 ternary compute encoder allocation failed")
-        })?;
-        self.encode_ternary(
-            encoder.as_ref(),
-            &self.ternary_fp16_pipeline,
-            input_buffer,
-            weights.positive.as_ref(),
-            weights.negative.as_ref(),
-            weights.scales.as_ref(),
-            output_buffer,
-            shape,
-            false,
-        )?;
-        encoder.endEncoding();
-        command.commit();
-        command.waitUntilCompleted();
-        if let Some(error) = command.error() {
-            bail!("Metal resident FP16 ternary command failed: {error}");
-        }
-        let mut output = vec![0_u16; output_len];
-        // SAFETY: command completion makes the initialized shared output readable.
-        unsafe {
-            output.as_mut_ptr().copy_from_nonoverlapping(
-                output_buffer.contents().cast::<u16>().as_ptr(),
-                output_len,
-            );
-        }
-        Ok(crate::precision::Fp16Storage::from_bits(output))
-    }
-
-    /// Applies a resident FP16 ternary projection between activation slots.
-    /// Call `reserve_fp16_activations(rows, max(input_width, output_width))`
-    /// before the initial upload, so capacity growth never invalidates a live
-    /// source slot.
-    pub fn resident_ternary_linear_fp16(
-        &self,
-        slot: ResidentFp16ActivationSlot,
-        weights: &ResidentFp16TernaryWeights,
-    ) -> Result<ResidentFp16ActivationSlot> {
-        use objc2_metal::{MTLCommandBuffer, MTLCommandEncoder, MTLCommandQueue};
-
-        let output_bytes = weights
-            .shape
-            .rows
-            .checked_mul(weights.shape.out_features)
-            .and_then(|elements| elements.checked_mul(size_of::<u16>()))
-            .ok_or_else(|| anyhow::anyhow!("resident FP16 projection output size overflow"))?;
-        let activations = self.fp16_activations.borrow();
-        if activations.capacity < output_bytes {
-            bail!(
-                "resident FP16 activation capacity is too small; reserve the maximum projection width before upload"
-            );
-        }
-        let source = activations.buffer(slot)?;
-        let destination = activations.buffer(slot.other())?;
-        let command = self.queue.commandBuffer().ok_or_else(|| {
-            anyhow::anyhow!("Metal resident FP16 projection command buffer allocation failed")
-        })?;
-        let encoder = command.computeCommandEncoder().ok_or_else(|| {
-            anyhow::anyhow!("Metal resident FP16 projection compute encoder allocation failed")
-        })?;
-        self.encode_ternary(
-            encoder.as_ref(),
-            &self.ternary_fp16_pipeline,
-            source,
-            weights.positive.as_ref(),
-            weights.negative.as_ref(),
-            weights.scales.as_ref(),
-            destination,
-            weights.shape,
-            false,
-        )?;
-        encoder.endEncoding();
-        command.commit();
-        command.waitUntilCompleted();
-        if let Some(error) = command.error() {
-            bail!("Metal resident FP16 projection failed: {error}");
-        }
-        Ok(slot.other())
-    }
-
-    /// Fuses RMSNorm with ternary projection, keeping normalized activations
-    /// virtual and reusing the runtime's packed-weight buffers.
-    #[allow(unsafe_code)]
-    pub fn rms_norm_ternary_linear_forward(
-        &self,
-        input: &[f32],
-        positive: &[u64],
-        negative: &[u64],
-        scales: &[f32],
-        shape: TernaryLinearShape,
-    ) -> Result<Vec<f32>> {
-        self.dispatch_ternary(
-            input,
-            positive,
-            negative,
-            scales,
-            shape,
-            &self.fused_rms_norm_ternary_pipeline,
-            true,
-        )
-    }
-
-    /// GPU reference for the in-place gate layout used by a Hyena input
-    /// projection: `[rows, 2 * channels] -> [rows, 2 * channels]`.
-    #[allow(unsafe_code)]
-    pub fn tanh_gate_forward(
-        &self,
-        input: &[f32],
-        rows: usize,
-        channels: usize,
-    ) -> Result<Vec<f32>> {
-        use objc2_metal::{MTLBuffer, MTLCommandBuffer, MTLCommandEncoder, MTLCommandQueue};
-        let elements = rows
-            .checked_mul(channels)
-            .and_then(|n| n.checked_mul(2))
-            .ok_or_else(|| anyhow::anyhow!("Metal gate shape overflow"))?;
-        if rows == 0 || channels == 0 || input.len() != elements {
-            bail!("Metal gate shape mismatch");
-        }
-        let bytes = elements
-            .checked_mul(size_of::<f32>())
-            .ok_or_else(|| anyhow::anyhow!("Metal gate size overflow"))?;
-        let mut buffers = self.gate_buffers.borrow_mut();
-        buffers.ensure(&self.device, bytes)?;
-        let source = buffers
-            .input
-            .as_ref()
-            .expect("checked Metal gate input buffer");
-        let output = buffers
-            .output
-            .as_ref()
-            .expect("checked Metal gate output buffer");
-        // SAFETY: the shared input buffer has the checked capacity and remains borrowed until completion.
-        unsafe {
-            source
-                .contents()
-                .cast::<f32>()
-                .as_ptr()
-                .copy_from_nonoverlapping(input.as_ptr(), elements);
-        }
-        let command = self
-            .queue
-            .commandBuffer()
-            .ok_or_else(|| anyhow::anyhow!("Metal command buffer allocation failed"))?;
-        let encoder = command
-            .computeCommandEncoder()
-            .ok_or_else(|| anyhow::anyhow!("Metal compute encoder allocation failed"))?;
-        self.encode_tanh_gate(
-            encoder.as_ref(),
-            &self.tanh_gate_pipeline,
-            source,
-            output,
-            rows,
-            channels,
-        )?;
-        encoder.endEncoding();
-        command.commit();
-        command.waitUntilCompleted();
-        if let Some(error) = command.error() {
-            bail!("Metal gate command failed: {error}");
-        }
-        let mut result = vec![0.0; elements];
-        // SAFETY: completion makes every output element readable from the shared buffer.
-        unsafe {
-            result
-                .as_mut_ptr()
-                .copy_from_nonoverlapping(output.contents().cast::<f32>().as_ptr(), elements);
-        }
-        Ok(result)
-    }
-
-    /// Applies the FP16 Hyena gate while retaining both projection layouts on
-    /// the GPU: `[rows, 2D]` in one slot becomes `[rows, 2D]` in the other.
-    pub fn resident_tanh_gate_fp16(
-        &self,
-        slot: ResidentFp16ActivationSlot,
-        rows: usize,
-        channels: usize,
-    ) -> Result<ResidentFp16ActivationSlot> {
-        use objc2_metal::{MTLCommandBuffer, MTLCommandEncoder, MTLCommandQueue};
-
-        let bytes = rows
-            .checked_mul(channels)
-            .and_then(|elements| elements.checked_mul(2))
-            .and_then(|elements| elements.checked_mul(size_of::<u16>()))
-            .ok_or_else(|| anyhow::anyhow!("resident FP16 gate shape overflow"))?;
-        let activations = self.fp16_activations.borrow();
-        if rows == 0 || channels == 0 || activations.capacity < bytes {
-            bail!("resident FP16 gate activation capacity is too small");
-        }
-        let source = activations.buffer(slot)?;
-        let destination = activations.buffer(slot.other())?;
-        let command = self.queue.commandBuffer().ok_or_else(|| {
-            anyhow::anyhow!("Metal resident FP16 gate command buffer allocation failed")
-        })?;
-        let encoder = command.computeCommandEncoder().ok_or_else(|| {
-            anyhow::anyhow!("Metal resident FP16 gate compute encoder allocation failed")
-        })?;
-        self.encode_tanh_gate(
-            encoder.as_ref(),
-            &self.tanh_gate_fp16_pipeline,
-            source,
-            destination,
-            rows,
-            channels,
-        )?;
-        encoder.endEncoding();
-        command.commit();
-        command.waitUntilCompleted();
-        if let Some(error) = command.error() {
-            bail!("Metal resident FP16 gate failed: {error}");
-        }
-        Ok(slot.other())
-    }
-
-    /// Multiplies a mixed `[rows,D]` stream by the gate half of a resident
-    /// `[rows,2D]` projection, writing FP16 output to an explicit work slot.
-    pub fn resident_apply_gate_fp16(
-        &self,
-        mixed_slot: ResidentFp16ActivationSlot,
-        gated_projection_slot: ResidentFp16ActivationSlot,
-        output_slot: ResidentFp16ActivationSlot,
-        rows: usize,
-        channels: usize,
-    ) -> Result<()> {
-        use objc2_metal::{MTLCommandBuffer, MTLCommandEncoder, MTLCommandQueue};
-
-        if gated_projection_slot == output_slot {
-            bail!("resident FP16 gate output may not overwrite its projection input");
-        }
-        let projection_bytes = rows
-            .checked_mul(channels)
-            .and_then(|elements| elements.checked_mul(2))
-            .and_then(|elements| elements.checked_mul(size_of::<u16>()))
-            .ok_or_else(|| anyhow::anyhow!("resident FP16 apply-gate shape overflow"))?;
-        let elements = rows
-            .checked_mul(channels)
-            .ok_or_else(|| anyhow::anyhow!("resident FP16 apply-gate shape overflow"))?;
-        let activations = self.fp16_activations.borrow();
-        if rows == 0 || channels == 0 || activations.capacity < projection_bytes {
-            bail!("resident FP16 apply-gate activation capacity is too small");
-        }
-        let mixed = activations.buffer(mixed_slot)?;
-        let projection = activations.buffer(gated_projection_slot)?;
-        let output = activations.buffer(output_slot)?;
-        let channels_u32 = u32::try_from(channels)
-            .map_err(|_| anyhow::anyhow!("resident FP16 apply-gate channels exceed u32"))?;
-        let elements_u32 = u32::try_from(elements)
-            .map_err(|_| anyhow::anyhow!("resident FP16 apply-gate elements exceed u32"))?;
-        let command = self.queue.commandBuffer().ok_or_else(|| {
-            anyhow::anyhow!("Metal resident FP16 apply-gate command buffer allocation failed")
-        })?;
-        let encoder = command.computeCommandEncoder().ok_or_else(|| {
-            anyhow::anyhow!("Metal resident FP16 apply-gate compute encoder allocation failed")
-        })?;
-        self.encode_apply_gate_fp16(
-            encoder.as_ref(),
-            mixed,
-            projection,
-            output,
-            channels_u32,
-            channels_u32
-                .checked_mul(2)
-                .ok_or_else(|| anyhow::anyhow!("resident FP16 stride exceeds u32"))?,
-            channels_u32,
-            elements_u32,
-        )?;
-        encoder.endEncoding();
-        command.commit();
-        command.waitUntilCompleted();
-        if let Some(error) = command.error() {
-            bail!("Metal resident FP16 apply-gate failed: {error}");
-        }
-        Ok(())
-    }
-
-    /// Adds two resident `[rows,D]` FP16 streams into an explicit output slot.
-    pub fn resident_residual_add_fp16(
-        &self,
-        residual_slot: ResidentFp16ActivationSlot,
-        update_slot: ResidentFp16ActivationSlot,
-        output_slot: ResidentFp16ActivationSlot,
-        rows: usize,
-        channels: usize,
-    ) -> Result<()> {
-        use objc2_metal::{MTLCommandBuffer, MTLCommandEncoder, MTLCommandQueue};
-
-        let elements = rows
-            .checked_mul(channels)
-            .ok_or_else(|| anyhow::anyhow!("resident FP16 residual shape overflow"))?;
-        let bytes = elements
-            .checked_mul(size_of::<u16>())
-            .ok_or_else(|| anyhow::anyhow!("resident FP16 residual size overflow"))?;
-        let activations = self.fp16_activations.borrow();
-        if rows == 0 || channels == 0 || activations.capacity < bytes {
-            bail!("resident FP16 residual activation capacity is too small");
-        }
-        let residual = activations.buffer(residual_slot)?;
-        let update = activations.buffer(update_slot)?;
-        let output = activations.buffer(output_slot)?;
-        let elements_u32 = u32::try_from(elements)
-            .map_err(|_| anyhow::anyhow!("resident FP16 residual elements exceed u32"))?;
-        let command = self.queue.commandBuffer().ok_or_else(|| {
-            anyhow::anyhow!("Metal resident FP16 residual command buffer allocation failed")
-        })?;
-        let encoder = command.computeCommandEncoder().ok_or_else(|| {
-            anyhow::anyhow!("Metal resident FP16 residual compute encoder allocation failed")
-        })?;
-        self.encode_residual_add_fp16(encoder.as_ref(), residual, update, output, elements_u32)?;
-        encoder.endEncoding();
-        command.commit();
-        command.waitUntilCompleted();
-        if let Some(error) = command.error() {
-            bail!("Metal resident FP16 residual add failed: {error}");
-        }
-        Ok(())
-    }
-
-    #[allow(unsafe_code)]
-    fn encode_tanh_gate(
-        &self,
-        encoder: &objc2::runtime::ProtocolObject<dyn objc2_metal::MTLComputeCommandEncoder>,
-        pipeline: &objc2::runtime::ProtocolObject<dyn objc2_metal::MTLComputePipelineState>,
-        input: &objc2::runtime::ProtocolObject<dyn objc2_metal::MTLBuffer>,
-        output: &objc2::runtime::ProtocolObject<dyn objc2_metal::MTLBuffer>,
-        rows: usize,
-        channels: usize,
-    ) -> Result<()> {
-        use core::ffi::c_void;
-        use core::ptr::NonNull;
-        use objc2_metal::{MTLComputeCommandEncoder, MTLComputePipelineState, MTLSize};
-        let elements = rows
-            .checked_mul(channels)
-            .and_then(|n| n.checked_mul(2))
-            .ok_or_else(|| anyhow::anyhow!("Metal gate shape overflow"))?;
-        let elements_u32 = u32::try_from(elements)
-            .map_err(|_| anyhow::anyhow!("Metal gate elements exceed u32"))?;
-        let channels_u32 = u32::try_from(channels)
-            .map_err(|_| anyhow::anyhow!("Metal gate channels exceed u32"))?;
-        encoder.setComputePipelineState(pipeline);
-        // SAFETY: slots 0..3 exactly match ullis_tanh_gate_in_place.
-        unsafe {
-            encoder.setBuffer_offset_atIndex(Some(input), 0, 0);
-            encoder.setBuffer_offset_atIndex(Some(output), 0, 1);
-            encoder.setBytes_length_atIndex(
-                NonNull::from(&elements_u32).cast::<c_void>(),
-                size_of::<u32>(),
-                2,
-            );
-            encoder.setBytes_length_atIndex(
-                NonNull::from(&channels_u32).cast::<c_void>(),
-                size_of::<u32>(),
-                3,
-            );
-        }
-        let width = pipeline.maxTotalThreadsPerThreadgroup().min(elements);
-        if width == 0 {
-            bail!("Metal gate pipeline reported zero threads per threadgroup");
-        }
-        encoder.dispatchThreads_threadsPerThreadgroup(
-            MTLSize {
-                width: elements,
-                height: 1,
-                depth: 1,
-            },
-            MTLSize {
-                width,
-                height: 1,
-                depth: 1,
-            },
-        );
-        Ok(())
-    }
-
-    /// Encodes the three layout-only Hyena operations used by the resident
-    /// path.  Keeping them here makes their buffer-slot contracts auditable
-    /// and lets one command buffer chain them without a host readback.
-    #[allow(unsafe_code)]
-    fn encode_pack_strided_real(
-        &self,
-        encoder: &objc2::runtime::ProtocolObject<dyn objc2_metal::MTLComputeCommandEncoder>,
-        input: &objc2::runtime::ProtocolObject<dyn objc2_metal::MTLBuffer>,
-        output: &objc2::runtime::ProtocolObject<dyn objc2_metal::MTLBuffer>,
-        time: u32,
-        channels: u32,
-        stride: u32,
-        offset: u32,
-        fft_len: u32,
-        elements: u32,
-    ) -> Result<()> {
-        self.encode_elementwise_buffers(
-            encoder,
-            &self.pack_strided_real_pipeline,
-            &[input, output],
-            &[time, channels, stride, offset, fft_len, elements],
-            elements as usize,
-        )
-    }
-
-    #[allow(unsafe_code)]
-    fn encode_pack_overlap_save(
-        &self,
-        encoder: &objc2::runtime::ProtocolObject<dyn objc2_metal::MTLComputeCommandEncoder>,
-        input: &objc2::runtime::ProtocolObject<dyn objc2_metal::MTLBuffer>,
-        output: &objc2::runtime::ProtocolObject<dyn objc2_metal::MTLBuffer>,
-        scalars: [u32; 9],
-        elements: usize,
-    ) -> Result<()> {
-        self.encode_elementwise_buffers(
-            encoder,
-            &self.pack_overlap_save_pipeline,
-            &[input, output],
-            &scalars,
-            elements,
-        )
-    }
-
-    #[allow(unsafe_code)]
-    fn encode_extract_overlap_save(
-        &self,
-        encoder: &objc2::runtime::ProtocolObject<dyn objc2_metal::MTLComputeCommandEncoder>,
-        input: &objc2::runtime::ProtocolObject<dyn objc2_metal::MTLBuffer>,
-        output: &objc2::runtime::ProtocolObject<dyn objc2_metal::MTLBuffer>,
-        scalars: [u32; 7],
-        elements: usize,
-    ) -> Result<()> {
-        self.encode_elementwise_buffers(
-            encoder,
-            &self.extract_overlap_save_pipeline,
-            &[input, output],
-            &scalars,
-            elements,
-        )
-    }
-
-    #[allow(unsafe_code)]
-    fn encode_apply_gate(
-        &self,
-        encoder: &objc2::runtime::ProtocolObject<dyn objc2_metal::MTLComputeCommandEncoder>,
-        mixed: &objc2::runtime::ProtocolObject<dyn objc2_metal::MTLBuffer>,
-        projection: &objc2::runtime::ProtocolObject<dyn objc2_metal::MTLBuffer>,
-        output: &objc2::runtime::ProtocolObject<dyn objc2_metal::MTLBuffer>,
-        channels: u32,
-        stride: u32,
-        gate_offset: u32,
-        elements: u32,
-    ) -> Result<()> {
-        self.encode_elementwise_buffers(
-            encoder,
-            &self.apply_gate_pipeline,
-            &[mixed, projection, output],
-            &[channels, stride, gate_offset, elements],
-            elements as usize,
-        )
-    }
-
-    #[allow(unsafe_code)]
-    fn encode_apply_gate_fp16(
-        &self,
-        encoder: &objc2::runtime::ProtocolObject<dyn objc2_metal::MTLComputeCommandEncoder>,
-        mixed: &objc2::runtime::ProtocolObject<dyn objc2_metal::MTLBuffer>,
-        projection: &objc2::runtime::ProtocolObject<dyn objc2_metal::MTLBuffer>,
-        output: &objc2::runtime::ProtocolObject<dyn objc2_metal::MTLBuffer>,
-        channels: u32,
-        stride: u32,
-        gate_offset: u32,
-        elements: u32,
-    ) -> Result<()> {
-        self.encode_elementwise_buffers(
-            encoder,
-            &self.apply_gate_fp16_pipeline,
-            &[mixed, projection, output],
-            &[channels, stride, gate_offset, elements],
-            elements as usize,
-        )
-    }
-
-    #[allow(unsafe_code)]
-    fn encode_hyena_gate_backward(
-        &self,
-        encoder: &objc2::runtime::ProtocolObject<dyn objc2_metal::MTLComputeCommandEncoder>,
-        mixed: &objc2::runtime::ProtocolObject<dyn objc2_metal::MTLBuffer>,
-        projection: &objc2::runtime::ProtocolObject<dyn objc2_metal::MTLBuffer>,
-        output_gradient: &objc2::runtime::ProtocolObject<dyn objc2_metal::MTLBuffer>,
-        mixed_gradient: &objc2::runtime::ProtocolObject<dyn objc2_metal::MTLBuffer>,
-        projection_gradient: &objc2::runtime::ProtocolObject<dyn objc2_metal::MTLBuffer>,
-        channels: u32,
-        elements: u32,
-    ) -> Result<()> {
-        self.encode_elementwise_buffers(
-            encoder,
-            &self.hyena_gate_backward_pipeline,
-            &[
-                mixed,
-                projection,
-                output_gradient,
-                mixed_gradient,
-                projection_gradient,
-            ],
-            &[channels, elements],
-            elements as usize,
-        )
-    }
-
-    #[allow(unsafe_code)]
-    fn encode_residual_add(
-        &self,
-        encoder: &objc2::runtime::ProtocolObject<dyn objc2_metal::MTLComputeCommandEncoder>,
-        residual: &objc2::runtime::ProtocolObject<dyn objc2_metal::MTLBuffer>,
-        update: &objc2::runtime::ProtocolObject<dyn objc2_metal::MTLBuffer>,
-        output: &objc2::runtime::ProtocolObject<dyn objc2_metal::MTLBuffer>,
-        elements: u32,
-    ) -> Result<()> {
-        self.encode_elementwise_buffers(
-            encoder,
-            &self.residual_add_pipeline,
-            &[residual, update, output],
-            &[elements],
-            elements as usize,
-        )
-    }
-
-    #[allow(unsafe_code)]
-    fn encode_identity(
-        &self,
-        encoder: &objc2::runtime::ProtocolObject<dyn objc2_metal::MTLComputeCommandEncoder>,
-        input: &objc2::runtime::ProtocolObject<dyn objc2_metal::MTLBuffer>,
-        output: &objc2::runtime::ProtocolObject<dyn objc2_metal::MTLBuffer>,
-        elements: usize,
-    ) -> Result<()> {
-        let elements = u32::try_from(elements)
-            .map_err(|_| anyhow::anyhow!("Metal identity elements exceed u32"))?;
-        self.encode_elementwise_buffers(
-            encoder,
-            &self.identity_pipeline,
-            &[input, output],
-            &[elements],
-            elements as usize,
-        )
-    }
-
-    #[allow(unsafe_code)]
-    fn encode_clipped_sgd_fp16(
-        &self,
-        encoder: &objc2::runtime::ProtocolObject<dyn objc2_metal::MTLComputeCommandEncoder>,
-        parameters: &objc2::runtime::ProtocolObject<dyn objc2_metal::MTLBuffer>,
-        gradient: &objc2::runtime::ProtocolObject<dyn objc2_metal::MTLBuffer>,
-        learning_rate: f32,
-        elements: usize,
-    ) -> Result<()> {
-        use core::ffi::c_void;
-        use core::ptr::NonNull;
-        use objc2_metal::{MTLComputeCommandEncoder, MTLComputePipelineState, MTLSize};
-
-        let elements = u32::try_from(elements)
-            .map_err(|_| anyhow::anyhow!("Metal FP16 SGD elements exceed u32"))?;
-        encoder.setComputePipelineState(&self.clipped_sgd_fp16_pipeline);
-        // SAFETY: the buffers and scalar constants match the MSL ABI exactly.
-        unsafe {
-            encoder.setBuffer_offset_atIndex(Some(parameters), 0, 0);
-            encoder.setBuffer_offset_atIndex(Some(gradient), 0, 1);
-            encoder.setBytes_length_atIndex(
-                NonNull::from(&learning_rate).cast::<c_void>(),
-                size_of::<f32>(),
-                2,
-            );
-            encoder.setBytes_length_atIndex(
-                NonNull::from(&elements).cast::<c_void>(),
-                size_of::<u32>(),
-                3,
-            );
-        }
-        let width = self
-            .clipped_sgd_fp16_pipeline
-            .maxTotalThreadsPerThreadgroup()
-            .min(elements as usize);
-        if width == 0 {
-            bail!("Metal FP16 SGD pipeline reported zero threads per threadgroup");
-        }
-        encoder.dispatchThreads_threadsPerThreadgroup(
-            MTLSize {
-                width: elements as usize,
-                height: 1,
-                depth: 1,
-            },
-            MTLSize {
-                width,
-                height: 1,
-                depth: 1,
-            },
-        );
-        Ok(())
-    }
-
-    #[allow(unsafe_code)]
-    fn encode_refresh_ternary_codes_fp16(
-        &self,
-        encoder: &objc2::runtime::ProtocolObject<dyn objc2_metal::MTLComputeCommandEncoder>,
-        weights: &ResidentTrainableFp16TernaryWeights,
-        parameter_count: usize,
-    ) -> Result<()> {
-        use core::ffi::c_void;
-        use core::ptr::NonNull;
-        use objc2_metal::{MTLComputeCommandEncoder, MTLComputePipelineState, MTLSize};
-
-        let in_features = u32::try_from(weights.in_features)
-            .map_err(|_| anyhow::anyhow!("Metal ternary code-refresh input width exceeds u32"))?;
-        let parameter_count = u32::try_from(parameter_count).map_err(|_| {
-            anyhow::anyhow!("Metal ternary code-refresh parameter count exceeds u32")
-        })?;
-        let words = (parameter_count as usize).div_ceil(64);
-        encoder.setComputePipelineState(&self.refresh_ternary_codes_fp16_pipeline);
-        // SAFETY: buffer order and constants exactly match the code-refresh
-        // MSL signature; `setBytes` copies scalar values into the encoder.
-        unsafe {
-            encoder.setBuffer_offset_atIndex(Some(weights.master.parameters.as_ref()), 0, 0);
-            encoder.setBuffer_offset_atIndex(Some(weights.scales.as_ref()), 0, 1);
-            encoder.setBuffer_offset_atIndex(Some(weights.positive.as_ref()), 0, 2);
-            encoder.setBuffer_offset_atIndex(Some(weights.negative.as_ref()), 0, 3);
-            encoder.setBytes_length_atIndex(
-                NonNull::from(&weights.threshold_ratio).cast::<c_void>(),
-                size_of::<f32>(),
-                4,
-            );
-            encoder.setBytes_length_atIndex(
-                NonNull::from(&in_features).cast::<c_void>(),
-                size_of::<u32>(),
-                5,
-            );
-            encoder.setBytes_length_atIndex(
-                NonNull::from(&parameter_count).cast::<c_void>(),
-                size_of::<u32>(),
-                6,
-            );
-        }
-        let width = self
-            .refresh_ternary_codes_fp16_pipeline
-            .maxTotalThreadsPerThreadgroup()
-            .min(words);
-        if width == 0 {
-            bail!("Metal ternary code-refresh pipeline reported zero threads per threadgroup");
-        }
-        encoder.dispatchThreads_threadsPerThreadgroup(
-            MTLSize {
-                width: words,
-                height: 1,
-                depth: 1,
-            },
-            MTLSize {
-                width,
-                height: 1,
-                depth: 1,
-            },
-        );
-        Ok(())
-    }
-
-    #[allow(unsafe_code)]
-    fn encode_rms_norm(
-        &self,
-        encoder: &objc2::runtime::ProtocolObject<dyn objc2_metal::MTLComputeCommandEncoder>,
-        input: &objc2::runtime::ProtocolObject<dyn objc2_metal::MTLBuffer>,
-        output: &objc2::runtime::ProtocolObject<dyn objc2_metal::MTLBuffer>,
-        rows: usize,
-        channels: usize,
-    ) -> Result<()> {
-        let rows =
-            u32::try_from(rows).map_err(|_| anyhow::anyhow!("Metal RMSNorm rows exceed u32"))?;
-        let channels = u32::try_from(channels)
-            .map_err(|_| anyhow::anyhow!("Metal RMSNorm channels exceed u32"))?;
-        self.encode_elementwise_buffers(
-            encoder,
-            &self.rms_norm_pipeline,
-            &[input, output],
-            &[rows, channels],
-            rows as usize,
-        )
-    }
-
-    #[allow(unsafe_code)]
-    fn encode_residual_add_fp16(
-        &self,
-        encoder: &objc2::runtime::ProtocolObject<dyn objc2_metal::MTLComputeCommandEncoder>,
-        residual: &objc2::runtime::ProtocolObject<dyn objc2_metal::MTLBuffer>,
-        update: &objc2::runtime::ProtocolObject<dyn objc2_metal::MTLBuffer>,
-        output: &objc2::runtime::ProtocolObject<dyn objc2_metal::MTLBuffer>,
-        elements: u32,
-    ) -> Result<()> {
-        self.encode_elementwise_buffers(
-            encoder,
-            &self.residual_add_fp16_pipeline,
-            &[residual, update, output],
-            &[elements],
-            elements as usize,
-        )
-    }
-
-    #[allow(unsafe_code)]
-    fn encode_elementwise_buffers(
-        &self,
-        encoder: &objc2::runtime::ProtocolObject<dyn objc2_metal::MTLComputeCommandEncoder>,
-        pipeline: &objc2::runtime::ProtocolObject<dyn objc2_metal::MTLComputePipelineState>,
-        buffers: &[&objc2::runtime::ProtocolObject<dyn objc2_metal::MTLBuffer>],
-        scalars: &[u32],
-        elements: usize,
-    ) -> Result<()> {
-        use core::ffi::c_void;
-        use core::ptr::NonNull;
-        use objc2_metal::{MTLComputeCommandEncoder, MTLComputePipelineState, MTLSize};
-        if elements == 0 {
-            bail!("Metal elementwise dispatch cannot be empty");
-        }
-        encoder.setComputePipelineState(pipeline);
-        // SAFETY: callers pair buffer/scalar lists with the exact MSL ABI.
-        unsafe {
-            for (slot, buffer) in buffers.iter().enumerate() {
-                encoder.setBuffer_offset_atIndex(Some(*buffer), 0, slot);
-            }
-            for (offset, scalar) in scalars.iter().enumerate() {
-                encoder.setBytes_length_atIndex(
-                    NonNull::from(scalar).cast::<c_void>(),
-                    size_of::<u32>(),
-                    buffers.len() + offset,
-                );
-            }
-        }
-        let width = pipeline.maxTotalThreadsPerThreadgroup().min(elements);
-        if width == 0 {
-            bail!("Metal elementwise pipeline reported zero threads per threadgroup");
-        }
-        encoder.dispatchThreads_threadsPerThreadgroup(
-            MTLSize {
-                width: elements,
-                height: 1,
-                depth: 1,
-            },
-            MTLSize {
-                width,
-                height: 1,
-                depth: 1,
-            },
-        );
-        Ok(())
-    }
-
-    #[allow(unsafe_code)]
-    fn encode_tiled_ternary_ste_weight_backward(
-        &self,
-        encoder: &objc2::runtime::ProtocolObject<dyn objc2_metal::MTLComputeCommandEncoder>,
-        input: &objc2::runtime::ProtocolObject<dyn objc2_metal::MTLBuffer>,
-        output_gradient: &objc2::runtime::ProtocolObject<dyn objc2_metal::MTLBuffer>,
-        scales: &objc2::runtime::ProtocolObject<dyn objc2_metal::MTLBuffer>,
-        weight_gradient: &objc2::runtime::ProtocolObject<dyn objc2_metal::MTLBuffer>,
-        rows: u32,
-        in_features: u32,
-        out_features: u32,
-    ) -> Result<()> {
-        use core::ffi::c_void;
-        use core::ptr::NonNull;
-        use objc2_metal::{MTLComputeCommandEncoder, MTLSize};
-        if rows == 0 || in_features == 0 || out_features == 0 {
-            bail!("Metal tiled ternary weight-backward has an empty shape");
-        }
-        encoder.setComputePipelineState(&self.ternary_ste_weight_backward_tiled_pipeline);
-        unsafe {
-            encoder.setBuffer_offset_atIndex(Some(input), 0, 0);
-            encoder.setBuffer_offset_atIndex(Some(output_gradient), 0, 1);
-            encoder.setBuffer_offset_atIndex(Some(scales), 0, 2);
-            encoder.setBuffer_offset_atIndex(Some(weight_gradient), 0, 3);
-            for (slot, scalar) in [rows, in_features, out_features].iter().enumerate() {
-                encoder.setBytes_length_atIndex(
-                    NonNull::from(scalar).cast::<c_void>(),
-                    size_of::<u32>(),
-                    slot + 4,
-                );
-            }
-        }
-        encoder.dispatchThreadgroups_threadsPerThreadgroup(
-            MTLSize {
-                width: (in_features as usize).div_ceil(16),
-                height: (out_features as usize).div_ceil(16),
-                depth: 1,
-            },
-            MTLSize {
-                width: 16,
-                height: 16,
-                depth: 1,
-            },
-        );
-        Ok(())
-    }
-
-    /// Executes the layout-only tail of a Hyena block in one submission.  It
-    /// is intentionally public as a small equivalence boundary while the
-    /// model-level resident API is wired: only the final residual stream is
-    /// read back, never the packed or gated intermediates.
-    #[allow(unsafe_code)]
-    pub fn resident_gate_residual_reference(
-        &self,
-        residual: &[f32],
-        mixed: &[f32],
-        projection: &[f32],
-        rows: usize,
-        channels: usize,
-    ) -> Result<Vec<f32>> {
-        use objc2_metal::{MTLBuffer, MTLCommandBuffer, MTLCommandEncoder, MTLCommandQueue};
-        let elements = rows
-            .checked_mul(channels)
-            .ok_or_else(|| anyhow::anyhow!("Metal resident element shape overflow"))?;
-        let projected = elements
-            .checked_mul(2)
-            .ok_or_else(|| anyhow::anyhow!("Metal resident projection shape overflow"))?;
-        if rows == 0
-            || channels == 0
-            || residual.len() != elements
-            || mixed.len() != elements
-            || projection.len() != projected
-        {
-            bail!("Metal resident gate/residual shape mismatch");
-        }
-        let activation_bytes = elements
-            .checked_mul(size_of::<f32>())
-            .ok_or_else(|| anyhow::anyhow!("Metal resident activation size overflow"))?;
-        let projection_bytes = projected
-            .checked_mul(size_of::<f32>())
-            .ok_or_else(|| anyhow::anyhow!("Metal resident projection size overflow"))?;
-        self.reserve_activations(rows, channels)?;
-        self.gate_buffers
-            .borrow_mut()
-            .ensure(&self.device, projection_bytes)?;
-        self.hyena_output_buffer
-            .borrow_mut()
-            .ensure(&self.device, activation_bytes)?;
-        let plan = HyenaFftPlan::new(rows)?;
-        let transform_elements = elements
-            .checked_mul(plan.fft_len)
-            .ok_or_else(|| anyhow::anyhow!("Metal resident FFT shape overflow"))?;
-        let transform_bytes = transform_elements
-            .checked_mul(size_of::<Complex32>())
-            .ok_or_else(|| anyhow::anyhow!("Metal resident FFT size overflow"))?;
-        self.fft_buffers
-            .borrow_mut()
-            .ensure(&self.device, transform_bytes)?;
-        let activations = self.activations.borrow();
-        let gates = self.gate_buffers.borrow();
-        let output = self.hyena_output_buffer.borrow();
-        let fft = self.fft_buffers.borrow();
-        let first = activations
-            .first
-            .as_ref()
-            .expect("checked Metal activation buffer");
-        let second = activations
-            .second
-            .as_ref()
-            .expect("checked Metal activation scratch");
-        let gate = gates.output.as_ref().expect("checked Metal gate buffer");
-        let mixed_buffer = output.buffer.as_ref().expect("checked Metal Hyena output");
-        let fft_first = fft.first.as_ref().expect("checked Metal FFT source buffer");
-        // SAFETY: each persistent shared allocation was checked above and no
-        // GPU command observes it until these complete host writes finish.
-        unsafe {
-            first
-                .contents()
-                .cast::<f32>()
-                .as_ptr()
-                .copy_from_nonoverlapping(residual.as_ptr(), elements);
-            mixed_buffer
-                .contents()
-                .cast::<f32>()
-                .as_ptr()
-                .copy_from_nonoverlapping(mixed.as_ptr(), elements);
-            gate.contents()
-                .cast::<f32>()
-                .as_ptr()
-                .copy_from_nonoverlapping(projection.as_ptr(), projected);
-            fft_first
-                .contents()
-                .cast::<Complex32>()
-                .as_ptr()
-                .write_bytes(0, transform_elements);
-        }
-        let channels_u32 =
-            u32::try_from(channels).map_err(|_| anyhow::anyhow!("Metal channels exceed u32"))?;
-        let projection_stride = channels_u32
-            .checked_mul(2)
-            .ok_or_else(|| anyhow::anyhow!("Metal projection stride overflow"))?;
-        let elements_u32 =
-            u32::try_from(elements).map_err(|_| anyhow::anyhow!("Metal elements exceed u32"))?;
-        let rows_u32 = u32::try_from(rows).map_err(|_| anyhow::anyhow!("Metal rows exceed u32"))?;
-        let fft_len_u32 = u32::try_from(plan.fft_len)
-            .map_err(|_| anyhow::anyhow!("Metal FFT length exceeds u32"))?;
-        let command = self
-            .queue
-            .commandBuffer()
-            .ok_or_else(|| anyhow::anyhow!("Metal command buffer allocation failed"))?;
-        let encoder = command
-            .computeCommandEncoder()
-            .ok_or_else(|| anyhow::anyhow!("Metal compute encoder allocation failed"))?;
-        self.encode_pack_strided_real(
-            encoder.as_ref(),
-            gate,
-            fft_first,
-            rows_u32,
-            channels_u32,
-            projection_stride,
-            0,
-            fft_len_u32,
-            elements_u32,
-        )?;
-        self.encode_apply_gate(
-            encoder.as_ref(),
-            mixed_buffer,
-            gate,
-            second,
-            channels_u32,
-            projection_stride,
-            channels_u32,
-            elements_u32,
-        )?;
-        self.encode_residual_add(encoder.as_ref(), first, second, second, elements_u32)?;
-        encoder.endEncoding();
-        command.commit();
-        command.waitUntilCompleted();
-        if let Some(error) = command.error() {
-            bail!("Metal resident gate/residual command failed: {error}");
-        }
-        let mut result = vec![0.0; elements];
-        // SAFETY: completion makes the shared final activation readable.
-        unsafe {
-            result
-                .as_mut_ptr()
-                .copy_from_nonoverlapping(second.contents().cast::<f32>().as_ptr(), elements);
-        }
-        Ok(result)
-    }
-
-    /// Runs the exact local Hyena gate backward kernel and reads back only its
-    /// two gradients. It is a numerical-reference boundary for the upcoming
-    /// resident training graph; all intermediate buffers stay on the runtime.
-    #[allow(unsafe_code)]
-    pub fn hyena_gate_backward_reference(
-        &self,
-        mixed: &[f32],
-        gated_projection: &[f32],
-        output_gradient: &[f32],
-        rows: usize,
-        channels: usize,
-    ) -> Result<MetalHyenaGateBackward> {
-        use objc2_metal::{MTLBuffer, MTLCommandBuffer, MTLCommandEncoder, MTLCommandQueue};
-        let elements = rows
-            .checked_mul(channels)
-            .ok_or_else(|| anyhow::anyhow!("Metal gate backward shape overflow"))?;
-        let projected = elements
-            .checked_mul(2)
-            .ok_or_else(|| anyhow::anyhow!("Metal gate backward projection overflow"))?;
-        if rows == 0
-            || channels == 0
-            || mixed.len() != elements
-            || output_gradient.len() != elements
-            || gated_projection.len() != projected
-            || mixed
-                .iter()
-                .chain(gated_projection)
-                .chain(output_gradient)
-                .any(|value| !value.is_finite())
-        {
-            bail!("Metal gate backward shape/value mismatch");
-        }
-        let activation_bytes = elements
-            .checked_mul(size_of::<f32>())
-            .ok_or_else(|| anyhow::anyhow!("Metal gate backward activation overflow"))?;
-        let projection_bytes = projected
-            .checked_mul(size_of::<f32>())
-            .ok_or_else(|| anyhow::anyhow!("Metal gate backward projection overflow"))?;
-        self.reserve_activations(rows, channels)?;
-        self.gate_buffers
-            .borrow_mut()
-            .ensure(&self.device, projection_bytes)?;
-        self.hyena_output_buffer
-            .borrow_mut()
-            .ensure(&self.device, activation_bytes)?;
-        let activations = self.activations.borrow();
-        let gates = self.gate_buffers.borrow();
-        let output = self.hyena_output_buffer.borrow();
-        let mixed_buffer = activations
-            .first
-            .as_ref()
-            .expect("checked Metal activation buffer");
-        let mixed_gradient = activations
-            .second
-            .as_ref()
-            .expect("checked Metal activation scratch");
-        let projection_buffer = gates.input.as_ref().expect("checked Metal gate input");
-        let projection_gradient = gates.output.as_ref().expect("checked Metal gate output");
-        let upstream = output.buffer.as_ref().expect("checked Metal Hyena output");
-        // SAFETY: allocations match the checked slices and commands start only
-        // after these shared-buffer writes are complete.
-        unsafe {
-            mixed_buffer
-                .contents()
-                .cast::<f32>()
-                .as_ptr()
-                .copy_from_nonoverlapping(mixed.as_ptr(), elements);
-            projection_buffer
-                .contents()
-                .cast::<f32>()
-                .as_ptr()
-                .copy_from_nonoverlapping(gated_projection.as_ptr(), projected);
-            upstream
-                .contents()
-                .cast::<f32>()
-                .as_ptr()
-                .copy_from_nonoverlapping(output_gradient.as_ptr(), elements);
-            projection_gradient
-                .contents()
-                .cast::<f32>()
-                .as_ptr()
-                .write_bytes(0, projected);
-        }
-        let channels =
-            u32::try_from(channels).map_err(|_| anyhow::anyhow!("Metal channels exceed u32"))?;
-        let elements =
-            u32::try_from(elements).map_err(|_| anyhow::anyhow!("Metal elements exceed u32"))?;
-        let command = self
-            .queue
-            .commandBuffer()
-            .ok_or_else(|| anyhow::anyhow!("Metal command buffer allocation failed"))?;
-        let encoder = command
-            .computeCommandEncoder()
-            .ok_or_else(|| anyhow::anyhow!("Metal compute encoder allocation failed"))?;
-        self.encode_hyena_gate_backward(
-            encoder.as_ref(),
-            mixed_buffer,
-            projection_buffer,
-            upstream,
-            mixed_gradient,
-            projection_gradient,
-            channels,
-            elements,
-        )?;
-        encoder.endEncoding();
-        command.commit();
-        command.waitUntilCompleted();
-        if let Some(error) = command.error() {
-            bail!("Metal gate backward command failed: {error}");
-        }
-        let mut mixed_gradient_result = vec![0.0; elements as usize];
-        let mut projection_gradient_result = vec![0.0; projected];
-        // SAFETY: completion makes the shared outputs readable at their exact
-        // checked element counts.
-        unsafe {
-            mixed_gradient_result.as_mut_ptr().copy_from_nonoverlapping(
-                mixed_gradient.contents().cast::<f32>().as_ptr(),
-                elements as usize,
-            );
-            projection_gradient_result
-                .as_mut_ptr()
-                .copy_from_nonoverlapping(
-                    projection_gradient.contents().cast::<f32>().as_ptr(),
-                    projected,
-                );
-        }
-        Ok(MetalHyenaGateBackward {
-            mixed_gradient: mixed_gradient_result,
-            projection_gradient: projection_gradient_result,
-        })
-    }
-
-    #[allow(unsafe_code)]
-    fn encode_fft_two_buffer(
-        &self,
-        encoder: &objc2::runtime::ProtocolObject<dyn objc2_metal::MTLComputeCommandEncoder>,
-        pipeline: &objc2::runtime::ProtocolObject<dyn objc2_metal::MTLComputePipelineState>,
-        input: &objc2::runtime::ProtocolObject<dyn objc2_metal::MTLBuffer>,
-        output: &objc2::runtime::ProtocolObject<dyn objc2_metal::MTLBuffer>,
-        total: usize,
-        scalars: &[u32],
-    ) -> Result<()> {
-        use core::ffi::c_void;
-        use core::ptr::NonNull;
-        use objc2_metal::{MTLComputeCommandEncoder, MTLComputePipelineState, MTLSize};
-        encoder.setComputePipelineState(pipeline);
-        // SAFETY: slots 0/1 and scalar slots from 2 match the FFT MSL kernels.
-        unsafe {
-            encoder.setBuffer_offset_atIndex(Some(input), 0, 0);
-            encoder.setBuffer_offset_atIndex(Some(output), 0, 1);
-            for (offset, scalar) in scalars.iter().enumerate() {
-                encoder.setBytes_length_atIndex(
-                    NonNull::from(scalar).cast::<c_void>(),
-                    size_of::<u32>(),
-                    offset + 2,
-                );
-            }
-        }
-        let width = pipeline.maxTotalThreadsPerThreadgroup().min(total);
-        if width == 0 {
-            bail!("Metal FFT pipeline reported zero threads per threadgroup");
-        }
-        encoder.dispatchThreads_threadsPerThreadgroup(
-            MTLSize {
-                width: total,
-                height: 1,
-                depth: 1,
-            },
-            MTLSize {
-                width,
-                height: 1,
-                depth: 1,
-            },
-        );
-        Ok(())
-    }
-
-    #[allow(unsafe_code)]
-    fn encode_fft_threadgroup_4096(
-        &self,
-        encoder: &objc2::runtime::ProtocolObject<dyn objc2_metal::MTLComputeCommandEncoder>,
-        input: &objc2::runtime::ProtocolObject<dyn objc2_metal::MTLBuffer>,
-        output: &objc2::runtime::ProtocolObject<dyn objc2_metal::MTLBuffer>,
-        fft_len: u32,
-        transforms: u32,
-        inverse: bool,
-    ) -> Result<()> {
-        use core::ffi::c_void;
-        use core::ptr::NonNull;
-        use objc2_metal::{MTLComputeCommandEncoder, MTLSize};
-
-        if fft_len > 4096 || transforms == 0 {
-            bail!("threadgroup FFT requires 1..=4096-point transforms");
-        }
-        encoder.setComputePipelineState(&self.fft_threadgroup_4096_pipeline);
-        let inverse = u32::from(inverse);
-        unsafe {
-            encoder.setBuffer_offset_atIndex(Some(input), 0, 0);
-            encoder.setBuffer_offset_atIndex(Some(output), 0, 1);
-            for (slot, scalar) in [fft_len, transforms, inverse].iter().enumerate() {
-                encoder.setBytes_length_atIndex(
-                    NonNull::from(scalar).cast::<c_void>(),
-                    size_of::<u32>(),
-                    slot + 2,
-                );
-            }
-        }
-        encoder.dispatchThreadgroups_threadsPerThreadgroup(
-            MTLSize {
-                width: transforms as usize,
-                height: 1,
-                depth: 1,
-            },
-            MTLSize {
-                width: 256,
-                height: 1,
-                depth: 1,
-            },
-        );
-        Ok(())
-    }
-
-    #[allow(unsafe_code)]
-    fn encode_implicit_filter(
-        &self,
-        encoder: &objc2::runtime::ProtocolObject<dyn objc2_metal::MTLComputeCommandEncoder>,
-        freq: &objc2::runtime::ProtocolObject<dyn objc2_metal::MTLBuffer>,
-        phase: &objc2::runtime::ProtocolObject<dyn objc2_metal::MTLBuffer>,
-        decay: &objc2::runtime::ProtocolObject<dyn objc2_metal::MTLBuffer>,
-        output: &objc2::runtime::ProtocolObject<dyn objc2_metal::MTLBuffer>,
-        time: u32,
-        sequence_len: u32,
-        order: u32,
-        fft_len: u32,
-        elements: u32,
-    ) -> Result<()> {
-        use core::ffi::c_void;
-        use core::ptr::NonNull;
-        use objc2_metal::{MTLComputeCommandEncoder, MTLComputePipelineState, MTLSize};
-        encoder.setComputePipelineState(&self.implicit_filter_pipeline);
-        // SAFETY: slots 0..8 exactly match ullis_generate_implicit_filter.
-        unsafe {
-            encoder.setBuffer_offset_atIndex(Some(freq), 0, 0);
-            encoder.setBuffer_offset_atIndex(Some(phase), 0, 1);
-            encoder.setBuffer_offset_atIndex(Some(decay), 0, 2);
-            encoder.setBuffer_offset_atIndex(Some(output), 0, 3);
-            for (slot, scalar) in [time, sequence_len, order, fft_len, elements]
-                .iter()
-                .enumerate()
-            {
-                encoder.setBytes_length_atIndex(
-                    NonNull::from(scalar).cast::<c_void>(),
-                    size_of::<u32>(),
-                    slot + 4,
-                );
-            }
-        }
-        let width = self
-            .implicit_filter_pipeline
-            .maxTotalThreadsPerThreadgroup()
-            .min(elements as usize);
-        if width == 0 {
-            bail!("Metal implicit-filter pipeline reported zero threads per threadgroup");
-        }
-        encoder.dispatchThreads_threadsPerThreadgroup(
-            MTLSize {
-                width: elements as usize,
-                height: 1,
-                depth: 1,
-            },
-            MTLSize {
-                width,
-                height: 1,
-                depth: 1,
-            },
-        );
-        Ok(())
-    }
-
-    #[allow(unsafe_code)]
-    fn encode_implicit_filter_fp16(
-        &self,
-        encoder: &objc2::runtime::ProtocolObject<dyn objc2_metal::MTLComputeCommandEncoder>,
-        freq: &objc2::runtime::ProtocolObject<dyn objc2_metal::MTLBuffer>,
-        phase: &objc2::runtime::ProtocolObject<dyn objc2_metal::MTLBuffer>,
-        decay: &objc2::runtime::ProtocolObject<dyn objc2_metal::MTLBuffer>,
-        output: &objc2::runtime::ProtocolObject<dyn objc2_metal::MTLBuffer>,
-        time: u32,
-        sequence_len: u32,
-        order: u32,
-        fft_len: u32,
-        elements: u32,
-    ) -> Result<()> {
-        use core::ffi::c_void;
-        use core::ptr::NonNull;
-        use objc2_metal::{MTLComputeCommandEncoder, MTLComputePipelineState, MTLSize};
-        encoder.setComputePipelineState(&self.implicit_filter_fp16_pipeline);
-        unsafe {
-            encoder.setBuffer_offset_atIndex(Some(freq), 0, 0);
-            encoder.setBuffer_offset_atIndex(Some(phase), 0, 1);
-            encoder.setBuffer_offset_atIndex(Some(decay), 0, 2);
-            encoder.setBuffer_offset_atIndex(Some(output), 0, 3);
-            for (slot, scalar) in [time, sequence_len, order, fft_len, elements]
-                .iter()
-                .enumerate()
-            {
-                encoder.setBytes_length_atIndex(
-                    NonNull::from(scalar).cast::<c_void>(),
-                    size_of::<u32>(),
-                    slot + 4,
-                );
-            }
-        }
-        let width = self
-            .implicit_filter_fp16_pipeline
-            .maxTotalThreadsPerThreadgroup()
-            .min(elements as usize);
-        if width == 0 {
-            bail!("Metal FP16 implicit-filter pipeline reported zero threads per threadgroup");
-        }
-        encoder.dispatchThreads_threadsPerThreadgroup(
-            MTLSize {
-                width: elements as usize,
-                height: 1,
-                depth: 1,
-            },
-            MTLSize {
-                width,
-                height: 1,
-                depth: 1,
-            },
-        );
-        Ok(())
-    }
-
-    #[allow(unsafe_code)]
-    fn encode_fft_multiply(
-        &self,
-        encoder: &objc2::runtime::ProtocolObject<dyn objc2_metal::MTLComputeCommandEncoder>,
-        signal: &objc2::runtime::ProtocolObject<dyn objc2_metal::MTLBuffer>,
-        filter: &objc2::runtime::ProtocolObject<dyn objc2_metal::MTLBuffer>,
-        output: &objc2::runtime::ProtocolObject<dyn objc2_metal::MTLBuffer>,
-        fft_len: u32,
-        channels: u32,
-        transforms: u32,
-        total: usize,
-    ) -> Result<()> {
-        use core::ffi::c_void;
-        use core::ptr::NonNull;
-        use objc2_metal::{MTLComputeCommandEncoder, MTLComputePipelineState, MTLSize};
-        encoder.setComputePipelineState(&self.fft_multiply_pipeline);
-        // SAFETY: slots 0..5 exactly match ullis_fft_complex_multiply.
-        unsafe {
-            encoder.setBuffer_offset_atIndex(Some(signal), 0, 0);
-            encoder.setBuffer_offset_atIndex(Some(filter), 0, 1);
-            encoder.setBuffer_offset_atIndex(Some(output), 0, 2);
-            for (slot, scalar) in [fft_len, channels, transforms].iter().enumerate() {
-                encoder.setBytes_length_atIndex(
-                    NonNull::from(scalar).cast::<c_void>(),
-                    size_of::<u32>(),
-                    slot + 3,
-                );
-            }
-        }
-        let width = self
-            .fft_multiply_pipeline
-            .maxTotalThreadsPerThreadgroup()
-            .min(total);
-        if width == 0 {
-            bail!("Metal FFT multiply pipeline reported zero threads per threadgroup");
-        }
-        encoder.dispatchThreads_threadsPerThreadgroup(
-            MTLSize {
-                width: total,
-                height: 1,
-                depth: 1,
-            },
-            MTLSize {
-                width,
-                height: 1,
-                depth: 1,
-            },
-        );
-        Ok(())
-    }
-
-    #[allow(unsafe_code)]
-    fn encode_causal_extract(
-        &self,
-        encoder: &objc2::runtime::ProtocolObject<dyn objc2_metal::MTLComputeCommandEncoder>,
-        input: &objc2::runtime::ProtocolObject<dyn objc2_metal::MTLBuffer>,
-        output: &objc2::runtime::ProtocolObject<dyn objc2_metal::MTLBuffer>,
-        time: u32,
-        channels: u32,
-        fft_len: u32,
-        elements: u32,
-    ) -> Result<()> {
-        use core::ffi::c_void;
-        use core::ptr::NonNull;
-        use objc2_metal::{MTLComputeCommandEncoder, MTLComputePipelineState, MTLSize};
-        encoder.setComputePipelineState(&self.fft_extract_pipeline);
-        // SAFETY: slots 0..5 exactly match ullis_fft_extract_causal.
-        unsafe {
-            encoder.setBuffer_offset_atIndex(Some(input), 0, 0);
-            encoder.setBuffer_offset_atIndex(Some(output), 0, 1);
-            for (slot, scalar) in [time, channels, fft_len, elements].iter().enumerate() {
-                encoder.setBytes_length_atIndex(
-                    NonNull::from(scalar).cast::<c_void>(),
-                    size_of::<u32>(),
-                    slot + 2,
-                );
-            }
-        }
-        let width = self
-            .fft_extract_pipeline
-            .maxTotalThreadsPerThreadgroup()
-            .min(elements as usize);
-        if width == 0 {
-            bail!("Metal FFT extract pipeline reported zero threads per threadgroup");
-        }
-        encoder.dispatchThreads_threadsPerThreadgroup(
-            MTLSize {
-                width: elements as usize,
-                height: 1,
-                depth: 1,
-            },
-            MTLSize {
-                width,
-                height: 1,
-                depth: 1,
-            },
-        );
-        Ok(())
-    }
-
-    /// Runs batched complex radix-2 FFTs through cached ping-pong buffers.
-    /// Values are interleaved as `(real, imaginary)` and each transform must
-    /// have the same power-of-two width.
-    #[allow(unsafe_code)]
-    pub fn fft_reference(
-        &self,
-        values: &[(f32, f32)],
-        transforms: usize,
-        inverse: bool,
-    ) -> Result<Vec<(f32, f32)>> {
-        use core::ffi::c_void;
-        use core::ptr::NonNull;
-        use objc2_metal::{
-            MTLBuffer, MTLCommandBuffer, MTLCommandEncoder, MTLCommandQueue,
-            MTLComputeCommandEncoder, MTLComputePipelineState, MTLSize,
-        };
-
-        if transforms == 0 || values.is_empty() || !values.len().is_multiple_of(transforms) {
-            bail!("Metal FFT shape mismatch");
-        }
-        let fft_len = values.len() / transforms;
-        if !fft_len.is_power_of_two() || u32::try_from(values.len()).is_err() {
-            bail!("Metal FFT length must be a non-zero u32 power of two");
-        }
-        let fft_len_u32 =
-            u32::try_from(fft_len).map_err(|_| anyhow::anyhow!("Metal FFT length exceeds u32"))?;
-        let transforms_u32 = u32::try_from(transforms)
-            .map_err(|_| anyhow::anyhow!("Metal FFT transform count exceeds u32"))?;
+    fn buffer_f32(&self, values: &[f32]) -> Result<RecycledBuffer<'_>> {
         let bytes = values
             .len()
-            .checked_mul(size_of::<(f32, f32)>())
-            .ok_or_else(|| anyhow::anyhow!("Metal FFT byte size overflow"))?;
-        let mut buffers = self.fft_buffers.borrow_mut();
-        buffers.ensure(&self.device, bytes)?;
-        let first = buffers
-            .first
-            .as_ref()
-            .expect("checked Metal FFT source buffer");
-        let second = buffers
-            .second
-            .as_ref()
-            .expect("checked Metal FFT scratch buffer");
-        // SAFETY: The shared source capacity was checked from `values`, and
-        // the borrow keeps both ping-pong buffers stable until GPU completion.
-        unsafe {
-            first
-                .contents()
-                .cast::<(f32, f32)>()
-                .as_ptr()
-                .copy_from_nonoverlapping(values.as_ptr(), values.len());
+            .checked_mul(size_of::<f32>())
+            .unwrap_or(size_of::<f32>())
+            .max(size_of::<f32>());
+        let buffer = self.shared_buffer(bytes)?;
+        if values.is_empty() {
+            buffer.zero()?;
+        } else {
+            buffer.write_f32(values)?;
         }
+        Ok(buffer)
+    }
+
+    fn buffer_u16(&self, values: &[u16]) -> Result<RecycledBuffer<'_>> {
+        let bytes = values
+            .len()
+            .checked_mul(size_of::<u16>())
+            .unwrap_or(size_of::<u16>())
+            .max(size_of::<u16>());
+        let buffer = self.shared_buffer(bytes)?;
+        if values.is_empty() {
+            buffer.zero()?;
+        } else {
+            buffer.write_u16(values)?;
+        }
+        Ok(buffer)
+    }
+
+    fn buffer_u32(&self, values: &[u32]) -> Result<RecycledBuffer<'_>> {
+        let bytes = values
+            .len()
+            .checked_mul(size_of::<u32>())
+            .unwrap_or(size_of::<u32>())
+            .max(size_of::<u32>());
+        let buffer = self.shared_buffer(bytes)?;
+        if values.is_empty() {
+            buffer.zero()?;
+        } else {
+            buffer.write_u32(values)?;
+        }
+        Ok(buffer)
+    }
+
+    fn zeros_f32(&self, len: usize) -> Result<RecycledBuffer<'_>> {
+        let bytes = len.saturating_mul(size_of::<f32>()).max(size_of::<f32>());
+        let buffer = self.shared_buffer(bytes)?;
+        buffer.zero()?;
+        Ok(buffer)
+    }
+
+    fn alloc_f32(&self, len: usize) -> Result<RecycledBuffer<'_>> {
+        let bytes = len.saturating_mul(size_of::<f32>()).max(size_of::<f32>());
+        self.shared_buffer(bytes)
+    }
+
+    fn alloc_bytes(&self, bytes: usize) -> Result<RecycledBuffer<'_>> {
+        self.shared_buffer(bytes.max(1))
+    }
+
+    fn submit(&self, encode: impl FnOnce(&ffi::ComputeEncoder) -> Result<()>) -> Result<()> {
+        use objc2_metal::{MTLCommandBuffer, MTLCommandEncoder, MTLCommandQueue};
+
         let command = self
             .queue
             .commandBuffer()
@@ -8060,211 +627,47 @@ impl MetalRuntime {
         let encoder = command
             .computeCommandEncoder()
             .ok_or_else(|| anyhow::anyhow!("Metal compute encoder allocation failed"))?;
-        let dispatch = |encoder: &objc2::runtime::ProtocolObject<dyn MTLComputeCommandEncoder>,
-                        pipeline: &objc2::runtime::ProtocolObject<dyn MTLComputePipelineState>,
-                        input: &objc2::runtime::ProtocolObject<dyn MTLBuffer>,
-                        output: &objc2::runtime::ProtocolObject<dyn MTLBuffer>,
-                        scalars: &[u32]|
-         -> Result<()> {
-            encoder.setComputePipelineState(pipeline);
-            // SAFETY: Slots 0/1 and scalar slots beginning at 2 match both
-            // FFT MSL signatures; `setBytes` copies each scalar immediately.
-            unsafe {
-                encoder.setBuffer_offset_atIndex(Some(input), 0, 0);
-                encoder.setBuffer_offset_atIndex(Some(output), 0, 1);
-                for (offset, scalar) in scalars.iter().enumerate() {
-                    encoder.setBytes_length_atIndex(
-                        NonNull::from(scalar).cast::<c_void>(),
-                        size_of::<u32>(),
-                        offset + 2,
-                    );
-                }
-            }
-            let width = pipeline.maxTotalThreadsPerThreadgroup().min(values.len());
-            if width == 0 {
-                bail!("Metal FFT pipeline reported zero threads per threadgroup");
-            }
-            encoder.dispatchThreads_threadsPerThreadgroup(
-                MTLSize {
-                    width: values.len(),
-                    height: 1,
-                    depth: 1,
-                },
-                MTLSize {
-                    width,
-                    height: 1,
-                    depth: 1,
-                },
-            );
-            Ok(())
-        };
-        dispatch(
-            encoder.as_ref(),
-            &self.fft_bitreverse_pipeline,
-            first.as_ref(),
-            second.as_ref(),
-            &[fft_len_u32, transforms_u32],
-        )?;
-        let mut source_is_first = false;
-        for stage in 1..=fft_len.ilog2() {
-            let (input, output) = if source_is_first {
-                (first.as_ref(), second.as_ref())
-            } else {
-                (second.as_ref(), first.as_ref())
-            };
-            dispatch(
-                encoder.as_ref(),
-                &self.fft_stage_pipeline,
-                input,
-                output,
-                &[fft_len_u32, transforms_u32, stage, u32::from(inverse)],
-            )?;
-            source_is_first = !source_is_first;
-        }
+        encode(encoder.as_ref())?;
         encoder.endEncoding();
         command.commit();
         command.waitUntilCompleted();
         if let Some(error) = command.error() {
-            bail!("Metal FFT command failed: {error}");
+            bail!("Metal command failed: {error}");
         }
-        let result = if source_is_first { first } else { second };
-        let mut output = vec![(0.0, 0.0); values.len()];
-        // SAFETY: Command completion makes the selected result buffer readable
-        // and it has exactly the requested complex element capacity.
-        unsafe {
-            output.as_mut_ptr().copy_from_nonoverlapping(
-                result.contents().cast::<(f32, f32)>().as_ptr(),
-                values.len(),
-            );
-        }
-        if inverse {
-            let scale = fft_len as f32;
-            for value in &mut output {
-                value.0 /= scale;
-                value.1 /= scale;
-            }
-        }
-        Ok(output)
+        Ok(())
     }
 
-    /// Generates an implicit filter on Metal into the cached FFT filter buffer.
-    /// The returned Vec exists only for numerical verification; the following
-    /// integration step will consume that buffer directly in the FFT chain.
-    #[allow(unsafe_code)]
-    pub fn implicit_filter_forward(
-        &self,
-        filter: &crate::hyena::ImplicitFilter,
-        channels: usize,
-        time: usize,
-    ) -> Result<Vec<f32>> {
-        use core::ffi::c_void;
-        use core::ptr::NonNull;
-        use objc2_metal::{
-            MTLBuffer, MTLCommandBuffer, MTLCommandEncoder, MTLCommandQueue,
-            MTLComputeCommandEncoder, MTLComputePipelineState, MTLSize,
-        };
+    fn set_u32s(encoder: &ffi::ComputeEncoder, start: usize, values: &[u32]) -> Result<()> {
+        for (offset, value) in values.iter().enumerate() {
+            set_bytes_u32(encoder, start + offset, &[*value])?;
+        }
+        Ok(())
+    }
 
-        let (freq, phase, decay, order) = filter.parameter_slices(channels)?;
-        let plan = HyenaFftPlan::new(time)?;
-        let elements = channels
-            .checked_mul(time)
-            .ok_or_else(|| anyhow::anyhow!("Metal implicit-filter shape overflow"))?;
-        let fft_elements = channels
-            .checked_mul(plan.fft_len)
-            .ok_or_else(|| anyhow::anyhow!("Metal implicit-filter FFT shape overflow"))?;
-        let parameter_bytes = freq
-            .len()
-            .checked_mul(size_of::<f32>())
-            .ok_or_else(|| anyhow::anyhow!("Metal implicit-filter parameter size overflow"))?;
-        let fft_bytes = fft_elements
-            .checked_mul(size_of::<Complex32>())
-            .ok_or_else(|| anyhow::anyhow!("Metal implicit-filter output size overflow"))?;
-        let time_u32 = u32::try_from(time)
-            .map_err(|_| anyhow::anyhow!("Metal implicit-filter time exceeds u32"))?;
-        let order_u32 = u32::try_from(order)
-            .map_err(|_| anyhow::anyhow!("Metal implicit-filter order exceeds u32"))?;
-        let fft_len_u32 = u32::try_from(plan.fft_len)
-            .map_err(|_| anyhow::anyhow!("Metal implicit-filter FFT length exceeds u32"))?;
-        let elements_u32 = u32::try_from(elements)
-            .map_err(|_| anyhow::anyhow!("Metal implicit-filter element count exceeds u32"))?;
-        let mut parameters = self.implicit_filter_parameters.borrow_mut();
-        let mut buffers = self.filter_fft_buffers.borrow_mut();
-        parameters.ensure(&self.device, parameter_bytes)?;
-        buffers.ensure(&self.device, fft_bytes)?;
-        let freq_buffer = parameters
-            .freq
-            .as_ref()
-            .expect("checked Metal implicit frequency buffer");
-        let phase_buffer = parameters
-            .phase
-            .as_ref()
-            .expect("checked Metal implicit phase buffer");
-        let decay_buffer = parameters
-            .decay
-            .as_ref()
-            .expect("checked Metal implicit decay buffer");
-        let output = buffers
-            .first
-            .as_ref()
-            .expect("checked Metal implicit output buffer");
-        // SAFETY: all shared buffers have checked capacities and stay borrowed until completion.
-        unsafe {
-            freq_buffer
-                .contents()
-                .cast::<f32>()
-                .as_ptr()
-                .copy_from_nonoverlapping(freq.as_ptr(), freq.len());
-            phase_buffer
-                .contents()
-                .cast::<f32>()
-                .as_ptr()
-                .copy_from_nonoverlapping(phase.as_ptr(), phase.len());
-            decay_buffer
-                .contents()
-                .cast::<f32>()
-                .as_ptr()
-                .copy_from_nonoverlapping(decay.as_ptr(), decay.len());
-            output
-                .contents()
-                .cast::<Complex32>()
-                .as_ptr()
-                .write_bytes(0, fft_elements);
+    fn encode_1d<B: AsRef<MetalBuffer>>(
+        encoder: &ffi::ComputeEncoder,
+        pipeline: &Pipeline,
+        buffers: &[B],
+        constants: impl FnOnce(&ffi::ComputeEncoder) -> Result<()>,
+        threads: usize,
+    ) -> Result<()> {
+        use objc2_metal::{MTLComputeCommandEncoder, MTLComputePipelineState, MTLSize};
+
+        if threads == 0 {
+            bail!("Metal dispatch cannot be empty");
         }
-        let command = self
-            .queue
-            .commandBuffer()
-            .ok_or_else(|| anyhow::anyhow!("Metal command buffer allocation failed"))?;
-        let encoder = command
-            .computeCommandEncoder()
-            .ok_or_else(|| anyhow::anyhow!("Metal compute encoder allocation failed"))?;
-        encoder.setComputePipelineState(&self.implicit_filter_pipeline);
-        // SAFETY: slots 0..8 exactly match ullis_generate_implicit_filter.
-        unsafe {
-            encoder.setBuffer_offset_atIndex(Some(freq_buffer), 0, 0);
-            encoder.setBuffer_offset_atIndex(Some(phase_buffer), 0, 1);
-            encoder.setBuffer_offset_atIndex(Some(decay_buffer), 0, 2);
-            encoder.setBuffer_offset_atIndex(Some(output), 0, 3);
-            for (slot, scalar) in [time_u32, time_u32, order_u32, fft_len_u32, elements_u32]
-                .iter()
-                .enumerate()
-            {
-                encoder.setBytes_length_atIndex(
-                    NonNull::from(scalar).cast::<c_void>(),
-                    size_of::<u32>(),
-                    slot + 4,
-                );
-            }
+        encoder.setComputePipelineState(pipeline);
+        for (slot, buffer) in buffers.iter().enumerate() {
+            set_buffer(encoder, buffer.as_ref(), slot);
         }
-        let width = self
-            .implicit_filter_pipeline
-            .maxTotalThreadsPerThreadgroup()
-            .min(elements);
+        constants(encoder)?;
+        let width = pipeline.maxTotalThreadsPerThreadgroup().min(threads);
         if width == 0 {
-            bail!("Metal implicit-filter pipeline reported zero threads per threadgroup");
+            bail!("Metal pipeline reported zero threads per threadgroup");
         }
         encoder.dispatchThreads_threadsPerThreadgroup(
             MTLSize {
-                width: elements,
+                width: threads,
                 height: 1,
                 depth: 1,
             },
@@ -8274,989 +677,2745 @@ impl MetalRuntime {
                 depth: 1,
             },
         );
-        encoder.endEncoding();
-        command.commit();
-        command.waitUntilCompleted();
-        if let Some(error) = command.error() {
-            bail!("Metal implicit-filter command failed: {error}");
-        }
-        let mut result = vec![0.0; elements];
-        // SAFETY: command completion makes generated complex values readable; only real lanes are returned.
-        unsafe {
-            let generated = output.contents().cast::<Complex32>().as_ptr();
-            for channel in 0..channels {
-                for position in 0..time {
-                    result[channel * time + position] =
-                        (*generated.add(channel * plan.fft_len + position)).real;
-                }
-            }
-        }
-        Ok(result)
+        Ok(())
     }
 
-    /// Executes dense causal Hyena convolution in one Metal command buffer.
+    fn encode_tiled<B: AsRef<MetalBuffer>>(
+        encoder: &ffi::ComputeEncoder,
+        pipeline: &Pipeline,
+        buffers: &[B],
+        constants: impl FnOnce(&ffi::ComputeEncoder) -> Result<()>,
+        width: usize,
+        height: usize,
+    ) -> Result<()> {
+        use objc2_metal::{MTLComputeCommandEncoder, MTLSize};
+
+        if width == 0 || height == 0 {
+            bail!("Metal tiled dispatch cannot be empty");
+        }
+        encoder.setComputePipelineState(pipeline);
+        for (slot, buffer) in buffers.iter().enumerate() {
+            set_buffer(encoder, buffer.as_ref(), slot);
+        }
+        constants(encoder)?;
+        encoder.dispatchThreadgroups_threadsPerThreadgroup(
+            MTLSize {
+                width: width.div_ceil(LINEAR_TILE),
+                height: height.div_ceil(LINEAR_TILE),
+                depth: 1,
+            },
+            MTLSize {
+                width: LINEAR_TILE,
+                height: LINEAR_TILE,
+                depth: 1,
+            },
+        );
+        Ok(())
+    }
+
+    fn encode_scale_groups<B: AsRef<MetalBuffer>>(
+        encoder: &ffi::ComputeEncoder,
+        pipeline: &Pipeline,
+        buffers: &[B],
+        constants: impl FnOnce(&ffi::ComputeEncoder) -> Result<()>,
+        out_features: usize,
+    ) -> Result<()> {
+        use objc2_metal::{MTLComputeCommandEncoder, MTLSize};
+
+        if out_features == 0 {
+            bail!("Metal scale-bwd dispatch cannot be empty");
+        }
+        encoder.setComputePipelineState(pipeline);
+        for (slot, buffer) in buffers.iter().enumerate() {
+            set_buffer(encoder, buffer.as_ref(), slot);
+        }
+        constants(encoder)?;
+        encoder.dispatchThreadgroups_threadsPerThreadgroup(
+            MTLSize {
+                width: out_features,
+                height: 1,
+                depth: 1,
+            },
+            MTLSize {
+                width: SCALE_BWD_THREADS,
+                height: 1,
+                depth: 1,
+            },
+        );
+        Ok(())
+    }
+
+    fn encode_wkv7<B: AsRef<MetalBuffer>>(
+        encoder: &ffi::ComputeEncoder,
+        pipeline: &Pipeline,
+        buffers: &[B],
+        time: u32,
+        heads: u32,
+        batch: u32,
+        constant_start: usize,
+    ) -> Result<()> {
+        use objc2_metal::{MTLComputeCommandEncoder, MTLSize};
+
+        encoder.setComputePipelineState(pipeline);
+        for (slot, buffer) in buffers.iter().enumerate() {
+            set_buffer(encoder, buffer.as_ref(), slot);
+        }
+        set_bytes_u32(encoder, constant_start, &[time])?;
+        set_bytes_u32(encoder, constant_start + 1, &[heads])?;
+        encoder.dispatchThreadgroups_threadsPerThreadgroup(
+            MTLSize {
+                width: usize::try_from(heads).unwrap_or(0),
+                height: usize::try_from(batch).unwrap_or(0),
+                depth: 1,
+            },
+            MTLSize {
+                width: crate::wkv7::HEAD_SIZE,
+                height: 1,
+                depth: 1,
+            },
+        );
+        Ok(())
+    }
+
+    /// Metal-resident CUDA `forward_kernel`. `T` must be a multiple of 16.
+    pub fn wkv7_forward(
+        &self,
+        w: &[f32],
+        q: &[f32],
+        k: &[f32],
+        v: &[f32],
+        a: &[f32],
+        b: &[f32],
+        batch: usize,
+        time: usize,
+        heads: usize,
+    ) -> Result<crate::wkv7::Wkv7Forward> {
+        crate::wkv7::require_shape(w, q, k, v, a, b, batch, time, heads)?;
+        let len = batch
+            .saturating_mul(time)
+            .saturating_mul(heads)
+            .saturating_mul(crate::wkv7::HEAD_SIZE);
+        let s_len = batch
+            .saturating_mul(heads)
+            .saturating_mul(time / crate::wkv7::CHUNK_LEN)
+            .saturating_mul(crate::wkv7::HEAD_SIZE)
+            .saturating_mul(crate::wkv7::HEAD_SIZE);
+        let w_b = self.buffer_f32(w)?;
+        let q_b = self.buffer_f32(q)?;
+        let k_b = self.buffer_f32(k)?;
+        let v_b = self.buffer_f32(v)?;
+        let a_b = self.buffer_f32(a)?;
+        let b_b = self.buffer_f32(b)?;
+        let y_b = self.zeros_f32(len)?;
+        let s_b = self.zeros_f32(s_len.max(1))?;
+        let sa_b = self.zeros_f32(len)?;
+        let t = as_u32(time, "WKV7 time")?;
+        let h = as_u32(heads, "WKV7 heads")?;
+        let bb = as_u32(batch, "WKV7 batch")?;
+        self.submit(|encoder| {
+            Self::encode_wkv7(
+                encoder,
+                &self.pipelines.wkv7_forward,
+                &[&w_b, &q_b, &k_b, &v_b, &a_b, &b_b, &y_b, &s_b, &sa_b],
+                t,
+                h,
+                bb,
+                9,
+            )
+        })?;
+        let mut y = vec![0.0; len];
+        let mut s = vec![0.0; s_len];
+        let mut sa = vec![0.0; len];
+        y_b.read_f32(&mut y)?;
+        s_b.read_f32(&mut s)?;
+        sa_b.read_f32(&mut sa)?;
+        Ok(crate::wkv7::Wkv7Forward { y, s, sa })
+    }
+
+    /// Metal-resident CUDA `backward_kernel`.
+    pub fn wkv7_backward(
+        &self,
+        w: &[f32],
+        q: &[f32],
+        k: &[f32],
+        v: &[f32],
+        a: &[f32],
+        b: &[f32],
+        dy: &[f32],
+        s: &[f32],
+        sa: &[f32],
+        batch: usize,
+        time: usize,
+        heads: usize,
+    ) -> Result<crate::wkv7::Wkv7Backward> {
+        crate::wkv7::require_backward_shape(w, q, k, v, a, b, dy, s, sa, batch, time, heads)?;
+        let len = batch
+            .saturating_mul(time)
+            .saturating_mul(heads)
+            .saturating_mul(crate::wkv7::HEAD_SIZE);
+        let w_b = self.buffer_f32(w)?;
+        let q_b = self.buffer_f32(q)?;
+        let k_b = self.buffer_f32(k)?;
+        let v_b = self.buffer_f32(v)?;
+        let a_b = self.buffer_f32(a)?;
+        let b_b = self.buffer_f32(b)?;
+        let dy_b = self.buffer_f32(dy)?;
+        let s_b = self.buffer_f32(s)?;
+        let sa_b = self.buffer_f32(sa)?;
+        let dw_b = self.zeros_f32(len)?;
+        let dq_b = self.zeros_f32(len)?;
+        let dk_b = self.zeros_f32(len)?;
+        let dv_b = self.zeros_f32(len)?;
+        let da_b = self.zeros_f32(len)?;
+        let db_b = self.zeros_f32(len)?;
+        let t = as_u32(time, "WKV7 time")?;
+        let h = as_u32(heads, "WKV7 heads")?;
+        let bb = as_u32(batch, "WKV7 batch")?;
+        self.submit(|encoder| {
+            Self::encode_wkv7(
+                encoder,
+                &self.pipelines.wkv7_backward,
+                &[
+                    &w_b, &q_b, &k_b, &v_b, &a_b, &b_b, &dy_b, &s_b, &sa_b, &dw_b, &dq_b, &dk_b,
+                    &dv_b, &da_b, &db_b,
+                ],
+                t,
+                h,
+                bb,
+                15,
+            )
+        })?;
+        let mut dw = vec![0.0; len];
+        let mut dq = vec![0.0; len];
+        let mut dk = vec![0.0; len];
+        let mut dv = vec![0.0; len];
+        let mut da = vec![0.0; len];
+        let mut db = vec![0.0; len];
+        dw_b.read_f32(&mut dw)?;
+        dq_b.read_f32(&mut dq)?;
+        dk_b.read_f32(&mut dk)?;
+        dv_b.read_f32(&mut dv)?;
+        da_b.read_f32(&mut da)?;
+        db_b.read_f32(&mut db)?;
+        Ok(crate::wkv7::Wkv7Backward {
+            dw,
+            dq,
+            dk,
+            dv,
+            da,
+            db,
+        })
+    }
+
+    pub fn identity(&self, input: &[f32]) -> Result<Vec<f32>> {
+        MetalDispatchShape::new(1, input.len().max(1), 1)?;
+        if input.is_empty() {
+            return Ok(Vec::new());
+        }
+        let elements = as_u32(input.len(), "element count")?;
+        let input_buffer = self.buffer_f32(input)?;
+        let output_buffer = self.zeros_f32(input.len())?;
+        self.submit(|encoder| {
+            Self::encode_1d(
+                encoder,
+                &self.pipelines.identity,
+                &[&input_buffer, &output_buffer],
+                |encoder| Self::set_u32s(encoder, 2, &[elements]),
+                input.len(),
+            )
+        })?;
+        let mut output = vec![0.0_f32; input.len()];
+        output_buffer.read_f32(&mut output)?;
+        Ok(output)
+    }
+
+    pub fn residual_add(&self, residual: &[f32], update: &[f32]) -> Result<Vec<f32>> {
+        if residual.len() != update.len() {
+            bail!("residual add length mismatch");
+        }
+        if residual.is_empty() {
+            return Ok(Vec::new());
+        }
+        let elements = as_u32(residual.len(), "residual elements")?;
+        let residual_buffer = self.buffer_f32(residual)?;
+        let update_buffer = self.buffer_f32(update)?;
+        let output_buffer = self.zeros_f32(residual.len())?;
+        self.submit(|encoder| {
+            Self::encode_1d(
+                encoder,
+                &self.pipelines.residual_add,
+                &[&residual_buffer, &update_buffer, &output_buffer],
+                |encoder| Self::set_u32s(encoder, 3, &[elements]),
+                residual.len(),
+            )
+        })?;
+        let mut output = vec![0.0; residual.len()];
+        output_buffer.read_f32(&mut output)?;
+        Ok(output)
+    }
+
+    pub fn time_shift_delta(
+        &self,
+        input: &[f32],
+        rows: usize,
+        time: usize,
+        channels: usize,
+    ) -> Result<Vec<f32>> {
+        if rows.checked_mul(channels) != Some(input.len())
+            || time == 0
+            || !rows.is_multiple_of(time)
+        {
+            bail!("time-shift input shape mismatch");
+        }
+        let input_buffer = self.buffer_f32(input)?;
+        let output_buffer = self.zeros_f32(input.len())?;
+        self.submit(|encoder| {
+            Self::encode_1d(
+                encoder,
+                &self.pipelines.time_shift_delta,
+                &[&input_buffer, &output_buffer],
+                |encoder| {
+                    Self::set_u32s(
+                        encoder,
+                        2,
+                        &[
+                            as_u32(rows, "rows")?,
+                            as_u32(time, "time")?,
+                            as_u32(channels, "channels")?,
+                        ],
+                    )
+                },
+                input.len(),
+            )
+        })?;
+        let mut output = vec![0.0; input.len()];
+        output_buffer.read_f32(&mut output)?;
+        Ok(output)
+    }
+
+    pub fn sign_pack_bits(&self, input: &[f32]) -> Result<Vec<u32>> {
+        if input.is_empty() {
+            return Ok(Vec::new());
+        }
+        let words = input.len().div_ceil(32);
+        let input_buffer = self.buffer_f32(input)?;
+        let bits_buffer = self.buffer_u32(&vec![0_u32; words])?;
+        self.submit(|encoder| {
+            Self::encode_1d(
+                encoder,
+                &self.pipelines.sign_pack_bits,
+                &[&input_buffer, &bits_buffer],
+                |encoder| set_bytes_u32(encoder, 2, &[as_u32(input.len(), "elements")?]),
+                words,
+            )
+        })?;
+        let mut bits = vec![0_u32; words];
+        bits_buffer.read_u32(&mut bits)?;
+        Ok(bits)
+    }
+
+    /// Metal-resident `rosa_qkv_ref` over packed `[B, T, D]` bitplanes.
     ///
-    /// `input` has `[batch, time, channels]` layout and `filter` has
-    /// `[channels, time]` layout. This is intentionally a dense-filter
-    /// reference boundary: the production implicit/strided mixer remains on
-    /// the CPU until its filter generator can write directly into GPU storage.
-    /// No FFT spectrum crosses the CPU/GPU boundary.
-    #[allow(unsafe_code)]
-    pub fn causal_long_conv_forward(
+    /// One thread owns `(batch, channel)`. SAM arrays live in global i32
+    /// buffers of shape `[B, D, 2T+1]`. `idx` is bit-exact with
+    /// [`crate::rosa::rosa_qkv_batch`]; `out = (2·idx − 1)·e` uses FP16 `e`.
+    pub fn rosa_qkv_1bit_fwd(
         &self,
-        input: &[f32],
-        filter: &[f32],
+        q_bits: &[u32],
+        k_bits: &[u32],
+        v_bits: &[u32],
+        e: &[f32],
+        batch: usize,
+        time: usize,
+        channels: usize,
+    ) -> Result<RosaQkvForward> {
+        let shape = MetalDispatchShape::new(batch, time, channels)?;
+        if e.len() != channels {
+            bail!("ROSA e must have one scale per channel");
+        }
+        let bit_count = shape.elements();
+        let words = bit_count.div_ceil(32);
+        if q_bits.len() != words || k_bits.len() != words || v_bits.len() != words {
+            bail!("ROSA QKV bitplane word count mismatch");
+        }
+        let nodes = crate::rosa::sam_node_count(time);
+        let sam_len = batch
+            .checked_mul(channels)
+            .and_then(|rows| rows.checked_mul(nodes))
+            .ok_or_else(|| anyhow::anyhow!("ROSA SAM workspace overflow"))?;
+        let sam_bytes = sam_len
+            .checked_mul(size_of::<i32>())
+            .ok_or_else(|| anyhow::anyhow!("ROSA SAM byte count overflow"))?;
+
+        let q_buffer = self.buffer_u32(q_bits)?;
+        let k_buffer = self.buffer_u32(k_bits)?;
+        let v_buffer = self.buffer_u32(v_bits)?;
+        let e_buffer = self.buffer_u16(&fp16_bits(e))?;
+        let trans0 = self.alloc_bytes(sam_bytes)?;
+        let trans1 = self.alloc_bytes(sam_bytes)?;
+        let fail = self.alloc_bytes(sam_bytes)?;
+        let maxlen = self.alloc_bytes(sam_bytes)?;
+        let last = self.alloc_bytes(sam_bytes)?;
+        let idx_buffer = self.alloc_bytes(bit_count)?;
+        let out_buffer = self.alloc_f32(bit_count)?;
+        let threads = batch
+            .checked_mul(channels)
+            .ok_or_else(|| anyhow::anyhow!("ROSA dispatch overflow"))?;
+
+        self.submit(|encoder| {
+            Self::encode_1d(
+                encoder,
+                &self.pipelines.rosa_sam_reset,
+                &[&trans0, &trans1, &fail, &maxlen, &last],
+                |encoder| set_bytes_u32(encoder, 5, &[as_u32(sam_len, "SAM nodes")?]),
+                sam_len,
+            )?;
+            Self::encode_1d(
+                encoder,
+                &self.pipelines.rosa_qkv_1bit_fwd,
+                &[
+                    &q_buffer,
+                    &k_buffer,
+                    &v_buffer,
+                    &e_buffer,
+                    &trans0,
+                    &trans1,
+                    &fail,
+                    &maxlen,
+                    &last,
+                    &idx_buffer,
+                    &out_buffer,
+                ],
+                |encoder| {
+                    Self::set_u32s(
+                        encoder,
+                        11,
+                        &[
+                            as_u32(batch, "batch")?,
+                            as_u32(time, "time")?,
+                            as_u32(channels, "channels")?,
+                        ],
+                    )
+                },
+                threads,
+            )
+        })?;
+
+        let mut idx = vec![0_u8; bit_count];
+        idx_buffer.read_bytes(&mut idx)?;
+        let mut out = vec![0.0_f32; bit_count];
+        out_buffer.read_f32(&mut out)?;
+        Ok(RosaQkvForward { idx, out })
+    }
+
+    /// Exact `g_e[c] = Σ gy · (2·idx − 1)` including unmatched positions.
+    pub fn rosa_qkv_1bit_bwd_e(
+        &self,
+        output_gradient: &[f32],
+        idx: &[u8],
         batch: usize,
         time: usize,
         channels: usize,
     ) -> Result<Vec<f32>> {
-        self.causal_long_conv_with_filter(
-            input,
-            HyenaFilterSource::Dense(filter),
-            batch,
-            time,
-            channels,
-            channels,
-            0,
+        let shape = MetalDispatchShape::new(batch, time, channels)?;
+        if output_gradient.len() != shape.elements() || idx.len() != shape.elements() {
+            bail!("ROSA g_e shape mismatch");
+        }
+        let gy_buffer = self.buffer_f32(output_gradient)?;
+        let idx_buffer = self.shared_buffer(idx.len())?;
+        idx_buffer.write_bytes(idx)?;
+        let ge_buffer = self.zeros_f32(channels)?;
+        self.submit(|encoder| {
+            Self::encode_1d(
+                encoder,
+                &self.pipelines.rosa_qkv_1bit_bwd_e,
+                &[&gy_buffer, &idx_buffer, &ge_buffer],
+                |encoder| {
+                    Self::set_u32s(
+                        encoder,
+                        3,
+                        &[
+                            as_u32(batch, "batch")?,
+                            as_u32(time, "time")?,
+                            as_u32(channels, "channels")?,
+                        ],
+                    )
+                },
+                channels,
+            )
+        })?;
+        let mut e_gradient = vec![0.0_f32; channels];
+        ge_buffer.read_f32(&mut e_gradient)?;
+        Ok(e_gradient)
+    }
+
+    fn encode_binary_linear<B: AsRef<MetalBuffer>>(
+        encoder: &ffi::ComputeEncoder,
+        pipeline: &Pipeline,
+        input: B,
+        bits: B,
+        scale: B,
+        bias: B,
+        output: B,
+        rows: usize,
+        in_features: usize,
+        out_features: usize,
+        has_bias: bool,
+    ) -> Result<()> {
+        Self::encode_tiled(
+            encoder,
+            pipeline,
+            &[input, bits, scale, bias, output],
+            |encoder| {
+                Self::set_u32s(
+                    encoder,
+                    5,
+                    &[
+                        as_u32(rows, "rows")?,
+                        as_u32(in_features, "in")?,
+                        as_u32(out_features, "out")?,
+                        u32::from(has_bias),
+                    ],
+                )
+            },
+            out_features,
+            rows,
         )
     }
 
-    /// Runs the complete implicit-filter Hyena mixer in one command buffer.
-    /// It writes the compact filter directly to the FFT buffer before the
-    /// filter transform, so no `[channels, time]` host filter exists.
-    #[allow(unsafe_code)]
-    pub fn causal_long_conv_implicit_forward(
+    /// Time-mix + QKV packed linears + SAM + output projection in one command buffer.
+    /// Activations never leave the GPU between those stages; only `idx`, `y`, and `out` are read.
+    pub fn rosa_block_forward(
         &self,
-        input: &[f32],
-        filter: &crate::hyena::ImplicitFilter,
+        x: &[f32],
+        mix_q: &[u16],
+        mix_k: &[u16],
+        mix_v: &[u16],
+        q_bits: &[u32],
+        q_scale: &[u16],
+        q_bias: &[u16],
+        k_bits: &[u32],
+        k_scale: &[u16],
+        k_bias: &[u16],
+        v_bits: &[u32],
+        v_scale: &[u16],
+        v_bias: &[u16],
+        e: &[u16],
+        o_bits: &[u32],
+        o_scale: &[u16],
+        o_bias: &[u16],
         batch: usize,
         time: usize,
         channels: usize,
-    ) -> Result<Vec<f32>> {
-        self.causal_long_conv_with_filter(
-            input,
-            HyenaFilterSource::Implicit(filter),
-            batch,
-            time,
-            channels,
-            channels,
-            0,
-        )
-    }
-
-    /// Strided variant for the signal half of a `[B,T,2D]` projection.
-    #[allow(unsafe_code)]
-    pub fn causal_long_conv_implicit_strided_forward(
-        &self,
-        input: &[f32],
-        filter: &crate::hyena::ImplicitFilter,
-        batch: usize,
-        time: usize,
-        channels: usize,
-        input_stride: usize,
-        input_offset: usize,
-    ) -> Result<Vec<f32>> {
-        self.causal_long_conv_with_filter(
-            input,
-            HyenaFilterSource::Implicit(filter),
-            batch,
-            time,
-            channels,
-            input_stride,
-            input_offset,
-        )
-    }
-
-    /// Runs exact bounded-receptive-field overlap-save convolution on Metal.
-    /// The filter is generated only for `plan.kernel_len` positions, normalized
-    /// against the full sequence length, and every FFT buffer is sized by the
-    /// chunk plan rather than `time`.
-    #[allow(unsafe_code)]
-    pub fn causal_chunked_conv_implicit_strided_forward(
-        &self,
-        input: &[f32],
-        filter: &crate::hyena::ImplicitFilter,
-        batch: usize,
-        time: usize,
-        channels: usize,
-        input_stride: usize,
-        input_offset: usize,
-        plan: HyenaChunkPlan,
-    ) -> Result<Vec<f32>> {
-        use objc2_metal::{MTLBuffer, MTLCommandBuffer, MTLCommandEncoder, MTLCommandQueue};
-
-        let plan = plan.for_sequence(time)?;
+    ) -> Result<RosaQkvBlockForward> {
         let shape = MetalDispatchShape::new(batch, time, channels)?;
         let rows = batch
             .checked_mul(time)
-            .ok_or_else(|| anyhow::anyhow!("Metal chunked Hyena row overflow"))?;
-        let minimum_input = rows
-            .checked_sub(1)
-            .and_then(|row| row.checked_mul(input_stride))
-            .and_then(|start| start.checked_add(input_offset))
-            .and_then(|start| start.checked_add(channels))
-            .ok_or_else(|| anyhow::anyhow!("Metal chunked Hyena input overflow"))?;
-        if input_stride < channels || input.len() < minimum_input {
-            bail!("Metal chunked Hyena convolution shape mismatch");
+            .ok_or_else(|| anyhow::anyhow!("ROSA block shape overflow"))?;
+        let linear = LinearDispatchShape::new(rows, channels, channels)?;
+        if x.len() != shape.elements()
+            || mix_q.len() != channels
+            || mix_k.len() != channels
+            || mix_v.len() != channels
+            || e.len() != channels
+            || q_scale.len() != channels
+            || k_scale.len() != channels
+            || v_scale.len() != channels
+            || o_scale.len() != channels
+            || q_bias.len() != channels
+            || k_bias.len() != channels
+            || v_bias.len() != channels
+            || o_bias.len() != channels
+        {
+            bail!("ROSA block mix/scale/bias length mismatch");
         }
-        let chunks = time.div_ceil(plan.chunk_len);
-        let transforms = batch
-            .checked_mul(chunks)
-            .and_then(|n| n.checked_mul(channels))
-            .ok_or_else(|| anyhow::anyhow!("Metal chunked Hyena transform overflow"))?;
-        let signal_elements = transforms
-            .checked_mul(plan.fft_len)
-            .ok_or_else(|| anyhow::anyhow!("Metal chunked Hyena FFT overflow"))?;
-        let filter_elements = channels
-            .checked_mul(plan.kernel_len)
-            .ok_or_else(|| anyhow::anyhow!("Metal chunked Hyena filter overflow"))?;
-        let filter_fft_elements = channels
-            .checked_mul(plan.fft_len)
-            .ok_or_else(|| anyhow::anyhow!("Metal chunked Hyena filter FFT overflow"))?;
-        let input_bytes = input
-            .len()
-            .checked_mul(size_of::<f32>())
-            .ok_or_else(|| anyhow::anyhow!("Metal chunked Hyena input size overflow"))?;
-        let signal_bytes = signal_elements
-            .checked_mul(size_of::<Complex32>())
-            .ok_or_else(|| anyhow::anyhow!("Metal chunked Hyena signal size overflow"))?;
-        let filter_bytes = filter_fft_elements
-            .checked_mul(size_of::<Complex32>())
-            .ok_or_else(|| anyhow::anyhow!("Metal chunked Hyena filter size overflow"))?;
-        let output_bytes = shape
-            .elements()
-            .checked_mul(size_of::<f32>())
-            .ok_or_else(|| anyhow::anyhow!("Metal chunked Hyena output size overflow"))?;
-        let (freq, phase, decay, order) = filter.parameter_slices(channels)?;
-        let parameter_bytes = freq
-            .len()
-            .checked_mul(size_of::<f32>())
-            .ok_or_else(|| anyhow::anyhow!("Metal chunked Hyena parameter overflow"))?;
-        self.gate_buffers
-            .borrow_mut()
-            .ensure(&self.device, input_bytes)?;
-        self.fft_buffers
-            .borrow_mut()
-            .ensure(&self.device, signal_bytes)?;
-        self.filter_fft_buffers
-            .borrow_mut()
-            .ensure(&self.device, filter_bytes)?;
-        self.hyena_output_buffer
-            .borrow_mut()
-            .ensure(&self.device, output_bytes)?;
-        self.implicit_filter_parameters
-            .borrow_mut()
-            .ensure(&self.device, parameter_bytes)?;
-        let as_u32 = |value: usize, name: &str| {
-            u32::try_from(value)
-                .map_err(|_| anyhow::anyhow!("Metal chunked Hyena {name} exceeds u32"))
-        };
-        let time_u32 = as_u32(time, "time")?;
-        let channels_u32 = as_u32(channels, "channels")?;
-        let stride_u32 = as_u32(input_stride, "stride")?;
-        let offset_u32 = as_u32(input_offset, "offset")?;
-        let chunk_u32 = as_u32(plan.chunk_len, "chunk length")?;
-        let kernel_u32 = as_u32(plan.kernel_len, "kernel length")?;
-        let fft_u32 = as_u32(plan.fft_len, "FFT length")?;
-        let chunks_u32 = as_u32(chunks, "chunk count")?;
-        let transforms_u32 = as_u32(transforms, "transform count")?;
-        let signal_u32 = as_u32(signal_elements, "FFT elements")?;
-        let filter_u32 = as_u32(filter_elements, "filter elements")?;
-        let output_u32 = as_u32(shape.elements(), "output elements")?;
-        let order_u32 = as_u32(order, "filter order")?;
+        self.check_binary_shape_u16(x, q_bits, q_scale, Some(q_bias), linear)?;
+        self.check_binary_shape_u16(x, k_bits, k_scale, Some(k_bias), linear)?;
+        self.check_binary_shape_u16(x, v_bits, v_scale, Some(v_bias), linear)?;
+        self.check_binary_shape_u16(x, o_bits, o_scale, Some(o_bias), linear)?;
+        let bit_count = shape.elements();
+        let words = bit_count.div_ceil(32);
 
-        let gates = self.gate_buffers.borrow();
-        let signal = self.fft_buffers.borrow();
-        let filter_fft = self.filter_fft_buffers.borrow();
-        let output = self.hyena_output_buffer.borrow();
-        let parameters = self.implicit_filter_parameters.borrow();
-        let source = gates.input.as_ref().expect("checked Metal chunked input");
-        let signal_first = signal.first.as_ref().expect("checked Metal chunked signal");
-        let signal_second = signal
-            .second
-            .as_ref()
-            .expect("checked Metal chunked signal scratch");
-        let filter_first = filter_fft
-            .first
-            .as_ref()
-            .expect("checked Metal chunked filter");
-        let filter_second = filter_fft
-            .second
-            .as_ref()
-            .expect("checked Metal chunked filter scratch");
-        let destination = output
-            .buffer
-            .as_ref()
-            .expect("checked Metal chunked output");
-        let freq_buffer = parameters
-            .freq
-            .as_ref()
-            .expect("checked Metal chunked freq");
-        let phase_buffer = parameters
-            .phase
-            .as_ref()
-            .expect("checked Metal chunked phase");
-        let decay_buffer = parameters
-            .decay
-            .as_ref()
-            .expect("checked Metal chunked decay");
-        unsafe {
-            source
-                .contents()
-                .cast::<f32>()
-                .as_ptr()
-                .copy_from_nonoverlapping(input.as_ptr(), input.len());
-            filter_first
-                .contents()
-                .cast::<Complex32>()
-                .as_ptr()
-                .write_bytes(0, filter_fft_elements);
-            freq_buffer
-                .contents()
-                .cast::<f32>()
-                .as_ptr()
-                .copy_from_nonoverlapping(freq.as_ptr(), freq.len());
-            phase_buffer
-                .contents()
-                .cast::<f32>()
-                .as_ptr()
-                .copy_from_nonoverlapping(phase.as_ptr(), phase.len());
-            decay_buffer
-                .contents()
-                .cast::<f32>()
-                .as_ptr()
-                .copy_from_nonoverlapping(decay.as_ptr(), decay.len());
-        }
-        let command = self
-            .queue
-            .commandBuffer()
-            .ok_or_else(|| anyhow::anyhow!("Metal command buffer allocation failed"))?;
-        let encoder = command
-            .computeCommandEncoder()
-            .ok_or_else(|| anyhow::anyhow!("Metal compute encoder allocation failed"))?;
-        self.encode_pack_overlap_save(
-            encoder.as_ref(),
-            source,
-            signal_first,
-            [
-                time_u32,
-                channels_u32,
-                stride_u32,
-                offset_u32,
-                chunk_u32,
-                kernel_u32,
-                fft_u32,
-                chunks_u32,
-                signal_u32,
-            ],
-            signal_elements,
-        )?;
-        self.encode_implicit_filter(
-            encoder.as_ref(),
-            freq_buffer,
-            phase_buffer,
-            decay_buffer,
-            filter_first,
-            kernel_u32,
-            time_u32,
-            order_u32,
-            fft_u32,
-            filter_u32,
-        )?;
-        let dispatch = |pipeline, input, output, total, scalars: &[u32]| {
-            self.encode_fft_two_buffer(encoder.as_ref(), pipeline, input, output, total, scalars)
-        };
-        let run_fft = |first, second, transform_count, total, inverse| -> Result<bool> {
-            dispatch(
-                &self.fft_bitreverse_pipeline,
-                first,
-                second,
-                total,
-                &[fft_u32, transform_count],
+        let x_b = self.buffer_f32(x)?;
+        let mix_q_b = self.buffer_u16(mix_q)?;
+        let mix_k_b = self.buffer_u16(mix_k)?;
+        let mix_v_b = self.buffer_u16(mix_v)?;
+        let q_in = self.alloc_f32(bit_count)?;
+        let k_in = self.alloc_f32(bit_count)?;
+        let v_in = self.alloc_f32(bit_count)?;
+        let q_bits_b = self.buffer_u32(q_bits)?;
+        let k_bits_b = self.buffer_u32(k_bits)?;
+        let v_bits_b = self.buffer_u32(v_bits)?;
+        let o_bits_b = self.buffer_u32(o_bits)?;
+        let q_scale_b = self.buffer_u16(q_scale)?;
+        let k_scale_b = self.buffer_u16(k_scale)?;
+        let v_scale_b = self.buffer_u16(v_scale)?;
+        let o_scale_b = self.buffer_u16(o_scale)?;
+        let q_bias_b = self.buffer_u16(q_bias)?;
+        let k_bias_b = self.buffer_u16(k_bias)?;
+        let v_bias_b = self.buffer_u16(v_bias)?;
+        let o_bias_b = self.buffer_u16(o_bias)?;
+        let q_act = self.alloc_f32(bit_count)?;
+        let k_act = self.alloc_f32(bit_count)?;
+        let v_act = self.alloc_f32(bit_count)?;
+        let q_packed = self.alloc_bytes(words.saturating_mul(size_of::<u32>()).max(4))?;
+        let k_packed = self.alloc_bytes(words.saturating_mul(size_of::<u32>()).max(4))?;
+        let v_packed = self.alloc_bytes(words.saturating_mul(size_of::<u32>()).max(4))?;
+
+        self.submit(|encoder| {
+            Self::encode_1d(
+                encoder,
+                &self.pipelines.time_shift_mix3,
+                &[&x_b, &mix_q_b, &mix_k_b, &mix_v_b, &q_in, &k_in, &v_in],
+                |encoder| {
+                    Self::set_u32s(
+                        encoder,
+                        7,
+                        &[
+                            as_u32(rows, "rows")?,
+                            as_u32(time, "time")?,
+                            as_u32(channels, "channels")?,
+                        ],
+                    )
+                },
+                bit_count,
             )?;
-            let mut source_is_first = false;
-            for stage in 1..=plan.stages {
-                let (source, destination) = if source_is_first {
-                    (first, second)
-                } else {
-                    (second, first)
-                };
-                dispatch(
-                    &self.fft_stage_pipeline,
-                    source,
-                    destination,
-                    total,
-                    &[fft_u32, transform_count, stage, u32::from(inverse)],
-                )?;
-                source_is_first = !source_is_first;
-            }
-            Ok(source_is_first)
-        };
-        let signal_is_first = run_fft(
-            signal_first,
-            signal_second,
-            transforms_u32,
-            signal_elements,
-            false,
-        )?;
-        let filter_is_first = run_fft(
-            filter_first,
-            filter_second,
-            channels_u32,
-            filter_fft_elements,
-            false,
-        )?;
-        let signal_spectrum = if signal_is_first {
-            signal_first
-        } else {
-            signal_second
-        };
-        let filter_spectrum = if filter_is_first {
-            filter_first
-        } else {
-            filter_second
-        };
-        let product_is_first = !signal_is_first;
-        let product = if product_is_first {
-            signal_first
-        } else {
-            signal_second
-        };
-        self.encode_fft_multiply(
-            encoder.as_ref(),
-            signal_spectrum,
-            filter_spectrum,
-            product,
-            fft_u32,
-            channels_u32,
-            transforms_u32,
-            signal_elements,
-        )?;
-        let inverse_bitrev_is_first = !product_is_first;
-        let inverse_bitrev = if inverse_bitrev_is_first {
-            signal_first
-        } else {
-            signal_second
-        };
-        dispatch(
-            &self.fft_bitreverse_pipeline,
-            product,
-            inverse_bitrev,
-            signal_elements,
-            &[fft_u32, transforms_u32],
-        )?;
-        let mut inverse_is_first = inverse_bitrev_is_first;
-        for stage in 1..=plan.stages {
-            let (source, destination) = if inverse_is_first {
-                (signal_first, signal_second)
-            } else {
-                (signal_second, signal_first)
-            };
-            dispatch(
-                &self.fft_stage_pipeline,
-                source,
-                destination,
-                signal_elements,
-                &[fft_u32, transforms_u32, stage, 1],
+            Self::encode_binary_linear(
+                encoder,
+                &self.pipelines.binary_linear,
+                &q_in,
+                &q_bits_b,
+                &q_scale_b,
+                &q_bias_b,
+                &q_act,
+                rows,
+                channels,
+                channels,
+                true,
             )?;
-            inverse_is_first = !inverse_is_first;
-        }
-        let inverse = if inverse_is_first {
-            signal_first
-        } else {
-            signal_second
-        };
-        self.encode_extract_overlap_save(
-            encoder.as_ref(),
-            inverse,
-            destination,
-            [
-                time_u32,
-                channels_u32,
-                chunk_u32,
-                kernel_u32,
-                fft_u32,
-                chunks_u32,
-                output_u32,
-            ],
-            shape.elements(),
+            Self::encode_binary_linear(
+                encoder,
+                &self.pipelines.binary_linear,
+                &k_in,
+                &k_bits_b,
+                &k_scale_b,
+                &k_bias_b,
+                &k_act,
+                rows,
+                channels,
+                channels,
+                true,
+            )?;
+            Self::encode_binary_linear(
+                encoder,
+                &self.pipelines.binary_linear,
+                &v_in,
+                &v_bits_b,
+                &v_scale_b,
+                &v_bias_b,
+                &v_act,
+                rows,
+                channels,
+                channels,
+                true,
+            )?;
+            Self::encode_1d(
+                encoder,
+                &self.pipelines.sign_pack_bits,
+                &[&q_act, &q_packed],
+                |encoder| set_bytes_u32(encoder, 2, &[as_u32(bit_count, "elements")?]),
+                words,
+            )?;
+            Self::encode_1d(
+                encoder,
+                &self.pipelines.sign_pack_bits,
+                &[&k_act, &k_packed],
+                |encoder| set_bytes_u32(encoder, 2, &[as_u32(bit_count, "elements")?]),
+                words,
+            )?;
+            Self::encode_1d(
+                encoder,
+                &self.pipelines.sign_pack_bits,
+                &[&v_act, &v_packed],
+                |encoder| set_bytes_u32(encoder, 2, &[as_u32(bit_count, "elements")?]),
+                words,
+            )
+        })?;
+
+        let mut q_plane = vec![0_u32; words];
+        let mut k_plane = vec![0_u32; words];
+        let mut v_plane = vec![0_u32; words];
+        q_packed.read_u32(&mut q_plane)?;
+        k_packed.read_u32(&mut k_plane)?;
+        v_packed.read_u32(&mut v_plane)?;
+        drop((
+            x_b, mix_q_b, mix_k_b, mix_v_b, q_in, k_in, v_in, q_bits_b, k_bits_b, v_bits_b, q_scale_b,
+            k_scale_b, v_scale_b, q_bias_b, k_bias_b, v_bias_b, q_act, k_act, v_act, q_packed, k_packed,
+            v_packed,
+        ));
+        let idx = crate::rosa::rosa_qkv_batch_packed(
+            &q_plane, &k_plane, &v_plane, batch, time, channels,
         )?;
-        encoder.endEncoding();
-        command.commit();
-        command.waitUntilCompleted();
-        if let Some(error) = command.error() {
-            bail!("Metal chunked Hyena convolution failed: {error}");
-        }
-        let mut result = vec![0.0; shape.elements()];
-        unsafe {
-            result.as_mut_ptr().copy_from_nonoverlapping(
-                destination.contents().cast::<f32>().as_ptr(),
-                result.len(),
-            );
-        }
-        Ok(result)
+        let e_f32: Vec<f32> = e
+            .iter()
+            .copied()
+            .map(|bits| Fp16::from_bits(bits).to_f32())
+            .collect();
+        let y = crate::rosa::rosa_qkv_out_batched(&idx, &e_f32, batch, time, channels)?;
+        let y_buffer = self.buffer_f32(&y)?;
+        let out_buffer = self.alloc_f32(bit_count)?;
+        self.submit(|encoder| {
+            Self::encode_binary_linear(
+                encoder,
+                &self.pipelines.binary_linear,
+                &y_buffer,
+                &o_bits_b,
+                &o_scale_b,
+                &o_bias_b,
+                &out_buffer,
+                rows,
+                channels,
+                channels,
+                true,
+            )
+        })?;
+        let mut out = vec![0.0_f32; bit_count];
+        out_buffer.read_f32(&mut out)?;
+        Ok(RosaQkvBlockForward { idx, y, out })
     }
 
-    #[allow(unsafe_code)]
-    fn causal_long_conv_with_filter(
+    pub fn cmix_relu2(&self, input: &[f32]) -> Result<Vec<f32>> {
+        self.elementwise_unary(&self.pipelines.cmix_relu2, input)
+    }
+
+    pub fn cmix_relu2_backward(&self, input: &[f32], output_gradient: &[f32]) -> Result<Vec<f32>> {
+        if input.len() != output_gradient.len() {
+            bail!("relu2 backward length mismatch");
+        }
+        if input.is_empty() {
+            return Ok(Vec::new());
+        }
+        let input_buffer = self.buffer_f32(input)?;
+        let gy_buffer = self.buffer_f32(output_gradient)?;
+        let gx_buffer = self.zeros_f32(input.len())?;
+        self.submit(|encoder| {
+            Self::encode_1d(
+                encoder,
+                &self.pipelines.cmix_relu2_backward,
+                &[&input_buffer, &gy_buffer, &gx_buffer],
+                |encoder| set_bytes_u32(encoder, 3, &[as_u32(input.len(), "elements")?]),
+                input.len(),
+            )
+        })?;
+        let mut gx = vec![0.0; input.len()];
+        gx_buffer.read_f32(&mut gx)?;
+        Ok(gx)
+    }
+
+    fn elementwise_unary(&self, pipeline: &Pipeline, input: &[f32]) -> Result<Vec<f32>> {
+        if input.is_empty() {
+            return Ok(Vec::new());
+        }
+        let input_buffer = self.buffer_f32(input)?;
+        let output_buffer = self.zeros_f32(input.len())?;
+        self.submit(|encoder| {
+            Self::encode_1d(
+                encoder,
+                pipeline,
+                &[&input_buffer, &output_buffer],
+                |encoder| set_bytes_u32(encoder, 2, &[as_u32(input.len(), "elements")?]),
+                input.len(),
+            )
+        })?;
+        let mut output = vec![0.0; input.len()];
+        output_buffer.read_f32(&mut output)?;
+        Ok(output)
+    }
+
+    pub fn layer_norm(
         &self,
         input: &[f32],
-        filter_source: HyenaFilterSource<'_>,
+        weight: &[f32],
+        bias: &[f32],
+        rows: usize,
+        channels: usize,
+    ) -> Result<Vec<f32>> {
+        if rows.checked_mul(channels) != Some(input.len())
+            || weight.len() != channels
+            || bias.len() != channels
+        {
+            bail!("LayerNorm input shape mismatch");
+        }
+        let input_buffer = self.buffer_f32(input)?;
+        let weight_buffer = self.buffer_u16(&fp16_bits(weight))?;
+        let bias_buffer = self.buffer_u16(&fp16_bits(bias))?;
+        let output_buffer = self.zeros_f32(input.len())?;
+        self.submit(|encoder| {
+            Self::encode_1d(
+                encoder,
+                &self.pipelines.layer_norm,
+                &[&input_buffer, &weight_buffer, &bias_buffer, &output_buffer],
+                |encoder| {
+                    Self::set_u32s(
+                        encoder,
+                        4,
+                        &[as_u32(rows, "rows")?, as_u32(channels, "channels")?],
+                    )
+                },
+                rows,
+            )
+        })?;
+        let mut output = vec![0.0; input.len()];
+        output_buffer.read_f32(&mut output)?;
+        Ok(output)
+    }
+
+    pub fn layer_norm_backward(
+        &self,
+        input: &[f32],
+        output_gradient: &[f32],
+        weight: &[f32],
+        rows: usize,
+        channels: usize,
+    ) -> Result<LayerNormBackward> {
+        if rows.checked_mul(channels) != Some(input.len())
+            || output_gradient.len() != input.len()
+            || weight.len() != channels
+        {
+            bail!("LayerNorm backward shape mismatch");
+        }
+        let input_buffer = self.buffer_f32(input)?;
+        let gy_buffer = self.buffer_f32(output_gradient)?;
+        let weight_buffer = self.buffer_u16(&fp16_bits(weight))?;
+        let gx_buffer = self.alloc_f32(input.len())?;
+        let mean_buffer = self.alloc_f32(rows)?;
+        let inv_buffer = self.alloc_f32(rows)?;
+        let gw_buffer = self.alloc_f32(channels)?;
+        let gb_buffer = self.alloc_f32(channels)?;
+        self.submit(|encoder| {
+            Self::encode_1d(
+                encoder,
+                &self.pipelines.layer_norm_backward,
+                &[
+                    &input_buffer,
+                    &gy_buffer,
+                    &weight_buffer,
+                    &gx_buffer,
+                    &mean_buffer,
+                    &inv_buffer,
+                ],
+                |encoder| {
+                    Self::set_u32s(
+                        encoder,
+                        6,
+                        &[as_u32(rows, "rows")?, as_u32(channels, "channels")?],
+                    )
+                },
+                rows,
+            )?;
+            Self::encode_scale_groups(
+                encoder,
+                &self.pipelines.layer_norm_param_bwd,
+                &[
+                    &input_buffer,
+                    &gy_buffer,
+                    &mean_buffer,
+                    &inv_buffer,
+                    &gw_buffer,
+                    &gb_buffer,
+                ],
+                |encoder| {
+                    Self::set_u32s(
+                        encoder,
+                        6,
+                        &[as_u32(rows, "rows")?, as_u32(channels, "channels")?],
+                    )
+                },
+                channels,
+            )
+        })?;
+        let mut input_gradient = vec![0.0; input.len()];
+        let mut weight_gradient = vec![0.0; channels];
+        let mut bias_gradient = vec![0.0; channels];
+        gx_buffer.read_f32(&mut input_gradient)?;
+        gw_buffer.read_f32(&mut weight_gradient)?;
+        gb_buffer.read_f32(&mut bias_gradient)?;
+        Ok(LayerNormBackward {
+            input_gradient,
+            weight_gradient,
+            bias_gradient,
+        })
+    }
+
+    pub fn binary_linear(
+        &self,
+        input: &[f32],
+        bits: &[u32],
+        scale: &[f32],
+        bias: Option<&[f32]>,
+        shape: LinearDispatchShape,
+    ) -> Result<Vec<f32>> {
+        self.check_binary_shape(input, bits, scale, bias, shape)?;
+        let out_len = shape.rows.saturating_mul(shape.out_features);
+        let input_buffer = self.buffer_f32(input)?;
+        let bits_buffer = self.buffer_u32(bits)?;
+        let scale_buffer = self.buffer_u16(&fp16_bits(scale))?;
+        let bias_buffer = self.buffer_u16(&fp16_bits(bias.unwrap_or(&[])))?;
+        let output_buffer = self.zeros_f32(out_len)?;
+        let has_bias = u32::from(bias.is_some());
+        self.submit(|encoder| {
+            Self::encode_tiled(
+                encoder,
+                &self.pipelines.binary_linear,
+                &[
+                    &input_buffer,
+                    &bits_buffer,
+                    &scale_buffer,
+                    &bias_buffer,
+                    &output_buffer,
+                ],
+                |encoder| {
+                    Self::set_u32s(
+                        encoder,
+                        5,
+                        &[
+                            as_u32(shape.rows, "rows")?,
+                            as_u32(shape.in_features, "in")?,
+                            as_u32(shape.out_features, "out")?,
+                            has_bias,
+                        ],
+                    )
+                },
+                shape.out_features,
+                shape.rows,
+            )
+        })?;
+        let mut output = vec![0.0; out_len];
+        output_buffer.read_f32(&mut output)?;
+        Ok(output)
+    }
+
+    pub fn binary_linear_pack3(
+        &self,
+        inputs: [&[f32]; 3],
+        bits: [&[u32]; 3],
+        scales: [&[f32]; 3],
+        biases: [Option<&[f32]>; 3],
+        shape: LinearDispatchShape,
+    ) -> Result<[Vec<f32>; 3]> {
+        let out_len = shape.rows.saturating_mul(shape.out_features);
+        let mut in_bufs = Vec::with_capacity(3);
+        let mut bit_bufs = Vec::with_capacity(3);
+        let mut scale_bufs = Vec::with_capacity(3);
+        let mut bias_bufs = Vec::with_capacity(3);
+        let mut out_bufs = Vec::with_capacity(3);
+        for i in 0..3 {
+            self.check_binary_shape(inputs[i], bits[i], scales[i], biases[i], shape)?;
+            in_bufs.push(self.buffer_f32(inputs[i])?);
+            bit_bufs.push(self.buffer_u32(bits[i])?);
+            scale_bufs.push(self.buffer_u16(&fp16_bits(scales[i]))?);
+            bias_bufs.push(self.buffer_u16(&fp16_bits(biases[i].unwrap_or(&[])))?);
+            out_bufs.push(self.alloc_f32(out_len)?);
+        }
+        self.submit(|encoder| {
+            for i in 0..3 {
+                Self::encode_tiled(
+                    encoder,
+                    &self.pipelines.binary_linear,
+                    &[
+                        &in_bufs[i],
+                        &bit_bufs[i],
+                        &scale_bufs[i],
+                        &bias_bufs[i],
+                        &out_bufs[i],
+                    ],
+                    |encoder| {
+                        Self::set_u32s(
+                            encoder,
+                            5,
+                            &[
+                                as_u32(shape.rows, "rows")?,
+                                as_u32(shape.in_features, "in")?,
+                                as_u32(shape.out_features, "out")?,
+                                u32::from(biases[i].is_some()),
+                            ],
+                        )
+                    },
+                    shape.out_features,
+                    shape.rows,
+                )?;
+            }
+            Ok(())
+        })?;
+        let mut outs = [Vec::new(), Vec::new(), Vec::new()];
+        for i in 0..3 {
+            outs[i] = vec![0.0; out_len];
+            out_bufs[i].read_f32(&mut outs[i])?;
+        }
+        Ok(outs)
+    }
+
+    pub fn cmix_ffn_forward(
+        &self,
+        shifted: &[f32],
+        key_bits: &[u32],
+        key_scale: &[f32],
+        value_weight: &[f32],
+        rows: usize,
+        d_model: usize,
+        dim_ffn: usize,
+    ) -> Result<(Vec<f32>, Vec<f32>, Vec<f32>)> {
+        let key_shape = LinearDispatchShape::new(rows, d_model, dim_ffn)?;
+        let value_shape = LinearDispatchShape::new(rows, dim_ffn, d_model)?;
+        self.check_binary_shape(shifted, key_bits, key_scale, None, key_shape)?;
+        let key_len = rows.saturating_mul(dim_ffn);
+        let out_len = rows.saturating_mul(d_model);
+        let shifted_b = self.buffer_f32(shifted)?;
+        let bits_b = self.buffer_u32(key_bits)?;
+        let scale_b = self.buffer_u16(&fp16_bits(key_scale))?;
+        let bias_b = self.buffer_u16(&fp16_bits(&[]))?;
+        let value_w_b = self.buffer_u16(&fp16_bits(value_weight))?;
+        let key_b = self.alloc_f32(key_len)?;
+        let relu_b = self.alloc_f32(key_len)?;
+        let out_b = self.alloc_f32(out_len)?;
+        self.submit(|encoder| {
+            Self::encode_tiled(
+                encoder,
+                &self.pipelines.binary_linear,
+                &[&shifted_b, &bits_b, &scale_b, &bias_b, &key_b],
+                |encoder| {
+                    Self::set_u32s(
+                        encoder,
+                        5,
+                        &[
+                            as_u32(rows, "rows")?,
+                            as_u32(d_model, "in")?,
+                            as_u32(dim_ffn, "out")?,
+                            0,
+                        ],
+                    )
+                },
+                dim_ffn,
+                rows,
+            )?;
+            Self::encode_1d(
+                encoder,
+                &self.pipelines.cmix_relu2,
+                &[&key_b, &relu_b],
+                |encoder| set_bytes_u32(encoder, 2, &[as_u32(key_len, "elements")?]),
+                key_len,
+            )?;
+            Self::encode_tiled(
+                encoder,
+                &self.pipelines.fp16_linear,
+                &[&relu_b, &value_w_b, &out_b],
+                |encoder| {
+                    Self::set_u32s(
+                        encoder,
+                        3,
+                        &[
+                            as_u32(value_shape.rows, "rows")?,
+                            as_u32(value_shape.in_features, "in")?,
+                            as_u32(value_shape.out_features, "out")?,
+                        ],
+                    )
+                },
+                value_shape.out_features,
+                value_shape.rows,
+            )
+        })?;
+        let mut key = vec![0.0; key_len];
+        let mut relu2 = vec![0.0; key_len];
+        let mut out = vec![0.0; out_len];
+        key_b.read_f32(&mut key)?;
+        relu_b.read_f32(&mut relu2)?;
+        out_b.read_f32(&mut out)?;
+        Ok((key, relu2, out))
+    }
+
+    pub fn cmix_block_forward(
+        &self,
+        x: &[f32],
+        mix: &[u16],
+        key_bits: &[u32],
+        key_scale: &[u16],
+        value_weight: &[u16],
         batch: usize,
         time: usize,
+        d_model: usize,
+        dim_ffn: usize,
+    ) -> Result<CmixBlockForward> {
+        let rows = batch
+            .checked_mul(time)
+            .ok_or_else(|| anyhow::anyhow!("CMix shape overflow"))?;
+        let key_shape = LinearDispatchShape::new(rows, d_model, dim_ffn)?;
+        let value_shape = LinearDispatchShape::new(rows, dim_ffn, d_model)?;
+        if x.len() != rows.saturating_mul(d_model)
+            || mix.len() != d_model
+            || key_scale.len() != dim_ffn
+            || value_weight.len() != d_model.saturating_mul(dim_ffn)
+        {
+            bail!("CMix block shape mismatch");
+        }
+        self.check_binary_shape_u16(x, key_bits, key_scale, None, key_shape)?;
+        let key_len = rows.saturating_mul(dim_ffn);
+        let out_len = rows.saturating_mul(d_model);
+        let x_b = self.buffer_f32(x)?;
+        let mix_b = self.buffer_u16(mix)?;
+        let xx_b = self.alloc_f32(x.len())?;
+        let shifted_b = self.alloc_f32(x.len())?;
+        let bits_b = self.buffer_u32(key_bits)?;
+        let scale_b = self.buffer_u16(key_scale)?;
+        let bias_b = self.buffer_u16(&[])?;
+        let value_w_b = self.buffer_u16(value_weight)?;
+        let key_b = self.alloc_f32(key_len)?;
+        let relu_b = self.alloc_f32(key_len)?;
+        let out_b = self.alloc_f32(out_len)?;
+        self.submit(|encoder| {
+            Self::encode_1d(
+                encoder,
+                &self.pipelines.time_shift_mix,
+                &[&x_b, &mix_b, &xx_b, &shifted_b],
+                |encoder| {
+                    Self::set_u32s(
+                        encoder,
+                        4,
+                        &[
+                            as_u32(rows, "rows")?,
+                            as_u32(time, "time")?,
+                            as_u32(d_model, "channels")?,
+                        ],
+                    )
+                },
+                x.len(),
+            )?;
+            Self::encode_tiled(
+                encoder,
+                &self.pipelines.binary_linear,
+                &[&shifted_b, &bits_b, &scale_b, &bias_b, &key_b],
+                |encoder| {
+                    Self::set_u32s(
+                        encoder,
+                        5,
+                        &[
+                            as_u32(rows, "rows")?,
+                            as_u32(d_model, "in")?,
+                            as_u32(dim_ffn, "out")?,
+                            0,
+                        ],
+                    )
+                },
+                dim_ffn,
+                rows,
+            )?;
+            Self::encode_1d(
+                encoder,
+                &self.pipelines.cmix_relu2,
+                &[&key_b, &relu_b],
+                |encoder| set_bytes_u32(encoder, 2, &[as_u32(key_len, "elements")?]),
+                key_len,
+            )?;
+            Self::encode_tiled(
+                encoder,
+                &self.pipelines.fp16_linear,
+                &[&relu_b, &value_w_b, &out_b],
+                |encoder| {
+                    Self::set_u32s(
+                        encoder,
+                        3,
+                        &[
+                            as_u32(value_shape.rows, "rows")?,
+                            as_u32(value_shape.in_features, "in")?,
+                            as_u32(value_shape.out_features, "out")?,
+                        ],
+                    )
+                },
+                value_shape.out_features,
+                value_shape.rows,
+            )
+        })?;
+        let mut xx = vec![0.0; x.len()];
+        let mut shifted = vec![0.0; x.len()];
+        let mut key = vec![0.0; key_len];
+        let mut relu2 = vec![0.0; key_len];
+        let mut out = vec![0.0; out_len];
+        xx_b.read_f32(&mut xx)?;
+        shifted_b.read_f32(&mut shifted)?;
+        key_b.read_f32(&mut key)?;
+        relu_b.read_f32(&mut relu2)?;
+        out_b.read_f32(&mut out)?;
+        Ok(CmixBlockForward {
+            xx,
+            shifted,
+            key,
+            relu2,
+            out,
+        })
+    }
+
+    pub fn cmix_ffn_backward(
+        &self,
+        shifted: &[f32],
+        key: &[f32],
+        relu2: &[f32],
+        gy: &[f32],
+        key_bits: &[u32],
+        key_scale: &[f32],
+        value_weight: &[f32],
+        rows: usize,
+        d_model: usize,
+        dim_ffn: usize,
+    ) -> Result<(Vec<f32>, Vec<f32>, Vec<f32>, Vec<f32>)> {
+        let key_shape = LinearDispatchShape::new(rows, d_model, dim_ffn)?;
+        let value_shape = LinearDispatchShape::new(rows, dim_ffn, d_model)?;
+        self.check_binary_shape(shifted, key_bits, key_scale, None, key_shape)?;
+        let key_len = rows.saturating_mul(dim_ffn);
+        let value_weights = d_model.saturating_mul(dim_ffn);
+        let key_weights = dim_ffn.saturating_mul(d_model);
+        if relu2.len() != key_len
+            || key.len() != key_len
+            || gy.len() != rows.saturating_mul(d_model)
+        {
+            bail!("CMix backward shape mismatch");
+        }
+        let shifted_b = self.buffer_f32(shifted)?;
+        let key_b = self.buffer_f32(key)?;
+        let relu_b = self.buffer_f32(relu2)?;
+        let gy_b = self.buffer_f32(gy)?;
+        let bits_b = self.buffer_u32(key_bits)?;
+        let scale_b = self.buffer_u16(&fp16_bits(key_scale))?;
+        let value_w_b = self.buffer_u16(&fp16_bits(value_weight))?;
+        let g_relu_b = self.alloc_f32(key_len)?;
+        let g_value_b = self.alloc_f32(value_weights)?;
+        let g_key_b = self.alloc_f32(key_len)?;
+        let g_shifted_b = self.alloc_f32(shifted.len())?;
+        let g_scale_b = self.alloc_f32(dim_ffn)?;
+        let g_bias_b = self.alloc_f32(dim_ffn)?;
+        let g_key_w_b = self.alloc_f32(key_weights)?;
+        let empty_bias_b = self.buffer_u16(&fp16_bits(&[]))?;
+        self.submit(|encoder| {
+            Self::encode_tiled(
+                encoder,
+                &self.pipelines.fp16_linear_bwd,
+                &[&relu_b, &gy_b, &value_w_b, &g_relu_b, &g_value_b],
+                |encoder| {
+                    Self::set_u32s(
+                        encoder,
+                        5,
+                        &[
+                            as_u32(value_shape.rows, "rows")?,
+                            as_u32(value_shape.in_features, "in")?,
+                            as_u32(value_shape.out_features, "out")?,
+                            0,
+                        ],
+                    )
+                },
+                value_shape.in_features,
+                value_shape.rows,
+            )?;
+            Self::encode_tiled(
+                encoder,
+                &self.pipelines.fp16_linear_bwd,
+                &[&relu_b, &gy_b, &value_w_b, &g_relu_b, &g_value_b],
+                |encoder| {
+                    Self::set_u32s(
+                        encoder,
+                        5,
+                        &[
+                            as_u32(value_shape.rows, "rows")?,
+                            as_u32(value_shape.in_features, "in")?,
+                            as_u32(value_shape.out_features, "out")?,
+                            1,
+                        ],
+                    )
+                },
+                value_shape.in_features,
+                value_shape.out_features,
+            )?;
+            Self::encode_1d(
+                encoder,
+                &self.pipelines.cmix_relu2_backward,
+                &[&key_b, &g_relu_b, &g_key_b],
+                |encoder| set_bytes_u32(encoder, 3, &[as_u32(key_len, "elements")?]),
+                key_len,
+            )?;
+            Self::encode_tiled(
+                encoder,
+                &self.pipelines.binary_linear_input_bwd,
+                &[&g_key_b, &bits_b, &scale_b, &g_shifted_b],
+                |encoder| {
+                    Self::set_u32s(
+                        encoder,
+                        4,
+                        &[
+                            as_u32(key_shape.rows, "rows")?,
+                            as_u32(key_shape.in_features, "in")?,
+                            as_u32(key_shape.out_features, "out")?,
+                        ],
+                    )
+                },
+                key_shape.in_features,
+                key_shape.rows,
+            )?;
+            Self::encode_scale_groups(
+                encoder,
+                &self.pipelines.binary_linear_scale_bwd_from_output,
+                &[
+                    &key_b,
+                    &g_key_b,
+                    &scale_b,
+                    &empty_bias_b,
+                    &g_scale_b,
+                    &g_bias_b,
+                ],
+                |encoder| {
+                    Self::set_u32s(
+                        encoder,
+                        6,
+                        &[
+                            as_u32(key_shape.rows, "rows")?,
+                            as_u32(key_shape.out_features, "out")?,
+                            0,
+                        ],
+                    )
+                },
+                dim_ffn,
+            )?;
+            Self::encode_tiled(
+                encoder,
+                &self.pipelines.binary_linear_weight_bwd,
+                &[&shifted_b, &g_key_b, &scale_b, &g_key_w_b],
+                |encoder| {
+                    Self::set_u32s(
+                        encoder,
+                        4,
+                        &[
+                            as_u32(key_shape.rows, "rows")?,
+                            as_u32(key_shape.in_features, "in")?,
+                            as_u32(key_shape.out_features, "out")?,
+                        ],
+                    )
+                },
+                key_shape.in_features,
+                key_shape.out_features,
+            )
+        })?;
+        let mut g_shifted = vec![0.0; shifted.len()];
+        let mut g_key_w = vec![0.0; key_weights];
+        let mut g_key_scale = vec![0.0; dim_ffn];
+        let mut g_value_w = vec![0.0; value_weights];
+        g_shifted_b.read_f32(&mut g_shifted)?;
+        g_key_w_b.read_f32(&mut g_key_w)?;
+        g_scale_b.read_f32(&mut g_key_scale)?;
+        g_value_b.read_f32(&mut g_value_w)?;
+        Ok((g_shifted, g_key_w, g_key_scale, g_value_w))
+    }
+
+    pub fn cmix_block_backward_sgd(
+        &self,
+        shifted: &[f32],
+        key: &[f32],
+        relu2: &[f32],
+        gy: &[f32],
+        key_bits: &[u32],
+        key_scale: &[u16],
+        key_latent: &[u16],
+        value_weight: &[u16],
+        rows: usize,
+        d_model: usize,
+        dim_ffn: usize,
+        learning_rate: f32,
+    ) -> Result<CmixBlockBackwardSgd> {
+        let key_shape = LinearDispatchShape::new(rows, d_model, dim_ffn)?;
+        let value_shape = LinearDispatchShape::new(rows, dim_ffn, d_model)?;
+        self.check_binary_shape_u16(shifted, key_bits, key_scale, None, key_shape)?;
+        let key_len = rows.saturating_mul(dim_ffn);
+        let value_weights = d_model.saturating_mul(dim_ffn);
+        let key_weights = dim_ffn.saturating_mul(d_model);
+        if relu2.len() != key_len
+            || key.len() != key_len
+            || gy.len() != rows.saturating_mul(d_model)
+            || key_latent.len() != key_weights
+            || value_weight.len() != value_weights
+        {
+            bail!("CMix backward SGD shape mismatch");
+        }
+        let key_words = key_weights.div_ceil(32);
+        let shifted_b = self.buffer_f32(shifted)?;
+        let key_b = self.buffer_f32(key)?;
+        let relu_b = self.buffer_f32(relu2)?;
+        let gy_b = self.buffer_f32(gy)?;
+        let bits_b = self.buffer_u32(key_bits)?;
+        let scale_b = self.buffer_u16(key_scale)?;
+        let value_w_b = self.buffer_u16(value_weight)?;
+        let key_latent_b = self.buffer_u16(key_latent)?;
+        let g_relu_b = self.alloc_f32(key_len)?;
+        let g_value_b = self.alloc_f32(value_weights)?;
+        let g_key_b = self.alloc_f32(key_len)?;
+        let g_shifted_b = self.alloc_f32(shifted.len())?;
+        let g_scale_b = self.alloc_f32(dim_ffn)?;
+        let g_bias_b = self.alloc_f32(dim_ffn)?;
+        let g_key_w_b = self.alloc_f32(key_weights)?;
+        let empty_bias_b = self.buffer_u16(&[])?;
+        let next_key_bits = self.alloc_bytes(key_words.saturating_mul(size_of::<u32>()).max(4))?;
+        self.submit(|encoder| {
+            Self::encode_tiled(
+                encoder,
+                &self.pipelines.fp16_linear_bwd,
+                &[&relu_b, &gy_b, &value_w_b, &g_relu_b, &g_value_b],
+                |encoder| {
+                    Self::set_u32s(
+                        encoder,
+                        5,
+                        &[
+                            as_u32(value_shape.rows, "rows")?,
+                            as_u32(value_shape.in_features, "in")?,
+                            as_u32(value_shape.out_features, "out")?,
+                            0,
+                        ],
+                    )
+                },
+                value_shape.in_features,
+                value_shape.rows,
+            )?;
+            Self::encode_tiled(
+                encoder,
+                &self.pipelines.fp16_linear_bwd,
+                &[&relu_b, &gy_b, &value_w_b, &g_relu_b, &g_value_b],
+                |encoder| {
+                    Self::set_u32s(
+                        encoder,
+                        5,
+                        &[
+                            as_u32(value_shape.rows, "rows")?,
+                            as_u32(value_shape.in_features, "in")?,
+                            as_u32(value_shape.out_features, "out")?,
+                            1,
+                        ],
+                    )
+                },
+                value_shape.in_features,
+                value_shape.out_features,
+            )?;
+            Self::encode_1d(
+                encoder,
+                &self.pipelines.cmix_relu2_backward,
+                &[&key_b, &g_relu_b, &g_key_b],
+                |encoder| set_bytes_u32(encoder, 3, &[as_u32(key_len, "elements")?]),
+                key_len,
+            )?;
+            Self::encode_tiled(
+                encoder,
+                &self.pipelines.binary_linear_input_bwd,
+                &[&g_key_b, &bits_b, &scale_b, &g_shifted_b],
+                |encoder| {
+                    Self::set_u32s(
+                        encoder,
+                        4,
+                        &[
+                            as_u32(key_shape.rows, "rows")?,
+                            as_u32(key_shape.in_features, "in")?,
+                            as_u32(key_shape.out_features, "out")?,
+                        ],
+                    )
+                },
+                key_shape.in_features,
+                key_shape.rows,
+            )?;
+            Self::encode_scale_groups(
+                encoder,
+                &self.pipelines.binary_linear_scale_bwd_from_output,
+                &[
+                    &key_b,
+                    &g_key_b,
+                    &scale_b,
+                    &empty_bias_b,
+                    &g_scale_b,
+                    &g_bias_b,
+                ],
+                |encoder| {
+                    Self::set_u32s(
+                        encoder,
+                        6,
+                        &[
+                            as_u32(key_shape.rows, "rows")?,
+                            as_u32(key_shape.out_features, "out")?,
+                            0,
+                        ],
+                    )
+                },
+                dim_ffn,
+            )?;
+            Self::encode_tiled(
+                encoder,
+                &self.pipelines.binary_linear_weight_bwd,
+                &[&shifted_b, &g_key_b, &scale_b, &g_key_w_b],
+                |encoder| {
+                    Self::set_u32s(
+                        encoder,
+                        4,
+                        &[
+                            as_u32(key_shape.rows, "rows")?,
+                            as_u32(key_shape.in_features, "in")?,
+                            as_u32(key_shape.out_features, "out")?,
+                        ],
+                    )
+                },
+                key_shape.in_features,
+                key_shape.out_features,
+            )?;
+            Self::encode_1d(
+                encoder,
+                &self.pipelines.clipped_sgd_fp16,
+                &[&value_w_b, &g_value_b],
+                |encoder| {
+                    set_bytes_f32(encoder, 2, &[learning_rate])?;
+                    set_bytes_u32(encoder, 3, &[as_u32(value_weights, "elements")?])
+                },
+                value_weights,
+            )?;
+            Self::encode_1d(
+                encoder,
+                &self.pipelines.clipped_sgd_fp16,
+                &[&key_latent_b, &g_key_w_b],
+                |encoder| {
+                    set_bytes_f32(encoder, 2, &[learning_rate])?;
+                    set_bytes_u32(encoder, 3, &[as_u32(key_weights, "elements")?])
+                },
+                key_weights,
+            )?;
+            Self::encode_1d(
+                encoder,
+                &self.pipelines.pack_latent_bits,
+                &[&key_latent_b, &next_key_bits],
+                |encoder| set_bytes_u32(encoder, 2, &[as_u32(key_weights, "elements")?]),
+                key_words,
+            )
+        })?;
+        let mut g_shifted = vec![0.0; shifted.len()];
+        let mut g_key_scale = vec![0.0; dim_ffn];
+        let mut next_value = vec![0_u16; value_weights];
+        let mut next_key_latent = vec![0_u16; key_weights];
+        let mut packed = vec![0_u32; key_words];
+        g_shifted_b.read_f32(&mut g_shifted)?;
+        g_scale_b.read_f32(&mut g_key_scale)?;
+        value_w_b.read_u16(&mut next_value)?;
+        key_latent_b.read_u16(&mut next_key_latent)?;
+        next_key_bits.read_u32(&mut packed)?;
+        Ok(CmixBlockBackwardSgd {
+            g_shifted,
+            g_key_scale,
+            next_key_latent,
+            next_key_bits: packed,
+            next_value_weight: next_value,
+        })
+    }
+
+    pub fn rosa_o_stop_grad_sgd(
+        &self,
+        y: &[f32],
+        out: &[f32],
+        gy: &[f32],
+        idx: &[u8],
+        o_bits: &[u32],
+        o_scale: &[u16],
+        o_bias: &[u16],
+        latent: &[u16],
+        rows: usize,
         channels: usize,
-        input_stride: usize,
-        input_offset: usize,
+        learning_rate: f32,
+    ) -> Result<RosaOStopGradSgd> {
+        let shape = LinearDispatchShape::new(rows, channels, channels)?;
+        self.check_binary_shape_u16(y, o_bits, o_scale, Some(o_bias), shape)?;
+        if out.len() != y.len()
+            || gy.len() != y.len()
+            || idx.len() != y.len()
+            || latent.len() != channels.saturating_mul(channels)
+        {
+            bail!("ROSA O stop-grad shape mismatch");
+        }
+        let weights = channels.saturating_mul(channels);
+        let words = weights.div_ceil(32);
+        let y_b = self.buffer_f32(y)?;
+        let out_b = self.buffer_f32(out)?;
+        let gy_b = self.buffer_f32(gy)?;
+        let idx_b = self.alloc_bytes(idx.len().max(1))?;
+        idx_b.write_bytes(idx)?;
+        let bits_b = self.buffer_u32(o_bits)?;
+        let scale_b = self.buffer_u16(o_scale)?;
+        let bias_b = self.buffer_u16(o_bias)?;
+        let latent_b = self.buffer_u16(latent)?;
+        let g_y_b = self.alloc_f32(y.len())?;
+        let g_scale_b = self.alloc_f32(channels)?;
+        let g_bias_b = self.alloc_f32(channels)?;
+        let gw_b = self.alloc_f32(weights)?;
+        let ge_b = self.alloc_f32(channels)?;
+        let next_bits = self.alloc_bytes(words.saturating_mul(size_of::<u32>()).max(4))?;
+        self.submit(|encoder| {
+            Self::encode_tiled(
+                encoder,
+                &self.pipelines.binary_linear_input_bwd,
+                &[&gy_b, &bits_b, &scale_b, &g_y_b],
+                |encoder| {
+                    Self::set_u32s(
+                        encoder,
+                        4,
+                        &[
+                            as_u32(rows, "rows")?,
+                            as_u32(channels, "in")?,
+                            as_u32(channels, "out")?,
+                        ],
+                    )
+                },
+                channels,
+                rows,
+            )?;
+            Self::encode_scale_groups(
+                encoder,
+                &self.pipelines.binary_linear_scale_bwd_from_output,
+                &[&out_b, &gy_b, &scale_b, &bias_b, &g_scale_b, &g_bias_b],
+                |encoder| {
+                    Self::set_u32s(
+                        encoder,
+                        6,
+                        &[
+                            as_u32(rows, "rows")?,
+                            as_u32(channels, "out")?,
+                            1,
+                        ],
+                    )
+                },
+                channels,
+            )?;
+            Self::encode_tiled(
+                encoder,
+                &self.pipelines.binary_linear_weight_bwd,
+                &[&y_b, &gy_b, &scale_b, &gw_b],
+                |encoder| {
+                    Self::set_u32s(
+                        encoder,
+                        4,
+                        &[
+                            as_u32(rows, "rows")?,
+                            as_u32(channels, "in")?,
+                            as_u32(channels, "out")?,
+                        ],
+                    )
+                },
+                channels,
+                channels,
+            )?;
+            Self::encode_1d(
+                encoder,
+                &self.pipelines.rosa_qkv_1bit_bwd_e,
+                &[&g_y_b, &idx_b, &ge_b],
+                |encoder| {
+                    Self::set_u32s(
+                        encoder,
+                        3,
+                        &[
+                            1,
+                            as_u32(rows, "time")?,
+                            as_u32(channels, "channels")?,
+                        ],
+                    )
+                },
+                channels,
+            )?;
+            Self::encode_1d(
+                encoder,
+                &self.pipelines.clipped_sgd_fp16,
+                &[&latent_b, &gw_b],
+                |encoder| {
+                    set_bytes_f32(encoder, 2, &[learning_rate])?;
+                    set_bytes_u32(encoder, 3, &[as_u32(weights, "elements")?])
+                },
+                weights,
+            )?;
+            Self::encode_1d(
+                encoder,
+                &self.pipelines.pack_latent_bits,
+                &[&latent_b, &next_bits],
+                |encoder| set_bytes_u32(encoder, 2, &[as_u32(weights, "elements")?]),
+                words,
+            )
+        })?;
+        let mut g_e = vec![0.0; channels];
+        let mut g_scale = vec![0.0; channels];
+        let mut g_bias = vec![0.0; channels];
+        let mut next_latent = vec![0_u16; weights];
+        let mut packed = vec![0_u32; words];
+        ge_b.read_f32(&mut g_e)?;
+        g_scale_b.read_f32(&mut g_scale)?;
+        g_bias_b.read_f32(&mut g_bias)?;
+        latent_b.read_u16(&mut next_latent)?;
+        next_bits.read_u32(&mut packed)?;
+        Ok(RosaOStopGradSgd {
+            e_gradient: g_e,
+            scale_gradient: g_scale,
+            bias_gradient: g_bias,
+            next_latent,
+            next_bits: packed,
+        })
+    }
+
+    pub fn binary_linear_backward(
+        &self,
+        input: &[f32],
+        output_gradient: &[f32],
+        bits: &[u32],
+        scale: &[f32],
+        has_bias: bool,
+        shape: LinearDispatchShape,
+    ) -> Result<BinaryLinearBackward> {
+        self.check_binary_shape(input, bits, scale, None, shape)?;
+        let out_len = shape.rows.saturating_mul(shape.out_features);
+        if output_gradient.len() != out_len {
+            bail!("binary linear output-gradient shape mismatch");
+        }
+        let input_buffer = self.buffer_f32(input)?;
+        let gy_buffer = self.buffer_f32(output_gradient)?;
+        let bits_buffer = self.buffer_u32(bits)?;
+        let scale_buffer = self.buffer_u16(&fp16_bits(scale))?;
+        let gx_buffer = self.alloc_f32(input.len())?;
+        let g_scale_buffer = self.alloc_f32(shape.out_features)?;
+        let g_bias_buffer = self.alloc_f32(shape.out_features)?;
+        let weights = shape.out_features.saturating_mul(shape.in_features);
+        let gw_buffer = self.alloc_f32(weights)?;
+        self.submit(|encoder| {
+            Self::encode_tiled(
+                encoder,
+                &self.pipelines.binary_linear_input_bwd,
+                &[&gy_buffer, &bits_buffer, &scale_buffer, &gx_buffer],
+                |encoder| {
+                    Self::set_u32s(
+                        encoder,
+                        4,
+                        &[
+                            as_u32(shape.rows, "rows")?,
+                            as_u32(shape.in_features, "in")?,
+                            as_u32(shape.out_features, "out")?,
+                        ],
+                    )
+                },
+                shape.in_features,
+                shape.rows,
+            )?;
+            Self::encode_scale_groups(
+                encoder,
+                &self.pipelines.binary_linear_scale_bwd,
+                &[
+                    &input_buffer,
+                    &gy_buffer,
+                    &bits_buffer,
+                    &g_scale_buffer,
+                    &g_bias_buffer,
+                ],
+                |encoder| {
+                    Self::set_u32s(
+                        encoder,
+                        5,
+                        &[
+                            as_u32(shape.rows, "rows")?,
+                            as_u32(shape.in_features, "in")?,
+                            as_u32(shape.out_features, "out")?,
+                            u32::from(has_bias),
+                        ],
+                    )
+                },
+                shape.out_features,
+            )?;
+            Self::encode_tiled(
+                encoder,
+                &self.pipelines.binary_linear_weight_bwd,
+                &[&input_buffer, &gy_buffer, &scale_buffer, &gw_buffer],
+                |encoder| {
+                    Self::set_u32s(
+                        encoder,
+                        4,
+                        &[
+                            as_u32(shape.rows, "rows")?,
+                            as_u32(shape.in_features, "in")?,
+                            as_u32(shape.out_features, "out")?,
+                        ],
+                    )
+                },
+                shape.in_features,
+                shape.out_features,
+            )
+        })?;
+        let mut input_gradient = vec![0.0; input.len()];
+        let mut scale_gradient = vec![0.0; shape.out_features];
+        let mut weight_gradient = vec![0.0; weights];
+        gx_buffer.read_f32(&mut input_gradient)?;
+        g_scale_buffer.read_f32(&mut scale_gradient)?;
+        gw_buffer.read_f32(&mut weight_gradient)?;
+        let bias_gradient = if has_bias {
+            let mut values = vec![0.0; shape.out_features];
+            g_bias_buffer.read_f32(&mut values)?;
+            Some(values)
+        } else {
+            None
+        };
+        Ok(BinaryLinearBackward {
+            input_gradient,
+            scale_gradient,
+            bias_gradient,
+            weight_gradient,
+        })
+    }
+
+    pub fn binary_linear_weight_bwd(
+        &self,
+        input: &[f32],
+        output_gradient: &[f32],
+        scale: &[f32],
+        shape: LinearDispatchShape,
     ) -> Result<Vec<f32>> {
-        use objc2_metal::{
-            MTLBuffer, MTLCommandBuffer, MTLCommandEncoder, MTLCommandQueue,
-            MTLComputePipelineState,
-        };
+        let weights = shape.out_features.saturating_mul(shape.in_features);
+        if input.len() != shape.rows.saturating_mul(shape.in_features)
+            || output_gradient.len() != shape.rows.saturating_mul(shape.out_features)
+            || scale.len() != shape.out_features
+        {
+            bail!("binary linear weight-gradient shape mismatch");
+        }
+        let input_buffer = self.buffer_f32(input)?;
+        let gy_buffer = self.buffer_f32(output_gradient)?;
+        let scale_buffer = self.buffer_u16(&fp16_bits(scale))?;
+        let gw_buffer = self.alloc_f32(weights)?;
+        self.submit(|encoder| {
+            Self::encode_tiled(
+                encoder,
+                &self.pipelines.binary_linear_weight_bwd,
+                &[&input_buffer, &gy_buffer, &scale_buffer, &gw_buffer],
+                |encoder| {
+                    Self::set_u32s(
+                        encoder,
+                        4,
+                        &[
+                            as_u32(shape.rows, "rows")?,
+                            as_u32(shape.in_features, "in")?,
+                            as_u32(shape.out_features, "out")?,
+                        ],
+                    )
+                },
+                shape.in_features,
+                shape.out_features,
+            )
+        })?;
+        let mut weight_gradient = vec![0.0; weights];
+        gw_buffer.read_f32(&mut weight_gradient)?;
+        Ok(weight_gradient)
+    }
 
-        let shape = MetalDispatchShape::new(batch, time, channels)?;
-        let plan = HyenaFftPlan::new(time)?;
-        let transforms = batch
-            .checked_mul(channels)
-            .ok_or_else(|| anyhow::anyhow!("Metal Hyena transform shape overflow"))?;
-        let filter_elements = channels
-            .checked_mul(time)
-            .ok_or_else(|| anyhow::anyhow!("Metal Hyena filter shape overflow"))?;
-        let input_rows = batch
-            .checked_mul(time)
-            .ok_or_else(|| anyhow::anyhow!("Metal Hyena input shape overflow"))?;
-        let minimum_input = input_rows
-            .checked_sub(1)
-            .and_then(|row| row.checked_mul(input_stride))
-            .and_then(|start| start.checked_add(input_offset))
-            .and_then(|start| start.checked_add(channels))
-            .ok_or_else(|| anyhow::anyhow!("Metal Hyena input shape overflow"))?;
-        if input_stride < channels || input.len() < minimum_input {
-            bail!("Metal Hyena causal convolution shape mismatch");
+    pub fn binary_linear_latent_sgd(
+        &self,
+        latent: &[u16],
+        input: &[f32],
+        output_gradient: &[f32],
+        scale: &[f32],
+        learning_rate: f32,
+        shape: LinearDispatchShape,
+    ) -> Result<(Vec<u16>, Vec<u32>, Vec<f32>)> {
+        let weights = shape
+            .out_features
+            .checked_mul(shape.in_features)
+            .ok_or_else(|| anyhow::anyhow!("binary latent shape overflow"))?;
+        if latent.len() != weights
+            || input.len() != shape.rows.saturating_mul(shape.in_features)
+            || output_gradient.len() != shape.rows.saturating_mul(shape.out_features)
+            || scale.len() != shape.out_features
+        {
+            bail!("binary latent SGD shape mismatch");
         }
-        let implicit_parameters = match &filter_source {
-            HyenaFilterSource::Dense(filter) => {
-                if filter.len() != filter_elements {
-                    bail!("Metal Hyena causal convolution shape mismatch");
-                }
-                None
-            }
-            HyenaFilterSource::Implicit(filter) => Some(filter.parameter_slices(channels)?),
-        };
-        let signal_elements = transforms
-            .checked_mul(plan.fft_len)
-            .ok_or_else(|| anyhow::anyhow!("Metal Hyena signal FFT shape overflow"))?;
-        let filter_fft_elements = channels
-            .checked_mul(plan.fft_len)
-            .ok_or_else(|| anyhow::anyhow!("Metal Hyena filter FFT shape overflow"))?;
-        let signal_bytes = signal_elements
-            .checked_mul(size_of::<Complex32>())
-            .ok_or_else(|| anyhow::anyhow!("Metal Hyena signal buffer size overflow"))?;
-        let filter_bytes = filter_fft_elements
-            .checked_mul(size_of::<Complex32>())
-            .ok_or_else(|| anyhow::anyhow!("Metal Hyena filter buffer size overflow"))?;
-        let output_bytes = shape
-            .elements()
-            .checked_mul(size_of::<f32>())
-            .ok_or_else(|| anyhow::anyhow!("Metal Hyena output buffer size overflow"))?;
-        let fft_len = u32::try_from(plan.fft_len)
-            .map_err(|_| anyhow::anyhow!("Metal Hyena FFT length exceeds u32"))?;
-        let transforms_u32 = u32::try_from(transforms)
-            .map_err(|_| anyhow::anyhow!("Metal Hyena transform count exceeds u32"))?;
-        let channels_u32 = u32::try_from(channels)
-            .map_err(|_| anyhow::anyhow!("Metal Hyena channel count exceeds u32"))?;
-        let time_u32 =
-            u32::try_from(time).map_err(|_| anyhow::anyhow!("Metal Hyena time exceeds u32"))?;
-        let elements_u32 = u32::try_from(shape.elements())
-            .map_err(|_| anyhow::anyhow!("Metal Hyena element count exceeds u32"))?;
+        let words = weights.div_ceil(32);
+        let latent_buffer = self.buffer_u16(latent)?;
+        let bits_buffer = self.buffer_u32(&vec![0_u32; words])?;
+        let input_buffer = self.buffer_f32(input)?;
+        let gy_buffer = self.buffer_f32(output_gradient)?;
+        let scale_buffer = self.buffer_u16(&fp16_bits(scale))?;
+        let gw_buffer = self.zeros_f32(weights)?;
+        self.submit(|encoder| {
+            Self::encode_1d(
+                encoder,
+                &self.pipelines.binary_linear_latent_sgd,
+                &[
+                    &latent_buffer,
+                    &bits_buffer,
+                    &input_buffer,
+                    &gy_buffer,
+                    &scale_buffer,
+                    &gw_buffer,
+                ],
+                |encoder| {
+                    Self::set_u32s(
+                        encoder,
+                        6,
+                        &[
+                            as_u32(shape.rows, "rows")?,
+                            as_u32(shape.in_features, "in")?,
+                            as_u32(shape.out_features, "out")?,
+                        ],
+                    )?;
+                    set_bytes_f32(encoder, 9, &[learning_rate])
+                },
+                words,
+            )
+        })?;
+        let mut next_latent = vec![0_u16; weights];
+        let mut bits = vec![0_u32; words];
+        let mut g_w = vec![0.0; weights];
+        latent_buffer.read_u16(&mut next_latent)?;
+        bits_buffer.read_u32(&mut bits)?;
+        gw_buffer.read_f32(&mut g_w)?;
+        Ok((next_latent, bits, g_w))
+    }
 
-        let mut signal_buffers = self.fft_buffers.borrow_mut();
-        let mut filter_buffers = self.filter_fft_buffers.borrow_mut();
-        let mut output_buffer = self.hyena_output_buffer.borrow_mut();
-        let mut parameter_buffers = self.implicit_filter_parameters.borrow_mut();
-        signal_buffers.ensure(&self.device, signal_bytes)?;
-        filter_buffers.ensure(&self.device, filter_bytes)?;
-        output_buffer.ensure(&self.device, output_bytes)?;
-        if let Some((freq, _, _, _)) = implicit_parameters {
-            parameter_buffers.ensure(
-                &self.device,
-                freq.len().checked_mul(size_of::<f32>()).ok_or_else(|| {
-                    anyhow::anyhow!("Metal implicit-filter parameter size overflow")
-                })?,
+    pub fn fp16_linear(
+        &self,
+        input: &[f32],
+        weight: &[f32],
+        shape: LinearDispatchShape,
+    ) -> Result<Vec<f32>> {
+        let weights = shape.out_features.saturating_mul(shape.in_features);
+        if input.len() != shape.rows.saturating_mul(shape.in_features) || weight.len() != weights {
+            bail!("FP16 linear shape mismatch");
+        }
+        let out_len = shape.rows.saturating_mul(shape.out_features);
+        let input_buffer = self.buffer_f32(input)?;
+        let weight_buffer = self.buffer_u16(&fp16_bits(weight))?;
+        let output_buffer = self.zeros_f32(out_len)?;
+        self.submit(|encoder| {
+            Self::encode_tiled(
+                encoder,
+                &self.pipelines.fp16_linear,
+                &[&input_buffer, &weight_buffer, &output_buffer],
+                |encoder| {
+                    Self::set_u32s(
+                        encoder,
+                        3,
+                        &[
+                            as_u32(shape.rows, "rows")?,
+                            as_u32(shape.in_features, "in")?,
+                            as_u32(shape.out_features, "out")?,
+                        ],
+                    )
+                },
+                shape.out_features,
+                shape.rows,
+            )
+        })?;
+        let mut output = vec![0.0; out_len];
+        output_buffer.read_f32(&mut output)?;
+        Ok(output)
+    }
+
+    pub fn fp16_linear_backward(
+        &self,
+        input: &[f32],
+        output_gradient: &[f32],
+        weight: &[f32],
+        shape: LinearDispatchShape,
+    ) -> Result<Fp16LinearBackward> {
+        let weights = shape.out_features.saturating_mul(shape.in_features);
+        if input.len() != shape.rows.saturating_mul(shape.in_features)
+            || output_gradient.len() != shape.rows.saturating_mul(shape.out_features)
+            || weight.len() != weights
+        {
+            bail!("FP16 linear backward shape mismatch");
+        }
+        let input_buffer = self.buffer_f32(input)?;
+        let gy_buffer = self.buffer_f32(output_gradient)?;
+        let weight_buffer = self.buffer_u16(&fp16_bits(weight))?;
+        let gx_buffer = self.zeros_f32(input.len())?;
+        let gw_buffer = self.zeros_f32(weights)?;
+        self.submit(|encoder| {
+            Self::encode_tiled(
+                encoder,
+                &self.pipelines.fp16_linear_bwd,
+                &[
+                    &input_buffer,
+                    &gy_buffer,
+                    &weight_buffer,
+                    &gx_buffer,
+                    &gw_buffer,
+                ],
+                |encoder| {
+                    Self::set_u32s(
+                        encoder,
+                        5,
+                        &[
+                            as_u32(shape.rows, "rows")?,
+                            as_u32(shape.in_features, "in")?,
+                            as_u32(shape.out_features, "out")?,
+                            0,
+                        ],
+                    )
+                },
+                shape.in_features,
+                shape.rows,
             )?;
+            Self::encode_tiled(
+                encoder,
+                &self.pipelines.fp16_linear_bwd,
+                &[
+                    &input_buffer,
+                    &gy_buffer,
+                    &weight_buffer,
+                    &gx_buffer,
+                    &gw_buffer,
+                ],
+                |encoder| {
+                    Self::set_u32s(
+                        encoder,
+                        5,
+                        &[
+                            as_u32(shape.rows, "rows")?,
+                            as_u32(shape.in_features, "in")?,
+                            as_u32(shape.out_features, "out")?,
+                            1,
+                        ],
+                    )
+                },
+                shape.in_features,
+                shape.out_features,
+            )
+        })?;
+        let mut input_gradient = vec![0.0; input.len()];
+        let mut weight_gradient = vec![0.0; weights];
+        gx_buffer.read_f32(&mut input_gradient)?;
+        gw_buffer.read_f32(&mut weight_gradient)?;
+        Ok(Fp16LinearBackward {
+            input_gradient,
+            weight_gradient,
+        })
+    }
+
+    pub fn streamed_cross_entropy_fp16(
+        &self,
+        hidden: &[f32],
+        bits: &[u32],
+        scale: &[f32],
+        tokens: &[u32],
+        rows: usize,
+        time: usize,
+        channels: usize,
+        vocab: usize,
+        horizon: usize,
+    ) -> Result<StreamedCrossEntropy> {
+        if rows.checked_mul(channels) != Some(hidden.len())
+            || tokens.len() != rows
+            || scale.len() != vocab
+            || time == 0
+            || !rows.is_multiple_of(time)
+            || bits.len() != (vocab.saturating_mul(channels)).div_ceil(32)
+        {
+            bail!("streamed CE shape mismatch");
         }
-        let signal_first = signal_buffers
-            .first
-            .as_ref()
-            .expect("checked Metal Hyena signal buffer");
-        let signal_second = signal_buffers
-            .second
-            .as_ref()
-            .expect("checked Metal Hyena signal scratch buffer");
-        let filter_first = filter_buffers
-            .first
-            .as_ref()
-            .expect("checked Metal Hyena filter buffer");
-        let filter_second = filter_buffers
-            .second
-            .as_ref()
-            .expect("checked Metal Hyena filter scratch buffer");
-        let output = output_buffer
-            .buffer
-            .as_ref()
-            .expect("checked Metal Hyena output buffer");
-        // SAFETY: each persistent shared buffer was grown to the exact checked
-        // count. Zeroing its complex elements provides FFT padding without a
-        // host-sized staging Vec; every later indexed write is bounded by the
-        // validated tensor dimensions, and the borrows keep buffers exclusive
-        // until GPU completion.
-        unsafe {
-            let signal_ptr = signal_first.contents().cast::<Complex32>().as_ptr();
-            signal_ptr.write_bytes(0, signal_elements);
-            for sequence in 0..batch {
-                for position in 0..time {
-                    let source_offset = (sequence * time + position) * input_stride + input_offset;
-                    for channel in 0..channels {
-                        let destination = (sequence * channels + channel) * plan.fft_len + position;
-                        (*signal_ptr.add(destination)).real = input[source_offset + channel];
-                    }
-                }
-            }
-            let filter_ptr = filter_first.contents().cast::<Complex32>().as_ptr();
-            filter_ptr.write_bytes(0, filter_fft_elements);
-            if let HyenaFilterSource::Dense(filter) = &filter_source {
-                for channel in 0..channels {
-                    for position in 0..time {
-                        (*filter_ptr.add(channel * plan.fft_len + position)).real =
-                            filter[channel * time + position];
-                    }
-                }
-            }
-            if let Some((freq, phase, decay, _)) = implicit_parameters {
-                parameter_buffers
-                    .freq
-                    .as_ref()
-                    .expect("checked Metal implicit frequency buffer")
-                    .contents()
-                    .cast::<f32>()
-                    .as_ptr()
-                    .copy_from_nonoverlapping(freq.as_ptr(), freq.len());
-                parameter_buffers
-                    .phase
-                    .as_ref()
-                    .expect("checked Metal implicit phase buffer")
-                    .contents()
-                    .cast::<f32>()
-                    .as_ptr()
-                    .copy_from_nonoverlapping(phase.as_ptr(), phase.len());
-                parameter_buffers
-                    .decay
-                    .as_ref()
-                    .expect("checked Metal implicit decay buffer")
-                    .contents()
-                    .cast::<f32>()
-                    .as_ptr()
-                    .copy_from_nonoverlapping(decay.as_ptr(), decay.len());
+        let mut n_valid = 0_usize;
+        for row in 0..rows {
+            if row % time + horizon < time {
+                n_valid += 1;
             }
         }
-        let command = self
-            .queue
-            .commandBuffer()
-            .ok_or_else(|| anyhow::anyhow!("Metal command buffer allocation failed"))?;
-        let encoder = command
-            .computeCommandEncoder()
-            .ok_or_else(|| anyhow::anyhow!("Metal compute encoder allocation failed"))?;
-        if let Some((_, _, _, order)) = implicit_parameters {
-            let order_u32 = u32::try_from(order)
-                .map_err(|_| anyhow::anyhow!("Metal implicit-filter order exceeds u32"))?;
-            let filter_elements_u32 = u32::try_from(filter_elements)
-                .map_err(|_| anyhow::anyhow!("Metal implicit-filter element count exceeds u32"))?;
-            let freq = parameter_buffers
-                .freq
-                .as_ref()
-                .expect("checked Metal implicit frequency buffer");
-            let phase = parameter_buffers
-                .phase
-                .as_ref()
-                .expect("checked Metal implicit phase buffer");
-            let decay = parameter_buffers
-                .decay
-                .as_ref()
-                .expect("checked Metal implicit decay buffer");
-            self.encode_implicit_filter(
-                encoder.as_ref(),
-                freq,
-                phase,
-                decay,
-                filter_first,
-                time_u32,
-                time_u32,
-                order_u32,
-                fft_len,
-                filter_elements_u32,
+        let gradient_scale = if n_valid == 0 {
+            0.0
+        } else {
+            1.0 / n_valid as f32
+        };
+        let hidden_buffer = self.buffer_f32(hidden)?;
+        let bits_buffer = self.buffer_u32(bits)?;
+        let scale_buffer = self.buffer_u16(&fp16_bits(scale))?;
+        let tokens_buffer = self.buffer_u32(tokens)?;
+        let gx_buffer = self.alloc_f32(hidden.len())?;
+        let loss_buffer = self.alloc_f32(rows)?;
+        let g_scale_buffer = self.zeros_f32(vocab)?;
+        let gy_buffer = self.alloc_f32(rows.saturating_mul(vocab))?;
+        self.submit(|encoder| {
+            Self::encode_1d(
+                encoder,
+                &self.pipelines.streamed_cross_entropy_fp16,
+                &[
+                    &hidden_buffer,
+                    &bits_buffer,
+                    &scale_buffer,
+                    &tokens_buffer,
+                    &gx_buffer,
+                    &loss_buffer,
+                    &g_scale_buffer,
+                    &gy_buffer,
+                ],
+                |encoder| {
+                    Self::set_u32s(
+                        encoder,
+                        8,
+                        &[
+                            as_u32(rows, "rows")?,
+                            as_u32(time, "time")?,
+                            as_u32(channels, "channels")?,
+                            as_u32(vocab, "vocab")?,
+                            as_u32(horizon, "horizon")?,
+                        ],
+                    )?;
+                    set_bytes_f32(encoder, 13, &[gradient_scale])
+                },
+                rows,
+            )
+        })?;
+        let mut hidden_gradient = vec![0.0; hidden.len()];
+        let mut row_loss = vec![0.0; rows];
+        let mut scale_gradient = vec![0.0; vocab];
+        let mut logit_gradient = vec![0.0; rows.saturating_mul(vocab)];
+        gx_buffer.read_f32(&mut hidden_gradient)?;
+        loss_buffer.read_f32(&mut row_loss)?;
+        g_scale_buffer.read_f32(&mut scale_gradient)?;
+        gy_buffer.read_f32(&mut logit_gradient)?;
+        let mean_loss = if n_valid == 0 {
+            0.0
+        } else {
+            row_loss.iter().sum::<f32>() / n_valid as f32
+        };
+        Ok(StreamedCrossEntropy {
+            mean_loss,
+            hidden_gradient,
+            scale_gradient,
+            row_loss,
+            logit_gradient,
+        })
+    }
+
+    pub fn apply_latent_sgd(
+        &self,
+        latent: &[u16],
+        gradient: &[f32],
+        learning_rate: f32,
+    ) -> Result<(Vec<u16>, Vec<u32>)> {
+        if latent.len() != gradient.len() {
+            bail!("latent SGD length mismatch");
+        }
+        if latent.is_empty() {
+            return Ok((Vec::new(), Vec::new()));
+        }
+        let words = latent.len().div_ceil(32);
+        let latent_buffer = self.buffer_u16(latent)?;
+        let grad_buffer = self.buffer_f32(gradient)?;
+        let bits_buffer = self.alloc_bytes(words.saturating_mul(size_of::<u32>()).max(4))?;
+        self.submit(|encoder| {
+            Self::encode_1d(
+                encoder,
+                &self.pipelines.clipped_sgd_fp16,
+                &[&latent_buffer, &grad_buffer],
+                |encoder| {
+                    set_bytes_f32(encoder, 2, &[learning_rate])?;
+                    set_bytes_u32(encoder, 3, &[as_u32(latent.len(), "elements")?])
+                },
+                latent.len(),
             )?;
+            Self::encode_1d(
+                encoder,
+                &self.pipelines.pack_latent_bits,
+                &[&latent_buffer, &bits_buffer],
+                |encoder| set_bytes_u32(encoder, 2, &[as_u32(latent.len(), "elements")?]),
+                words,
+            )
+        })?;
+        let mut next = vec![0_u16; latent.len()];
+        let mut bits = vec![0_u32; words];
+        latent_buffer.read_u16(&mut next)?;
+        bits_buffer.read_u32(&mut bits)?;
+        Ok((next, bits))
+    }
+
+    pub fn clipped_sgd_fp16(
+        &self,
+        parameters: &[u16],
+        gradient: &[f32],
+        learning_rate: f32,
+    ) -> Result<Vec<u16>> {
+        if parameters.len() != gradient.len() {
+            bail!("clipped SGD length mismatch");
         }
-        let dispatch_two = |pipeline: &objc2::runtime::ProtocolObject<
-            dyn MTLComputePipelineState,
-        >,
-                            input: &objc2::runtime::ProtocolObject<dyn MTLBuffer>,
-                            output: &objc2::runtime::ProtocolObject<dyn MTLBuffer>,
-                            total: usize,
-                            scalars: &[u32]|
-         -> Result<()> {
-            self.encode_fft_two_buffer(encoder.as_ref(), pipeline, input, output, total, scalars)
-        };
-        let run_fft = |first: &objc2::runtime::ProtocolObject<dyn MTLBuffer>,
-                       second: &objc2::runtime::ProtocolObject<dyn MTLBuffer>,
-                       transforms: u32,
-                       total: usize,
-                       inverse: bool|
-         -> Result<bool> {
-            dispatch_two(
-                &self.fft_bitreverse_pipeline,
-                first,
-                second,
-                total,
-                &[fft_len, transforms],
-            )?;
-            let mut source_is_first = false;
-            for stage in 1..=plan.stages {
-                let (source, destination) = if source_is_first {
-                    (first, second)
-                } else {
-                    (second, first)
-                };
-                dispatch_two(
-                    &self.fft_stage_pipeline,
-                    source,
-                    destination,
-                    total,
-                    &[fft_len, transforms, stage, u32::from(inverse)],
-                )?;
-                source_is_first = !source_is_first;
+        if parameters.is_empty() {
+            return Ok(Vec::new());
+        }
+        let param_buffer = self.buffer_u16(parameters)?;
+        let grad_buffer = self.buffer_f32(gradient)?;
+        self.submit(|encoder| {
+            Self::encode_1d(
+                encoder,
+                &self.pipelines.clipped_sgd_fp16,
+                &[&param_buffer, &grad_buffer],
+                |encoder| {
+                    set_bytes_f32(encoder, 2, &[learning_rate])?;
+                    set_bytes_u32(encoder, 3, &[as_u32(parameters.len(), "elements")?])
+                },
+                parameters.len(),
+            )
+        })?;
+        let mut updated = vec![0_u16; parameters.len()];
+        param_buffer.read_u16(&mut updated)?;
+        Ok(updated)
+    }
+
+    /// Packed ±1 head: logits, softmax CE, and STE gradients in one command buffer.
+    /// Logits and `gy` stay resident; only `gx`, `g_scale`, `g_w`, and row loss are read.
+    pub fn packed_head_train(
+        &self,
+        hidden: &[f32],
+        bits: &[u32],
+        scale: &[f32],
+        tokens: &[u32],
+        rows: usize,
+        time: usize,
+        channels: usize,
+        vocab: usize,
+        horizon: usize,
+    ) -> Result<PackedHeadTrain> {
+        let shape = LinearDispatchShape::new(rows, channels, vocab)?;
+        self.check_binary_shape(hidden, bits, scale, None, shape)?;
+        if tokens.len() != rows || time == 0 || !rows.is_multiple_of(time) {
+            bail!("packed head CE shape mismatch");
+        }
+        let mut n_valid = 0_usize;
+        for row in 0..rows {
+            if row % time + horizon < time {
+                n_valid += 1;
             }
-            Ok(source_is_first)
-        };
-        let signal_source_is_first = run_fft(
-            signal_first.as_ref(),
-            signal_second.as_ref(),
-            transforms_u32,
-            signal_elements,
-            false,
-        )?;
-        let filter_source_is_first = run_fft(
-            filter_first.as_ref(),
-            filter_second.as_ref(),
-            channels_u32,
-            filter_fft_elements,
-            false,
-        )?;
-        let signal_spectrum = if signal_source_is_first {
-            signal_first.as_ref()
+        }
+        let gradient_scale = if n_valid == 0 {
+            0.0
         } else {
-            signal_second.as_ref()
+            1.0 / n_valid as f32
         };
-        let filter_spectrum = if filter_source_is_first {
-            filter_first.as_ref()
-        } else {
-            filter_second.as_ref()
-        };
-        let multiply_output_is_first = !signal_source_is_first;
-        let product = if multiply_output_is_first {
-            signal_first.as_ref()
-        } else {
-            signal_second.as_ref()
-        };
-        self.encode_fft_multiply(
-            encoder.as_ref(),
-            signal_spectrum,
-            filter_spectrum,
-            product,
-            fft_len,
-            channels_u32,
-            transforms_u32,
-            signal_elements,
-        )?;
-        let inverse_bitreversed_is_first = !multiply_output_is_first;
-        let inverse_bitreversed = if inverse_bitreversed_is_first {
-            signal_first.as_ref()
-        } else {
-            signal_second.as_ref()
-        };
-        dispatch_two(
-            &self.fft_bitreverse_pipeline,
-            product,
-            inverse_bitreversed,
-            signal_elements,
-            &[fft_len, transforms_u32],
-        )?;
-        let mut inverse_source_is_first = inverse_bitreversed_is_first;
-        for stage in 1..=plan.stages {
-            let (source, destination) = if inverse_source_is_first {
-                (signal_first.as_ref(), signal_second.as_ref())
-            } else {
-                (signal_second.as_ref(), signal_first.as_ref())
-            };
-            dispatch_two(
-                &self.fft_stage_pipeline,
-                source,
-                destination,
-                signal_elements,
-                &[fft_len, transforms_u32, stage, 1],
+        let logits_len = rows.saturating_mul(vocab);
+        let weights = vocab.saturating_mul(channels);
+        let hidden_buffer = self.buffer_f32(hidden)?;
+        let bits_buffer = self.buffer_u32(bits)?;
+        let scale_buffer = self.buffer_u16(&fp16_bits(scale))?;
+        let bias_buffer = self.buffer_u16(&fp16_bits(&[]))?;
+        let tokens_buffer = self.buffer_u32(tokens)?;
+        let logits_buffer = self.alloc_f32(logits_len)?;
+        let gy_buffer = self.alloc_f32(logits_len)?;
+        let loss_buffer = self.alloc_f32(rows)?;
+        let gx_buffer = self.alloc_f32(hidden.len())?;
+        let g_scale_buffer = self.alloc_f32(vocab)?;
+        let g_bias_buffer = self.alloc_f32(vocab)?;
+        let gw_buffer = self.alloc_f32(weights)?;
+        self.submit(|encoder| {
+            Self::encode_tiled(
+                encoder,
+                &self.pipelines.binary_linear,
+                &[
+                    &hidden_buffer,
+                    &bits_buffer,
+                    &scale_buffer,
+                    &bias_buffer,
+                    &logits_buffer,
+                ],
+                |encoder| {
+                    Self::set_u32s(
+                        encoder,
+                        5,
+                        &[
+                            as_u32(rows, "rows")?,
+                            as_u32(channels, "in")?,
+                            as_u32(vocab, "out")?,
+                            0,
+                        ],
+                    )
+                },
+                vocab,
+                rows,
             )?;
-            inverse_source_is_first = !inverse_source_is_first;
-        }
-        let inverse = if inverse_source_is_first {
-            signal_first.as_ref()
+            Self::encode_1d(
+                encoder,
+                &self.pipelines.softmax_cross_entropy,
+                &[&logits_buffer, &tokens_buffer, &loss_buffer, &gy_buffer],
+                |encoder| {
+                    Self::set_u32s(
+                        encoder,
+                        4,
+                        &[
+                            as_u32(rows, "rows")?,
+                            as_u32(time, "time")?,
+                            as_u32(vocab, "vocab")?,
+                            as_u32(horizon, "horizon")?,
+                        ],
+                    )?;
+                    set_bytes_f32(encoder, 8, &[gradient_scale])
+                },
+                rows,
+            )?;
+            Self::encode_tiled(
+                encoder,
+                &self.pipelines.binary_linear_input_bwd,
+                &[&gy_buffer, &bits_buffer, &scale_buffer, &gx_buffer],
+                |encoder| {
+                    Self::set_u32s(
+                        encoder,
+                        4,
+                        &[
+                            as_u32(rows, "rows")?,
+                            as_u32(channels, "in")?,
+                            as_u32(vocab, "out")?,
+                        ],
+                    )
+                },
+                channels,
+                rows,
+            )?;
+            Self::encode_scale_groups(
+                encoder,
+                &self.pipelines.binary_linear_scale_bwd_from_output,
+                &[
+                    &logits_buffer,
+                    &gy_buffer,
+                    &scale_buffer,
+                    &bias_buffer,
+                    &g_scale_buffer,
+                    &g_bias_buffer,
+                ],
+                |encoder| {
+                    Self::set_u32s(
+                        encoder,
+                        6,
+                        &[as_u32(rows, "rows")?, as_u32(vocab, "out")?, 0],
+                    )
+                },
+                vocab,
+            )?;
+            Self::encode_tiled(
+                encoder,
+                &self.pipelines.binary_linear_weight_bwd,
+                &[&hidden_buffer, &gy_buffer, &scale_buffer, &gw_buffer],
+                |encoder| {
+                    Self::set_u32s(
+                        encoder,
+                        4,
+                        &[
+                            as_u32(rows, "rows")?,
+                            as_u32(channels, "in")?,
+                            as_u32(vocab, "out")?,
+                        ],
+                    )
+                },
+                channels,
+                vocab,
+            )
+        })?;
+        let mut hidden_gradient = vec![0.0; hidden.len()];
+        let mut scale_gradient = vec![0.0; vocab];
+        let mut weight_gradient = vec![0.0; weights];
+        let mut row_loss = vec![0.0; rows];
+        gx_buffer.read_f32(&mut hidden_gradient)?;
+        g_scale_buffer.read_f32(&mut scale_gradient)?;
+        gw_buffer.read_f32(&mut weight_gradient)?;
+        loss_buffer.read_f32(&mut row_loss)?;
+        let mean_loss = if n_valid == 0 {
+            0.0
         } else {
-            signal_second.as_ref()
+            row_loss.iter().sum::<f32>() / n_valid as f32
         };
-        self.encode_causal_extract(
-            encoder.as_ref(),
-            inverse,
-            output,
-            time_u32,
-            channels_u32,
-            fft_len,
-            elements_u32,
-        )?;
-        encoder.endEncoding();
-        command.commit();
-        command.waitUntilCompleted();
-        if let Some(error) = command.error() {
-            bail!("Metal Hyena causal convolution failed: {error}");
+        Ok(PackedHeadTrain {
+            mean_loss,
+            hidden_gradient,
+            scale_gradient,
+            weight_gradient,
+        })
+    }
+
+    /// Packed head + STE latent SGD in one command buffer. Does not read `g_w`.
+    pub fn packed_head_train_sgd(
+        &self,
+        hidden: &[f32],
+        bits: &[u32],
+        scale: &[u16],
+        latent: &[u16],
+        tokens: &[u32],
+        rows: usize,
+        time: usize,
+        channels: usize,
+        vocab: usize,
+        horizon: usize,
+        learning_rate: f32,
+    ) -> Result<PackedHeadTrainSgd> {
+        let shape = LinearDispatchShape::new(rows, channels, vocab)?;
+        let weights = vocab.saturating_mul(channels);
+        if hidden.len() != rows.saturating_mul(channels)
+            || bits.len() != shape.packed_words()?
+            || scale.len() != vocab
+            || latent.len() != weights
+            || tokens.len() != rows
+            || time == 0
+            || !rows.is_multiple_of(time)
+        {
+            bail!("packed head SGD shape mismatch");
         }
-        let mut result = vec![0.0; shape.elements()];
-        // SAFETY: completion makes every written output element readable from the shared buffer.
-        unsafe {
-            result
-                .as_mut_ptr()
-                .copy_from_nonoverlapping(output.contents().cast::<f32>().as_ptr(), result.len());
+        let mut n_valid = 0_usize;
+        for row in 0..rows {
+            if row % time + horizon < time {
+                n_valid += 1;
+            }
         }
-        Ok(result)
+        let gradient_scale = if n_valid == 0 {
+            0.0
+        } else {
+            1.0 / n_valid as f32
+        };
+        let logits_len = rows.saturating_mul(vocab);
+        let words = weights.div_ceil(32);
+        let hidden_buffer = self.buffer_f32(hidden)?;
+        let bits_buffer = self.buffer_u32(bits)?;
+        let scale_buffer = self.buffer_u16(scale)?;
+        let bias_buffer = self.buffer_u16(&[])?;
+        let tokens_buffer = self.buffer_u32(tokens)?;
+        let latent_buffer = self.buffer_u16(latent)?;
+        let next_bits = self.alloc_bytes(words.saturating_mul(size_of::<u32>()).max(4))?;
+        let logits_buffer = self.alloc_f32(logits_len)?;
+        let gy_buffer = self.alloc_f32(logits_len)?;
+        let loss_buffer = self.alloc_f32(rows)?;
+        let gx_buffer = self.alloc_f32(hidden.len())?;
+        let g_scale_buffer = self.alloc_f32(vocab)?;
+        let g_bias_buffer = self.alloc_f32(vocab)?;
+        let gw_buffer = self.alloc_f32(weights)?;
+        self.submit(|encoder| {
+            Self::encode_tiled(
+                encoder,
+                &self.pipelines.binary_linear,
+                &[
+                    &hidden_buffer,
+                    &bits_buffer,
+                    &scale_buffer,
+                    &bias_buffer,
+                    &logits_buffer,
+                ],
+                |encoder| {
+                    Self::set_u32s(
+                        encoder,
+                        5,
+                        &[
+                            as_u32(rows, "rows")?,
+                            as_u32(channels, "in")?,
+                            as_u32(vocab, "out")?,
+                            0,
+                        ],
+                    )
+                },
+                vocab,
+                rows,
+            )?;
+            Self::encode_1d(
+                encoder,
+                &self.pipelines.softmax_cross_entropy,
+                &[&logits_buffer, &tokens_buffer, &loss_buffer, &gy_buffer],
+                |encoder| {
+                    Self::set_u32s(
+                        encoder,
+                        4,
+                        &[
+                            as_u32(rows, "rows")?,
+                            as_u32(time, "time")?,
+                            as_u32(vocab, "vocab")?,
+                            as_u32(horizon, "horizon")?,
+                        ],
+                    )?;
+                    set_bytes_f32(encoder, 8, &[gradient_scale])
+                },
+                rows,
+            )?;
+            Self::encode_tiled(
+                encoder,
+                &self.pipelines.binary_linear_input_bwd,
+                &[&gy_buffer, &bits_buffer, &scale_buffer, &gx_buffer],
+                |encoder| {
+                    Self::set_u32s(
+                        encoder,
+                        4,
+                        &[
+                            as_u32(rows, "rows")?,
+                            as_u32(channels, "in")?,
+                            as_u32(vocab, "out")?,
+                        ],
+                    )
+                },
+                channels,
+                rows,
+            )?;
+            Self::encode_scale_groups(
+                encoder,
+                &self.pipelines.binary_linear_scale_bwd_from_output,
+                &[
+                    &logits_buffer,
+                    &gy_buffer,
+                    &scale_buffer,
+                    &bias_buffer,
+                    &g_scale_buffer,
+                    &g_bias_buffer,
+                ],
+                |encoder| {
+                    Self::set_u32s(
+                        encoder,
+                        6,
+                        &[as_u32(rows, "rows")?, as_u32(vocab, "out")?, 0],
+                    )
+                },
+                vocab,
+            )?;
+            Self::encode_tiled(
+                encoder,
+                &self.pipelines.binary_linear_weight_bwd,
+                &[&hidden_buffer, &gy_buffer, &scale_buffer, &gw_buffer],
+                |encoder| {
+                    Self::set_u32s(
+                        encoder,
+                        4,
+                        &[
+                            as_u32(rows, "rows")?,
+                            as_u32(channels, "in")?,
+                            as_u32(vocab, "out")?,
+                        ],
+                    )
+                },
+                channels,
+                vocab,
+            )?;
+            Self::encode_1d(
+                encoder,
+                &self.pipelines.clipped_sgd_fp16,
+                &[&latent_buffer, &gw_buffer],
+                |encoder| {
+                    set_bytes_f32(encoder, 2, &[learning_rate])?;
+                    set_bytes_u32(encoder, 3, &[as_u32(weights, "elements")?])
+                },
+                weights,
+            )?;
+            Self::encode_1d(
+                encoder,
+                &self.pipelines.pack_latent_bits,
+                &[&latent_buffer, &next_bits],
+                |encoder| set_bytes_u32(encoder, 2, &[as_u32(weights, "elements")?]),
+                words,
+            )
+        })?;
+        let mut hidden_gradient = vec![0.0; hidden.len()];
+        let mut scale_gradient = vec![0.0; vocab];
+        let mut row_loss = vec![0.0; rows];
+        let mut next_latent = vec![0_u16; weights];
+        let mut packed = vec![0_u32; words];
+        gx_buffer.read_f32(&mut hidden_gradient)?;
+        g_scale_buffer.read_f32(&mut scale_gradient)?;
+        loss_buffer.read_f32(&mut row_loss)?;
+        latent_buffer.read_u16(&mut next_latent)?;
+        next_bits.read_u32(&mut packed)?;
+        let mean_loss = if n_valid == 0 {
+            0.0
+        } else {
+            row_loss.iter().sum::<f32>() / n_valid as f32
+        };
+        Ok(PackedHeadTrainSgd {
+            mean_loss,
+            hidden_gradient,
+            scale_gradient,
+            next_latent,
+            next_bits: packed,
+        })
+    }
+
+    fn check_binary_shape_u16(
+        &self,
+        input: &[f32],
+        bits: &[u32],
+        scale: &[u16],
+        bias: Option<&[u16]>,
+        shape: LinearDispatchShape,
+    ) -> Result<()> {
+        if input.len() != shape.rows.saturating_mul(shape.in_features)
+            || bits.len() != shape.packed_words()?
+            || scale.len() != shape.out_features
+            || bias.is_some_and(|bias| bias.len() != shape.out_features)
+        {
+            bail!("binary linear shape mismatch");
+        }
+        Ok(())
+    }
+
+    fn check_binary_shape(
+        &self,
+        input: &[f32],
+        bits: &[u32],
+        scale: &[f32],
+        bias: Option<&[f32]>,
+        shape: LinearDispatchShape,
+    ) -> Result<()> {
+        if input.len() != shape.rows.saturating_mul(shape.in_features)
+            || bits.len() != shape.packed_words()?
+            || scale.len() != shape.out_features
+            || bias.is_some_and(|bias| bias.len() != shape.out_features)
+        {
+            bail!("binary linear shape mismatch");
+        }
+        Ok(())
     }
 }
 
-/// Executes one packed ternary projection on Metal.
-///
-/// This is still a numerical-reference path: buffers and pipeline are created
-/// per call so the result can be compared directly with the safe CPU model.
-/// A later persistent runtime will own and reuse these Metal objects.
-#[cfg(target_os = "macos")]
-#[allow(unsafe_code)]
-pub fn ternary_linear_forward(
-    input: &[f32],
-    positive: &[u64],
-    negative: &[u64],
-    scales: &[f32],
-    shape: TernaryLinearShape,
-) -> Result<Vec<f32>> {
-    use core::ffi::c_void;
-    use core::ptr::NonNull;
-    use objc2_foundation::NSString;
-    use objc2_metal::{
-        MTLBuffer, MTLCommandBuffer, MTLCommandEncoder, MTLCommandQueue, MTLCompileOptions,
-        MTLComputeCommandEncoder, MTLComputePipelineState, MTLCreateSystemDefaultDevice, MTLDevice,
-        MTLLibrary, MTLResourceOptions, MTLSize,
-    };
-
-    let input_len = shape
-        .rows
-        .checked_mul(shape.in_features)
-        .ok_or_else(|| anyhow::anyhow!("ternary input shape overflow"))?;
-    let output_len = shape
-        .rows
-        .checked_mul(shape.out_features)
-        .ok_or_else(|| anyhow::anyhow!("ternary output shape overflow"))?;
-    let packed_words = shape.packed_words()?;
-    if input.len() != input_len
-        || positive.len() != packed_words
-        || negative.len() != packed_words
-        || scales.len() != shape.out_features
-    {
-        bail!("Metal ternary projection shape mismatch");
-    }
-    let input_bytes = input_len
-        .checked_mul(size_of::<f32>())
-        .ok_or_else(|| anyhow::anyhow!("Metal input buffer byte size overflow"))?;
-    let packed_bytes = packed_words
-        .checked_mul(size_of::<u64>())
-        .ok_or_else(|| anyhow::anyhow!("Metal ternary buffer byte size overflow"))?;
-    let scale_bytes = scales
-        .len()
-        .checked_mul(size_of::<f32>())
-        .ok_or_else(|| anyhow::anyhow!("Metal scale buffer byte size overflow"))?;
-    let output_bytes = output_len
-        .checked_mul(size_of::<f32>())
-        .ok_or_else(|| anyhow::anyhow!("Metal output buffer byte size overflow"))?;
-    let rows = u32::try_from(shape.rows).map_err(|_| anyhow::anyhow!("Metal rows exceed u32"))?;
-    let in_features = u32::try_from(shape.in_features)
-        .map_err(|_| anyhow::anyhow!("Metal input width exceeds u32"))?;
-    let out_features = u32::try_from(shape.out_features)
-        .map_err(|_| anyhow::anyhow!("Metal output width exceeds u32"))?;
-
-    let device = MTLCreateSystemDefaultDevice()
-        .ok_or_else(|| anyhow::anyhow!("Metal device is unavailable"))?;
-    let source = NSString::from_str(HYENA_METAL_SOURCE);
-    let options = MTLCompileOptions::new();
-    let library = device
-        .newLibraryWithSource_options_error(&source, Some(&options))
-        .map_err(|error| anyhow::anyhow!("Metal shader compilation failed: {error}"))?;
-    let name = NSString::from_str(TERNARY_LINEAR_KERNEL_NAME);
-    let function = library
-        .newFunctionWithName(&name)
-        .ok_or_else(|| anyhow::anyhow!("Metal ternary function is missing"))?;
-    let pipeline = device
-        .newComputePipelineStateWithFunction_error(&function)
-        .map_err(|error| anyhow::anyhow!("Metal pipeline creation failed: {error}"))?;
-    let queue = device
-        .newCommandQueue()
-        .ok_or_else(|| anyhow::anyhow!("Metal command queue is unavailable"))?;
-    let shared = MTLResourceOptions::StorageModeShared;
-    let input_buffer = device
-        .newBufferWithLength_options(input_bytes, shared)
-        .ok_or_else(|| anyhow::anyhow!("Metal input buffer allocation failed"))?;
-    let positive_buffer = device
-        .newBufferWithLength_options(packed_bytes, shared)
-        .ok_or_else(|| anyhow::anyhow!("Metal positive bitplane allocation failed"))?;
-    let negative_buffer = device
-        .newBufferWithLength_options(packed_bytes, shared)
-        .ok_or_else(|| anyhow::anyhow!("Metal negative bitplane allocation failed"))?;
-    let scale_buffer = device
-        .newBufferWithLength_options(scale_bytes, shared)
-        .ok_or_else(|| anyhow::anyhow!("Metal scale buffer allocation failed"))?;
-    let output_buffer = device
-        .newBufferWithLength_options(output_bytes, shared)
-        .ok_or_else(|| anyhow::anyhow!("Metal output buffer allocation failed"))?;
-
-    // SAFETY: Each shared buffer was allocated from the exact checked byte
-    // count of its source slice. The command is only submitted after all host
-    // copies complete, and retained buffers outlive the command.
-    unsafe {
-        input_buffer
-            .contents()
-            .cast::<f32>()
-            .as_ptr()
-            .copy_from_nonoverlapping(input.as_ptr(), input_len);
-        positive_buffer
-            .contents()
-            .cast::<u64>()
-            .as_ptr()
-            .copy_from_nonoverlapping(positive.as_ptr(), packed_words);
-        negative_buffer
-            .contents()
-            .cast::<u64>()
-            .as_ptr()
-            .copy_from_nonoverlapping(negative.as_ptr(), packed_words);
-        scale_buffer
-            .contents()
-            .cast::<f32>()
-            .as_ptr()
-            .copy_from_nonoverlapping(scales.as_ptr(), scales.len());
-    }
-
-    let command = queue
-        .commandBuffer()
-        .ok_or_else(|| anyhow::anyhow!("Metal command buffer allocation failed"))?;
-    let encoder = command
-        .computeCommandEncoder()
-        .ok_or_else(|| anyhow::anyhow!("Metal compute encoder allocation failed"))?;
-    encoder.setComputePipelineState(&pipeline);
-    // SAFETY: Buffer slots and scalar slots exactly mirror the MSL signature
-    // for `ullis_ternary_linear`; scalar values are copied synchronously.
-    unsafe {
-        encoder.setBuffer_offset_atIndex(Some(&input_buffer), 0, 0);
-        encoder.setBuffer_offset_atIndex(Some(&positive_buffer), 0, 1);
-        encoder.setBuffer_offset_atIndex(Some(&negative_buffer), 0, 2);
-        encoder.setBuffer_offset_atIndex(Some(&scale_buffer), 0, 3);
-        encoder.setBuffer_offset_atIndex(Some(&output_buffer), 0, 4);
-        encoder.setBytes_length_atIndex(NonNull::from(&rows).cast::<c_void>(), size_of::<u32>(), 5);
-        encoder.setBytes_length_atIndex(
-            NonNull::from(&in_features).cast::<c_void>(),
-            size_of::<u32>(),
-            6,
-        );
-        encoder.setBytes_length_atIndex(
-            NonNull::from(&out_features).cast::<c_void>(),
-            size_of::<u32>(),
-            7,
-        );
-    }
-    let thread_width = pipeline.maxTotalThreadsPerThreadgroup().min(output_len);
-    if thread_width == 0 {
-        bail!("Metal ternary pipeline reported zero threads per threadgroup");
-    }
-    encoder.dispatchThreads_threadsPerThreadgroup(
-        MTLSize {
-            width: output_len,
-            height: 1,
-            depth: 1,
-        },
-        MTLSize {
-            width: thread_width,
-            height: 1,
-            depth: 1,
-        },
-    );
-    encoder.endEncoding();
-    command.commit();
-    command.waitUntilCompleted();
-    if let Some(error) = command.error() {
-        bail!("Metal ternary command failed: {error}");
-    }
-    let mut output = vec![0.0; output_len];
-    // SAFETY: The command completed successfully, so Metal no longer writes
-    // the retained shared buffer, whose initialized byte count matches output.
-    unsafe {
-        output
-            .as_mut_ptr()
-            .copy_from_nonoverlapping(output_buffer.contents().cast::<f32>().as_ptr(), output_len);
-    }
-    Ok(output)
-}
-
-#[cfg(not(target_os = "macos"))]
-pub fn identity_forward(_input: &[f32]) -> Result<Vec<f32>> {
-    bail!("Ullis Metal backend requires macOS on Apple Silicon")
-}
-
-#[cfg(not(target_os = "macos"))]
-pub fn rms_norm_forward(_input: &[f32], _rows: usize, _channels: usize) -> Result<Vec<f32>> {
-    bail!("Ullis Metal backend requires macOS on Apple Silicon")
-}
-
-#[cfg(not(target_os = "macos"))]
-pub fn ternary_linear_forward(
-    _input: &[f32],
-    _positive: &[u64],
-    _negative: &[u64],
-    _scales: &[f32],
-    _shape: TernaryLinearShape,
-) -> Result<Vec<f32>> {
-    bail!("Ullis Metal backend requires macOS on Apple Silicon")
+/// Executes the identity smoke kernel and returns a fresh output vector.
+pub fn identity_forward(input: &[f32]) -> Result<Vec<f32>> {
+    MetalRuntime::new()?.identity(input)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::model::{Fp16Linear, LAYER_NORM_EPS, LayerNorm, PackedBinaryLinear};
+    use crate::precision::Fp16Storage;
 
-    #[cfg(target_os = "macos")]
-    #[test]
-    fn ternary_code_stats_mask_tail_bits_and_count_state_changes() {
-        let previous = MetalTernaryCodeSnapshot {
-            parameters: 65,
-            positive: vec![0b1, 0],
-            negative: vec![0, 0],
+    fn runtime() -> Option<MetalRuntime> {
+        MetalRuntime::new().ok()
+    }
+
+    fn pack_plus_bits(plus: impl Iterator<Item = bool>, weights: usize) -> Vec<u32> {
+        let mut bits = vec![0_u32; weights.div_ceil(32)];
+        for (index, is_plus) in plus.enumerate() {
+            if is_plus {
+                bits[index / 32] |= 1_u32 << (index % 32);
+            }
+        }
+        bits
+    }
+
+    fn assert_close(actual: &[f32], expected: &[f32], atol: f32) {
+        assert_eq!(actual.len(), expected.len());
+        for (index, (a, e)) in actual.iter().zip(expected).enumerate() {
+            assert!(
+                (a - e).abs() <= atol,
+                "index {index}: {a} vs {e} (atol {atol})"
+            );
+        }
+    }
+
+    fn cpu_layer_norm_backward(
+        x: &[f32],
+        gy: &[f32],
+        weight: &[f32],
+        rows: usize,
+        channels: usize,
+    ) -> LayerNormBackward {
+        let mut gx = vec![0.0; x.len()];
+        let mut gw = vec![0.0; channels];
+        let mut gb = vec![0.0; channels];
+        for row in 0..rows {
+            let start = row * channels;
+            let src = &x[start..start + channels];
+            let mean = src.iter().sum::<f32>() / channels as f32;
+            let var = src.iter().map(|v| (v - mean) * (v - mean)).sum::<f32>() / channels as f32;
+            let inv = (var + LAYER_NORM_EPS).sqrt().recip();
+            let mut sum_dxhat = 0.0;
+            let mut sum_dxhat_xhat = 0.0;
+            let mut xhat = vec![0.0; channels];
+            let mut dxhat = vec![0.0; channels];
+            for c in 0..channels {
+                xhat[c] = (src[c] - mean) * inv;
+                dxhat[c] = gy[start + c] * weight[c];
+                sum_dxhat += dxhat[c];
+                sum_dxhat_xhat += dxhat[c] * xhat[c];
+                gw[c] += gy[start + c] * xhat[c];
+                gb[c] += gy[start + c];
+            }
+            let inv_n = inv / channels as f32;
+            for c in 0..channels {
+                gx[start + c] =
+                    inv_n * (channels as f32 * dxhat[c] - sum_dxhat - xhat[c] * sum_dxhat_xhat);
+            }
+        }
+        LayerNormBackward {
+            input_gradient: gx,
+            weight_gradient: gw,
+            bias_gradient: gb,
+        }
+    }
+
+    fn cpu_time_shift(x: &[f32], time: usize, channels: usize) -> Vec<f32> {
+        let mut xx = vec![0.0; x.len()];
+        let rows = x.len() / channels;
+        for row in 0..rows {
+            let t = row % time;
+            for c in 0..channels {
+                let index = row * channels + c;
+                xx[index] = if t == 0 {
+                    -x[index]
+                } else {
+                    x[index - channels] - x[index]
+                };
+            }
+        }
+        xx
+    }
+
+    fn cpu_streamed_ce(
+        hidden: &[f32],
+        linear: &PackedBinaryLinear,
+        tokens: &[u32],
+        time: usize,
+        horizon: usize,
+    ) -> StreamedCrossEntropy {
+        let rows = tokens.len();
+        let channels = linear.in_features();
+        let vocab = linear.out_features();
+        let logits = linear.forward(hidden, rows).unwrap();
+        let mut n_valid = 0_usize;
+        for row in 0..rows {
+            if row % time + horizon < time {
+                n_valid += 1;
+            }
+        }
+        let scale = if n_valid == 0 {
+            0.0
+        } else {
+            1.0 / n_valid as f32
         };
-        let current = MetalTernaryCodeSnapshot {
-            parameters: 65,
-            positive: vec![0b10, u64::MAX],
-            negative: vec![0b100, 0],
+        let mut row_loss = vec![0.0; rows];
+        let mut gy = vec![0.0; rows * vocab];
+        for row in 0..rows {
+            if row % time + horizon >= time {
+                continue;
+            }
+            let target = tokens[row + horizon] as usize;
+            let start = row * vocab;
+            let row_logits = &logits[start..start + vocab];
+            let max = row_logits.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+            let exp_sum: f32 = row_logits.iter().map(|v| (v - max).exp()).sum();
+            row_loss[row] = max + exp_sum.ln() - row_logits[target];
+            for v in 0..vocab {
+                let p = (row_logits[v] - max).exp() / exp_sum;
+                gy[start + v] = scale * (p - f32::from(v == target));
+            }
+        }
+        let mut g_w = vec![0.0; vocab * channels];
+        let mut gx = vec![0.0; hidden.len()];
+        let mut g_scale = vec![0.0; vocab];
+        linear
+            .backward_ste(
+                hidden,
+                &gy,
+                rows,
+                &mut g_w,
+                Some(&mut gx),
+                &mut g_scale,
+                None,
+            )
+            .unwrap();
+        let mean_loss = if n_valid == 0 {
+            0.0
+        } else {
+            row_loss.iter().sum::<f32>() / n_valid as f32
         };
-        let stats = current.stats_against(Some(&previous));
-        assert_eq!(stats.parameters, 65);
-        assert_eq!(stats.positive, 2);
-        assert_eq!(stats.negative, 1);
-        assert_eq!(stats.changed, 4);
+        StreamedCrossEntropy {
+            mean_loss,
+            hidden_gradient: gx,
+            scale_gradient: g_scale,
+            row_loss,
+            logit_gradient: gy,
+        }
     }
 
     #[test]
@@ -9268,473 +3427,57 @@ mod tests {
     }
 
     #[test]
-    fn ternary_shape_uses_two_packed_bitplanes() {
-        assert_eq!(
-            TernaryLinearShape::new(2, 65, 3)
-                .unwrap()
-                .packed_words()
-                .unwrap(),
-            4
-        );
+    fn shader_source_has_no_mps_or_hyena_aliases() {
+        let source = RWKV8_METAL_SOURCE.to_ascii_lowercase();
+        assert!(!source.contains("mps"));
+        assert!(!source.contains("hyena"));
+        assert!(!source.contains("fft"));
+        assert!(!source.contains("rms_norm"));
+        for name in PR3_KERNEL_NAMES {
+            assert!(
+                RWKV8_METAL_SOURCE.contains(&format!("kernel void {name}(")),
+                "missing kernel {name}"
+            );
+        }
+        for name in PR4_KERNEL_NAMES {
+            assert!(
+                RWKV8_METAL_SOURCE.contains(&format!("kernel void {name}(")),
+                "missing kernel {name}"
+            );
+        }
+        for name in PR5_KERNEL_NAMES {
+            assert!(
+                RWKV8_METAL_SOURCE.contains(&format!("kernel void {name}(")),
+                "missing kernel {name}"
+            );
+        }
+        for name in PR8_KERNEL_NAMES {
+            assert!(
+                RWKV8_METAL_SOURCE.contains(&format!("kernel void {name}(")),
+                "missing kernel {name}"
+            );
+        }
+        assert!(!RWKV8_METAL_SOURCE.contains("ullis_rosa_qkv_1bit_bwd_bits"));
     }
 
     #[test]
-    fn ternary_reference_decodes_both_bitplanes() {
-        let shape = TernaryLinearShape::new(1, 3, 2).unwrap();
-        let output = ternary_reference(
-            &[2.0, 3.0, 5.0],
-            &[0b011001],
-            &[0b000010],
-            &[2.0, 0.5],
-            shape,
-        )
-        .unwrap();
-        assert_eq!(output, vec![-2.0, 2.5]);
-    }
-
-    #[test]
-    fn fused_reference_keeps_normalized_rows_virtual() {
-        let shape = TernaryLinearShape::new(1, 3, 2).unwrap();
-        let output = rms_norm_ternary_reference(
-            &[3.0, 4.0, 0.0],
-            &[0b011001],
-            &[0b000010],
-            &[2.0, 0.5],
-            shape,
-        )
-        .unwrap();
-        let inverse_rms = (25.0_f32 / 3.0 + 1e-5).sqrt().recip();
-        assert!((output[0] + 2.0 * inverse_rms).abs() < 1e-6);
-        assert!((output[1] - 3.5 * inverse_rms).abs() < 1e-6);
-    }
-
-    #[test]
-    #[cfg(target_os = "macos")]
-    fn resident_gate_and_residual_match_cpu_when_metal_is_available() {
-        let Ok(runtime) = MetalRuntime::new() else {
+    fn pr3_kernels_compile_on_the_local_metal_device() {
+        let Ok(_) = MetalRuntime::new() else {
             return;
         };
-        let residual = [1.0, -2.0, 0.5, 3.0];
-        let mixed = [2.0, 4.0, -1.0, 0.25];
-        // Signal | gate for each row.
-        let projection = [9.0, 8.0, 0.5, -0.25, 7.0, 6.0, -0.75, 0.4];
-        let actual = runtime
-            .resident_gate_residual_reference(&residual, &mixed, &projection, 2, 2)
-            .unwrap();
-        let expected = [2.0, -3.0, 1.25, 3.1];
-        for (actual, expected) in actual.iter().zip(expected) {
-            assert!((actual - expected).abs() < 1e-6, "{actual} != {expected}");
+        let shape = MetalDispatchShape::new(1, 8, 16).unwrap();
+        for name in PR3_KERNEL_NAMES
+            .iter()
+            .chain(PR4_KERNEL_NAMES)
+            .chain(PR5_KERNEL_NAMES)
+            .chain(PR8_KERNEL_NAMES)
+        {
+            let width = validate_metal_kernel(name, shape).unwrap();
+            assert!(width > 0, "{name}");
         }
     }
 
     #[test]
-    #[cfg(target_os = "macos")]
-    fn metal_gate_backward_matches_cpu_when_metal_is_available() {
-        let Ok(runtime) = MetalRuntime::new() else {
-            return;
-        };
-        let mixed = [0.5, -1.5, 2.0, 0.25];
-        let gated_projection = [
-            9.0,
-            8.0,
-            0.25_f32.tanh(),
-            (-0.75_f32).tanh(),
-            7.0,
-            6.0,
-            0.5_f32.tanh(),
-            1.25_f32.tanh(),
-        ];
-        let output_gradient = [0.75, -0.5, 1.0, -1.5];
-        let expected =
-            crate::model::hyena_gate_backward(&mixed, &gated_projection, &output_gradient, 2)
-                .unwrap();
-        let actual = runtime
-            .hyena_gate_backward_reference(&mixed, &gated_projection, &output_gradient, 2, 2)
-            .unwrap();
-        assert_eq!(actual.mixed_gradient, expected.mixed_gradient);
-        assert_eq!(actual.projection_gradient, expected.projection_gradient);
-    }
-
-    #[test]
-    #[cfg(target_os = "macos")]
-    fn metal_ternary_backward_matches_cpu_contract_when_metal_is_available() {
-        let Ok(runtime) = MetalRuntime::new() else {
-            return;
-        };
-        let shape = TernaryLinearShape::new(2, 3, 2).unwrap();
-        let input = [0.25, -1.5, 2.0, 0.5, 1.0, -0.75];
-        let output_gradient = [0.75, -0.5, 1.0, 0.25];
-        // Output rows: [+1, -1, 0] and [+1, 0, -1].
-        let positive = [0b010_001_u64];
-        let negative = [0b100_010_u64];
-        let scales = [0.5, 0.75];
-        let code = |weight: usize| {
-            let bit = 1_u64 << weight;
-            if positive[0] & bit != 0 {
-                1.0
-            } else if negative[0] & bit != 0 {
-                -1.0
-            } else {
-                0.0
-            }
-        };
-        let mut expected_input = vec![0.0; input.len()];
-        let mut expected_weight = vec![0.0; 6];
-        for row in 0..2 {
-            for feature in 0..3 {
-                for output in 0..2 {
-                    expected_input[row * 3 + feature] += output_gradient[row * 2 + output]
-                        * scales[output]
-                        * code(output * 3 + feature);
-                    expected_weight[output * 3 + feature] += output_gradient[row * 2 + output]
-                        * scales[output]
-                        * input[row * 3 + feature];
-                }
-            }
-        }
-        let actual = runtime
-            .ternary_linear_backward_reference(
-                &input,
-                &output_gradient,
-                &positive,
-                &negative,
-                &scales,
-                shape,
-            )
-            .unwrap();
-        for (actual, expected) in actual.input_gradient.iter().zip(expected_input) {
-            assert!((actual - expected).abs() < 1e-6, "{actual} != {expected}");
-        }
-        for (actual, expected) in actual.latent_weight_gradient.iter().zip(expected_weight) {
-            assert!((actual - expected).abs() < 1e-6, "{actual} != {expected}");
-        }
-    }
-
-    #[test]
-    #[cfg(target_os = "macos")]
-    fn resident_fp16_stateless_sgd_matches_clipped_cpu_contract_when_available() {
-        let Ok(runtime) = MetalRuntime::new() else {
-            return;
-        };
-        let initial = crate::precision::Fp16Storage::from_f32([0.5, -1.0, 0.25, -0.75]);
-        let gradient = [2.0, -3.0, 0.125, -0.5];
-        let parameters = runtime.upload_resident_fp16_parameters(&initial).unwrap();
-        runtime
-            .resident_fp16_stateless_sgd(&parameters, &gradient, 0.2)
-            .unwrap();
-        let actual = runtime
-            .download_resident_fp16_parameters(&parameters)
-            .unwrap();
-        let mut expected = initial;
-        for (index, &value) in gradient.iter().enumerate() {
-            expected.apply_clipped_sgd(index, value, 0.2);
-        }
-        assert_eq!(actual, expected);
-        assert!(
-            runtime
-                .resident_fp16_stateless_sgd(&parameters, &[f32::NAN; 4], 0.2)
-                .is_err()
-        );
-    }
-
-    #[test]
-    #[cfg(target_os = "macos")]
-    fn resident_trainable_ternary_refreshes_scales_and_codes_after_sgd_when_available() {
-        let Ok(runtime) = MetalRuntime::new() else {
-            return;
-        };
-        let master = crate::precision::Fp16Storage::from_f32([1.0, -0.5, 0.1, -0.8, 0.4, 0.2]);
-        let weights = runtime
-            .upload_trainable_fp16_ternary_weights(&master, 3, 2, 0.7)
-            .unwrap();
-        runtime
-            .resident_trainable_fp16_ternary_stateless_sgd(
-                &weights,
-                &[2.0, -3.0, 0.0, 0.25, -0.5, 1.0],
-                0.2,
-            )
-            .unwrap();
-        let (actual_master, positive, negative, scales) = runtime
-            .download_trainable_fp16_ternary_weights(&weights)
-            .unwrap();
-        let mut expected_master = master;
-        for (index, &gradient) in [2.0_f32, -3.0, 0.0, 0.25, -0.5, 1.0].iter().enumerate() {
-            expected_master.apply_clipped_sgd(index, gradient, 0.2);
-        }
-        assert_eq!(actual_master, expected_master);
-        let mut expected_positive = 0_u64;
-        let mut expected_negative = 0_u64;
-        for row in 0..2 {
-            let start = row * 3;
-            let scale = (0..3)
-                .map(|feature| expected_master.get(start + feature).abs())
-                .sum::<f32>()
-                / 3.0;
-            assert!((scales[row] - scale).abs() < 1e-6);
-            for feature in 0..3 {
-                let bit = 1_u64 << (start + feature);
-                let value = expected_master.get(start + feature);
-                if value > 0.7 * scale {
-                    expected_positive |= bit;
-                } else if value < -0.7 * scale {
-                    expected_negative |= bit;
-                }
-            }
-        }
-        assert_eq!(positive, vec![expected_positive]);
-        assert_eq!(negative, vec![expected_negative]);
-    }
-
-    #[test]
-    #[cfg(target_os = "macos")]
-    fn metal_backward_workspace_is_grow_only_when_metal_is_available() {
-        let Ok(runtime) = MetalRuntime::new() else {
-            return;
-        };
-        let large = TernaryLinearShape::new(2, 3, 2).unwrap();
-        runtime
-            .ternary_linear_backward_reference(
-                &[1.0, -1.0, 0.5, 0.25, 2.0, -0.5],
-                &[0.5, -0.25, 1.0, 0.75],
-                &[0b010_001_u64],
-                &[0b100_010_u64],
-                &[0.5, 0.75],
-                large,
-            )
-            .unwrap();
-        let capacity_after_large = {
-            let buffers = runtime.backward_buffers.borrow();
-            (
-                buffers.output_gradient_capacity,
-                buffers.input_gradient_capacity,
-                buffers.parameter_gradient_capacity,
-            )
-        };
-        let small = TernaryLinearShape::new(1, 2, 1).unwrap();
-        runtime
-            .ternary_linear_backward_reference(
-                &[1.0, -1.0],
-                &[0.5],
-                &[0b01_u64],
-                &[0],
-                &[1.0],
-                small,
-            )
-            .unwrap();
-        let buffers = runtime.backward_buffers.borrow();
-        assert_eq!(
-            (
-                buffers.output_gradient_capacity,
-                buffers.input_gradient_capacity,
-                buffers.parameter_gradient_capacity,
-            ),
-            capacity_after_large
-        );
-    }
-
-    #[test]
-    #[cfg(target_os = "macos")]
-    fn metal_bounded_convolution_backward_matches_cpu_when_metal_is_available() {
-        let Ok(runtime) = MetalRuntime::new() else {
-            return;
-        };
-        let plan = HyenaChunkPlan::new(4, 3).unwrap();
-        let input = [0.5, -1.0, 1.5, 2.0, -0.5, 3.0, 4.0, -2.0];
-        let filter = [0.5, -0.25, 0.125, 1.0, 0.0, -0.5];
-        let output_gradient = [0.25, -0.5, 1.0, 0.75, -1.5, 0.5, 0.25, -0.75];
-        let expected = crate::hyena::causal_chunked_conv_backward(
-            &input,
-            &filter,
-            &output_gradient,
-            1,
-            4,
-            2,
-            plan,
-        )
-        .unwrap();
-        let actual = runtime
-            .causal_chunked_conv_backward_reference(
-                &input,
-                &filter,
-                &output_gradient,
-                1,
-                4,
-                2,
-                plan,
-            )
-            .unwrap();
-        for (actual, expected) in actual.input_gradient.iter().zip(expected.input_gradient) {
-            assert!((actual - expected).abs() < 1e-6, "{actual} != {expected}");
-        }
-        for (actual, expected) in actual.filter_gradient.iter().zip(expected.filter_gradient) {
-            assert!((actual - expected).abs() < 1e-6, "{actual} != {expected}");
-        }
-    }
-
-    #[test]
-    #[cfg(target_os = "macos")]
-    fn metal_rms_norm_backward_matches_cpu_contract_when_metal_is_available() {
-        let Ok(runtime) = MetalRuntime::new() else {
-            return;
-        };
-        let input = [3.0, 4.0, 0.0, 2.0, -2.0, 1.0];
-        let output_gradient = [0.25, -0.5, 1.0, -1.5, 0.5, 0.75];
-        let mut normalized = vec![0.0; input.len()];
-        let mut expected = vec![0.0; input.len()];
-        for row in 0..2 {
-            let offset = row * 3;
-            let inverse_rms = (input[offset..offset + 3]
-                .iter()
-                .map(|value| value * value)
-                .sum::<f32>()
-                / 3.0
-                + 1e-5)
-                .sqrt()
-                .recip();
-            for channel in 0..3 {
-                normalized[offset + channel] = input[offset + channel] * inverse_rms;
-            }
-            let projection = normalized[offset..offset + 3]
-                .iter()
-                .zip(&output_gradient[offset..offset + 3])
-                .map(|(value, gradient)| value * gradient)
-                .sum::<f32>()
-                / 3.0;
-            for channel in 0..3 {
-                expected[offset + channel] = inverse_rms
-                    * (output_gradient[offset + channel]
-                        - normalized[offset + channel] * projection);
-            }
-        }
-        let actual = runtime
-            .rms_norm_backward_reference(&input, &normalized, &output_gradient, 2, 3)
-            .unwrap();
-        for (actual, expected) in actual.iter().zip(expected) {
-            assert!((actual - expected).abs() < 1e-6, "{actual} != {expected}");
-        }
-    }
-
-    #[test]
-    #[cfg(target_os = "macos")]
-    fn metal_projection_signal_join_matches_cpu_when_metal_is_available() {
-        let Ok(runtime) = MetalRuntime::new() else {
-            return;
-        };
-        let projection = [1.0, 2.0, 9.0, 8.0, -3.0, 4.0, 7.0, 6.0];
-        let gate_gradient = [0.5, -0.25, 1.0, 2.0, -1.5, 0.75, 0.25, -0.5];
-        let signal_gradient = [0.125, -0.5, 1.25, 0.25];
-        let (signal, joined) = runtime
-            .projection_signal_backward_reference(
-                &projection,
-                &gate_gradient,
-                &signal_gradient,
-                2,
-                2,
-            )
-            .unwrap();
-        assert_eq!(signal, [1.0, 2.0, -3.0, 4.0]);
-        assert_eq!(joined, [0.625, -0.75, 1.0, 2.0, -0.25, 1.0, 0.25, -0.5]);
-    }
-
-    #[test]
-    #[cfg(target_os = "macos")]
-    fn resident_projection_ping_pongs_without_host_activation_copy() {
-        let Ok(runtime) = MetalRuntime::new() else {
-            return;
-        };
-        let source = [1.0, -2.0, 0.5, 3.0];
-        let slot = runtime.upload_resident_activations(&source, 2, 2).unwrap();
-        // Identity ternary matrix, encoded row-major by output feature.
-        let slot = runtime
-            .resident_output_projection(slot, 2, 2, &[0b1001], &[0], &[1.0, 1.0])
-            .unwrap();
-        let actual = runtime.download_resident_activations(slot, 2, 2).unwrap();
-        assert_eq!(actual, [2.0, -4.0, 1.0, 6.0]);
-    }
-
-    #[test]
-    #[cfg(target_os = "macos")]
-    fn resident_gradient_slots_are_independent_and_grow_only_when_available() {
-        let Ok(runtime) = MetalRuntime::new() else {
-            return;
-        };
-        let source = [1.0, -2.0, 0.5, 3.0];
-        let slot = runtime.upload_resident_gradient(&source, 2, 2).unwrap();
-        assert_eq!(slot, ResidentGradientSlot::First);
-        assert_eq!(slot.other(), ResidentGradientSlot::Second);
-        // The second MTP head writes to Third while accumulating the first
-        // head from Second; the reverse Hyena chain then resumes at Second.
-        assert_eq!(
-            ResidentGradientSlot::Third.other(),
-            ResidentGradientSlot::Second
-        );
-        assert_eq!(
-            runtime.download_resident_gradient(slot, 2, 2).unwrap(),
-            source
-        );
-        runtime.reserve_gradients(1, 2).unwrap();
-        assert_eq!(
-            runtime.download_resident_gradient(slot, 2, 2).unwrap(),
-            source
-        );
-    }
-
-    #[test]
-    #[cfg(target_os = "macos")]
-    fn fft_stage_kernels_compile_on_the_local_metal_device() {
-        let shape = MetalDispatchShape::new(1, 8, 1).unwrap();
-        for kernel in [
-            FFT_BITREVERSE_KERNEL_NAME,
-            FFT_STAGE_KERNEL_NAME,
-            FFT_COMPLEX_MULTIPLY_KERNEL_NAME,
-            FFT_EXTRACT_CAUSAL_KERNEL_NAME,
-            IMPLICIT_FILTER_KERNEL_NAME,
-            TANH_GATE_KERNEL_NAME,
-            PACK_STRIDED_REAL_KERNEL_NAME,
-            APPLY_GATE_KERNEL_NAME,
-            RESIDUAL_ADD_KERNEL_NAME,
-        ] {
-            if let Ok(width) = validate_metal_kernel(kernel, shape) {
-                assert!(width > 0);
-            }
-        }
-    }
-
-    #[test]
-    #[cfg(target_os = "macos")]
-    fn identity_shader_compiles_on_the_local_metal_device() {
-        // CI and sandboxed shells may deliberately expose no GPU. The public
-        // constructor reports that condition as a recoverable error; a local
-        // Metal-enabled run still compiles the shader and checks its pipeline.
-        if let Ok(width) = validate_metal_pipeline(MetalDispatchShape::new(1, 8, 16).unwrap()) {
-            assert!(width > 0);
-        }
-    }
-
-    #[test]
-    #[cfg(target_os = "macos")]
-    fn rms_norm_shader_compiles_on_the_local_metal_device() {
-        if let Ok(width) = validate_metal_kernel(
-            RMS_NORM_KERNEL_NAME,
-            MetalDispatchShape::new(1, 8, 16).unwrap(),
-        ) {
-            assert!(width > 0);
-        }
-    }
-
-    #[test]
-    #[cfg(target_os = "macos")]
-    fn ternary_shader_compiles_on_the_local_metal_device() {
-        if let Ok(width) = validate_metal_kernel(
-            TERNARY_LINEAR_KERNEL_NAME,
-            MetalDispatchShape::new(1, 8, 16).unwrap(),
-        ) {
-            assert!(width > 0);
-        }
-    }
-
-    #[test]
-    #[cfg(target_os = "macos")]
     fn identity_kernel_round_trips_fp32_data_when_metal_is_available() {
         let input = [-1.0, 0.0, 0.5, 3.25];
         if let Ok(output) = identity_forward(&input) {
@@ -9743,265 +3486,297 @@ mod tests {
     }
 
     #[test]
-    #[cfg(target_os = "macos")]
-    fn rms_norm_matches_cpu_reference_when_metal_is_available() {
-        let input = [3.0, 4.0, 0.0, 2.0, -2.0, 1.0];
-        if let Ok(output) = rms_norm_forward(&input, 2, 3) {
-            for (row, actual) in output.chunks_exact(3).enumerate() {
-                let source = &input[row * 3..row * 3 + 3];
-                let inv = (source.iter().map(|x| x * x).sum::<f32>() / 3.0 + 1e-5)
-                    .sqrt()
-                    .recip();
-                for (&value, expected) in actual.iter().zip(source.iter().map(|x| x * inv)) {
-                    assert!((value - expected).abs() < 1e-5);
-                }
-            }
-        }
-    }
-
-    #[test]
-    #[cfg(target_os = "macos")]
-    fn ternary_kernel_matches_cpu_reference_when_metal_is_available() {
-        let shape = TernaryLinearShape::new(2, 3, 2).unwrap();
-        let input = [2.0, 3.0, 5.0, -1.0, 4.0, 2.0];
-        let positive = [0b011001];
-        let negative = [0b000010];
-        let scales = [2.0, 0.5];
-        let expected = ternary_reference(&input, &positive, &negative, &scales, shape).unwrap();
-        if let Ok(actual) = ternary_linear_forward(&input, &positive, &negative, &scales, shape) {
-            for (actual, expected) in actual.iter().zip(expected) {
-                assert!((actual - expected).abs() < 1e-6);
-            }
-        }
-    }
-
-    #[test]
-    #[cfg(target_os = "macos")]
-    fn runtime_reuses_ternary_pipeline_and_buffers_when_metal_is_available() {
-        let shape = TernaryLinearShape::new(2, 3, 2).unwrap();
-        let input = [2.0, 3.0, 5.0, -1.0, 4.0, 2.0];
-        let positive = [0b011001];
-        let negative = [0b000010];
-        let scales = [2.0, 0.5];
-        let expected = ternary_reference(&input, &positive, &negative, &scales, shape).unwrap();
-        if let Ok(runtime) = MetalRuntime::new() {
-            let first = runtime
-                .ternary_linear_forward(&input, &positive, &negative, &scales, shape)
-                .unwrap();
-            let second = runtime
-                .ternary_linear_forward(&input, &positive, &negative, &scales, shape)
-                .unwrap();
-            assert_eq!(first, expected);
-            assert_eq!(second, expected);
-        }
-    }
-
-    #[test]
-    #[cfg(target_os = "macos")]
-    fn fused_runtime_matches_cpu_reference_when_metal_is_available() {
-        let shape = TernaryLinearShape::new(2, 3, 2).unwrap();
-        let input = [3.0, 4.0, 0.0, -1.0, 4.0, 2.0];
-        let positive = [0b011001];
-        let negative = [0b000010];
-        let scales = [2.0, 0.5];
-        let expected =
-            rms_norm_ternary_reference(&input, &positive, &negative, &scales, shape).unwrap();
-        if let Ok(runtime) = MetalRuntime::new() {
-            let actual = runtime
-                .rms_norm_ternary_linear_forward(&input, &positive, &negative, &scales, shape)
-                .unwrap();
-            for (actual, expected) in actual.iter().zip(expected) {
-                assert!((actual - expected).abs() < 1e-5);
-            }
-        }
-    }
-
-    #[test]
-    #[cfg(target_os = "macos")]
-    fn cached_fft_round_trips_complex_data_when_metal_is_available() {
-        let input = [(1.0, 0.0), (2.0, -1.0), (0.5, 3.0), (-2.0, 0.25)];
-        if let Ok(runtime) = MetalRuntime::new() {
-            let spectrum = runtime.fft_reference(&input, 1, false).unwrap();
-            let output = runtime.fft_reference(&spectrum, 1, true).unwrap();
-            for (actual, expected) in output.iter().zip(input) {
-                assert!((actual.0 - expected.0).abs() < 1e-5);
-                assert!((actual.1 - expected.1).abs() < 1e-5);
-            }
-        }
-    }
-
-    #[test]
-    #[cfg(target_os = "macos")]
-    fn cached_fft_matches_known_forward_spectrum_when_metal_is_available() {
-        let input = [(1.0, 0.0), (2.0, 0.0), (0.0, 0.0), (0.0, 0.0)];
-        let expected = [(3.0, 0.0), (1.0, -2.0), (-1.0, 0.0), (1.0, 2.0)];
-        if let Ok(runtime) = MetalRuntime::new() {
-            let actual = runtime.fft_reference(&input, 1, false).unwrap();
-            for (actual, expected) in actual.iter().zip(expected) {
-                assert!((actual.0 - expected.0).abs() < 1e-5);
-                assert!((actual.1 - expected.1).abs() < 1e-5);
-            }
-        }
-    }
-
-    #[test]
-    #[cfg(target_os = "macos")]
-    fn causal_hyena_chain_matches_cpu_reference_when_metal_is_available() {
-        let input = [0.5, -1.0, 1.5, 2.0, -0.5, 3.0, 4.0, -2.0];
-        let filter = [0.5, 0.25, -0.5, 0.0, 1.0, -1.0, 0.5, 0.0];
-        let expected = crate::hyena::causal_chunked_conv(
-            &input,
-            &filter,
-            1,
-            4,
-            2,
-            HyenaChunkPlan::new(4, 4).unwrap(),
+    fn layer_norm_matches_cpu_affine_reference() {
+        let Some(runtime) = runtime() else {
+            return;
+        };
+        let ln = LayerNorm::from_bits(
+            fp16_bits(&[1.25, 0.75, 1.0, 0.5]),
+            fp16_bits(&[0.1, -0.2, 0.0, 0.05]),
         )
         .unwrap();
-        if let Ok(runtime) = MetalRuntime::new() {
-            let actual = runtime
-                .causal_long_conv_forward(&input, &filter, 1, 4, 2)
-                .unwrap();
-            for (actual, expected) in actual.iter().zip(expected) {
-                assert!((actual - expected).abs() < 1e-4, "{actual} != {expected}");
-            }
-        }
+        let x = [1.0_f32, 2.0, 3.0, 4.0, 0.5, -1.0, 0.0, 2.5];
+        let cpu = ln.forward(&x, 2).unwrap();
+        let gpu = runtime
+            .layer_norm(&x, &[1.25, 0.75, 1.0, 0.5], &[0.1, -0.2, 0.0, 0.05], 2, 4)
+            .unwrap();
+        assert_close(&gpu, &cpu, 2e-3);
     }
 
     #[test]
-    #[cfg(target_os = "macos")]
-    fn implicit_filter_matches_cpu_reference_when_metal_is_available() {
-        let filter = crate::hyena::ImplicitFilter::new(2, 3, 7);
-        let expected = filter.generate(2, 4).unwrap();
-        if let Ok(runtime) = MetalRuntime::new() {
-            let actual = runtime.implicit_filter_forward(&filter, 2, 4).unwrap();
-            for (actual, expected) in actual.iter().zip(expected) {
-                assert!((actual - expected).abs() < 1e-5, "{actual} != {expected}");
-            }
-        }
+    fn layer_norm_backward_matches_cpu() {
+        let Some(runtime) = runtime() else {
+            return;
+        };
+        let x = [1.0_f32, 2.0, 0.0, -1.0, 4.0, 1.0, -2.0, 0.5];
+        let gy = [0.2_f32, -0.1, 0.3, 0.0, -0.4, 0.15, 0.05, -0.2];
+        let weight = [1.0_f32, 0.5, 1.5, 0.75];
+        let cpu = cpu_layer_norm_backward(&x, &gy, &weight, 2, 4);
+        let gpu = runtime.layer_norm_backward(&x, &gy, &weight, 2, 4).unwrap();
+        assert_close(&gpu.input_gradient, &cpu.input_gradient, 3e-3);
+        assert_close(&gpu.weight_gradient, &cpu.weight_gradient, 3e-3);
+        assert_close(&gpu.bias_gradient, &cpu.bias_gradient, 3e-3);
     }
 
     #[test]
-    #[cfg(target_os = "macos")]
-    fn implicit_hyena_chain_matches_cpu_reference_when_metal_is_available() {
-        let filter = crate::hyena::ImplicitFilter::new(2, 3, 7);
-        let input = [0.5, -1.0, 1.5, 2.0, -0.5, 3.0, 4.0, -2.0];
-        let expected = crate::hyena::causal_chunked_conv_implicit_strided(
-            &input,
-            &filter,
-            1,
-            4,
-            2,
-            2,
-            0,
-            HyenaChunkPlan::new(4, 4).unwrap(),
-        )
-        .unwrap();
-        if let Ok(runtime) = MetalRuntime::new() {
-            let actual = runtime
-                .causal_long_conv_implicit_forward(&input, &filter, 1, 4, 2)
-                .unwrap();
-            for (actual, expected) in actual.iter().zip(expected) {
-                assert!((actual - expected).abs() < 1e-4, "{actual} != {expected}");
-            }
-        }
+    fn binary_linear_matches_packed_cpu_forward_and_ste() {
+        let Some(runtime) = runtime() else {
+            return;
+        };
+        let signs = [1_i8, -1, -1, 1, 1, 1];
+        let linear = PackedBinaryLinear::from_signs(2, 3, &signs, 0.5, true).unwrap();
+        let x = [0.5_f32, -1.0, 2.0, 1.0, 0.0, -0.5];
+        let cpu = linear.forward(&x, 2).unwrap();
+        let bits = pack_plus_bits(signs.iter().map(|&s| s >= 0), 6);
+        let shape = LinearDispatchShape::new(2, 3, 2).unwrap();
+        let gpu = runtime
+            .binary_linear(&x, &bits, &[0.5, 0.5], Some(&[0.0, 0.0]), shape)
+            .unwrap();
+        assert_close(&gpu, &cpu, 2e-3);
+
+        let gy = [1.0_f32, -0.5, 0.25, 0.75];
+        let mut g_w = [0.0_f32; 6];
+        let mut g_x = [0.0_f32; 6];
+        let mut g_scale = [0.0_f32; 2];
+        let mut g_bias = [0.0_f32; 2];
+        linear
+            .backward_ste(
+                &x,
+                &gy,
+                2,
+                &mut g_w,
+                Some(&mut g_x),
+                &mut g_scale,
+                Some(&mut g_bias),
+            )
+            .unwrap();
+        let gpu_bwd = runtime
+            .binary_linear_backward(&x, &gy, &bits, &[0.5, 0.5], true, shape)
+            .unwrap();
+        assert_close(&gpu_bwd.input_gradient, &g_x, 2e-3);
+        assert_close(&gpu_bwd.scale_gradient, &g_scale, 2e-3);
+        assert_close(gpu_bwd.bias_gradient.as_ref().unwrap(), &g_bias, 2e-3);
+        assert_close(&gpu_bwd.weight_gradient, &g_w, 2e-3);
     }
 
     #[test]
-    #[cfg(target_os = "macos")]
-    fn chunked_implicit_hyena_chain_matches_cpu_across_boundaries_when_available() {
-        let filter = crate::hyena::ImplicitFilter::new(2, 3, 7);
-        let plan = HyenaChunkPlan::new(4, 3).unwrap();
-        let input = [
-            0.5, -1.0, 1.5, 2.0, -0.5, 3.0, 4.0, -2.0, 1.25, 0.75, -3.0, 2.5, 0.0, -1.5,
+    fn binary_linear_latent_sgd_matches_cpu_updater() {
+        let Some(runtime) = runtime() else {
+            return;
+        };
+        let mut linear = PackedBinaryLinear::from_signs(1, 2, &[1, -1], 0.5, false).unwrap();
+        let x = [1.0_f32, 2.0];
+        let gy = [1.0_f32];
+        let mut g_w = [0.0_f32; 2];
+        let mut g_scale = [0.0_f32; 1];
+        linear
+            .backward_ste(&x, &gy, 1, &mut g_w, None, &mut g_scale, None)
+            .unwrap();
+        linear.apply_clipped_sgd(&g_w, &[0.0], None, 0.1).unwrap();
+        let shape = LinearDispatchShape::new(1, 2, 1).unwrap();
+        let latent = [
+            Fp16::from_f32(0.5).to_bits(),
+            Fp16::from_f32(-0.5).to_bits(),
         ];
-        let expected = crate::hyena::causal_chunked_conv_implicit_strided(
-            &input, &filter, 1, 7, 2, 2, 0, plan,
-        )
-        .unwrap();
-        if let Ok(runtime) = MetalRuntime::new() {
-            let actual = runtime
-                .causal_chunked_conv_implicit_strided_forward(&input, &filter, 1, 7, 2, 2, 0, plan)
-                .unwrap();
-            for (actual, expected) in actual.iter().zip(expected) {
-                assert!((actual - expected).abs() < 2e-4, "{actual} != {expected}");
-            }
-        }
+        let (next, bits, gpu_gw) = runtime
+            .binary_linear_latent_sgd(&latent, &x, &gy, &[0.5], 0.1, shape)
+            .unwrap();
+        assert_close(&gpu_gw, &g_w, 2e-4);
+        assert_eq!(next[0], Fp16::from_f32(linear.latent().get(0)).to_bits());
+        assert_eq!(next[1], Fp16::from_f32(linear.latent().get(1)).to_bits());
+        assert_eq!(bits[0] & 1, u32::from(linear.sign_at(0) > 0.0));
+        assert_eq!((bits[0] >> 1) & 1, u32::from(linear.sign_at(1) > 0.0));
     }
 
     #[test]
-    #[cfg(target_os = "macos")]
-    fn tanh_gate_keeps_signal_and_transforms_gate_when_metal_is_available() {
-        let input = [1.0, -2.0, 0.0, 1.0, 3.0, -0.5, -1.0, 2.0];
-        if let Ok(runtime) = MetalRuntime::new() {
-            let actual = runtime.tanh_gate_forward(&input, 2, 2).unwrap();
-            for row in 0..2 {
-                assert_eq!(&actual[row * 4..row * 4 + 2], &input[row * 4..row * 4 + 2]);
-                for column in 0..2 {
-                    let index = row * 4 + 2 + column;
-                    assert!((actual[index] - input[index].tanh()).abs() < 1e-6);
+    fn fp16_linear_matches_cpu_forward_and_backward() {
+        let Some(runtime) = runtime() else {
+            return;
+        };
+        let weight = [1.0_f32, -0.5, 0.25, 2.0, 0.0, -1.0];
+        let linear = Fp16Linear::from_f32(2, 3, &weight).unwrap();
+        let x = [0.5_f32, 1.0, -1.0, 2.0, 0.0, 0.25];
+        let cpu = linear.forward(&x, 2).unwrap();
+        let shape = LinearDispatchShape::new(2, 3, 2).unwrap();
+        let gpu = runtime.fp16_linear(&x, &weight, shape).unwrap();
+        assert_close(&gpu, &cpu, 2e-3);
+
+        let gy = [1.0_f32, -1.0, 0.5, 0.25];
+        let mut gx = vec![0.0; 6];
+        let mut gw = vec![0.0; 6];
+        for row in 0..2 {
+            for o in 0..2 {
+                for i in 0..3 {
+                    let w = Fp16::from_f32(weight[o * 3 + i]).to_f32();
+                    gx[row * 3 + i] += gy[row * 2 + o] * w;
+                    gw[o * 3 + i] += gy[row * 2 + o] * x[row * 3 + i];
                 }
             }
         }
+        let gpu_bwd = runtime
+            .fp16_linear_backward(&x, &gy, &weight, shape)
+            .unwrap();
+        assert_close(&gpu_bwd.input_gradient, &gx, 3e-3);
+        assert_close(&gpu_bwd.weight_gradient, &gw, 3e-3);
     }
 
     #[test]
-    #[cfg(target_os = "macos")]
-    fn resident_fp16_gate_matches_quantized_contract_when_metal_is_available() {
-        let values =
-            crate::precision::Fp16Storage::from_f32([1.0, -2.0, 0.5, -1.5, -0.25, 0.75, 2.0, -3.0]);
-        let Ok(runtime) = MetalRuntime::new() else {
+    fn tiled_linears_match_cpu_past_tile_boundary() {
+        let Some(runtime) = runtime() else {
             return;
         };
-        runtime.reserve_fp16_activations(2, 4).unwrap();
-        let slot = runtime
-            .upload_resident_fp16_activations(&values, 2, 4)
-            .unwrap();
-        let slot = runtime.resident_tanh_gate_fp16(slot, 2, 2).unwrap();
-        let actual = runtime
-            .download_resident_fp16_activations(slot, 2, 4)
-            .unwrap();
-        for row in 0..2 {
-            for channel in 0..2 {
-                assert_eq!(actual.get(row * 4 + channel), values.get(row * 4 + channel));
-                let gate = values.get(row * 4 + 2 + channel).tanh();
-                assert_eq!(
-                    actual.get(row * 4 + 2 + channel),
-                    crate::precision::Fp16::from_f32(gate).to_f32()
-                );
+        let rows = 17;
+        let inn = 19;
+        let out = 18;
+        let mut signs = Vec::with_capacity(out * inn);
+        let mut weight = Vec::with_capacity(out * inn);
+        let mut x = Vec::with_capacity(rows * inn);
+        let mut gy = Vec::with_capacity(rows * out);
+        for o in 0..out {
+            for i in 0..inn {
+                signs.push(if (o + i) % 2 == 0 { 1_i8 } else { -1 });
+                weight.push(((o * 3 + i) % 7) as f32 * 0.25 - 0.5);
             }
         }
+        for row in 0..rows {
+            for i in 0..inn {
+                x.push(((row * 5 + i) % 11) as f32 * 0.125 - 0.5);
+            }
+            for o in 0..out {
+                gy.push(((row + o) % 5) as f32 * 0.2 - 0.4);
+            }
+        }
+        let linear = PackedBinaryLinear::from_signs(out, inn, &signs, 0.5, true).unwrap();
+        let cpu = linear.forward(&x, rows).unwrap();
+        let bits = pack_plus_bits(signs.iter().map(|&s| s >= 0), out * inn);
+        let shape = LinearDispatchShape::new(rows, inn, out).unwrap();
+        let gpu = runtime
+            .binary_linear(&x, &bits, &[0.5; 18], Some(&[0.0; 18]), shape)
+            .unwrap();
+        assert_close(&gpu, &cpu, 3e-3);
+        let mut g_w = vec![0.0; out * inn];
+        let mut g_x = vec![0.0; rows * inn];
+        let mut g_scale = vec![0.0; out];
+        let mut g_bias = vec![0.0; out];
+        linear
+            .backward_ste(
+                &x,
+                &gy,
+                rows,
+                &mut g_w,
+                Some(&mut g_x),
+                &mut g_scale,
+                Some(&mut g_bias),
+            )
+            .unwrap();
+        let gpu_bwd = runtime
+            .binary_linear_backward(&x, &gy, &bits, &[0.5; 18], true, shape)
+            .unwrap();
+        assert_close(&gpu_bwd.input_gradient, &g_x, 4e-3);
+        assert_close(&gpu_bwd.scale_gradient, &g_scale, 4e-3);
+        assert_close(gpu_bwd.bias_gradient.as_ref().unwrap(), &g_bias, 4e-3);
+        assert_close(&gpu_bwd.weight_gradient, &g_w, 4e-3);
+
+        let fp = Fp16Linear::from_f32(out, inn, &weight).unwrap();
+        let cpu_y = fp.forward(&x, rows).unwrap();
+        let gpu_y = runtime.fp16_linear(&x, &weight, shape).unwrap();
+        assert_close(&gpu_y, &cpu_y, 3e-3);
+        let (cpu_gx, cpu_gw) = fp.backward(&x, &gy, rows).unwrap();
+        let gpu_fp = runtime
+            .fp16_linear_backward(&x, &gy, &weight, shape)
+            .unwrap();
+        assert_close(&gpu_fp.input_gradient, &cpu_gx, 4e-3);
+        assert_close(&gpu_fp.weight_gradient, &cpu_gw, 4e-3);
     }
 
     #[test]
-    #[cfg(target_os = "macos")]
-    fn resident_fp16_apply_gate_and_residual_stay_on_slots_when_metal_is_available() {
-        let values = crate::precision::Fp16Storage::from_f32([1.0, 2.0, 0.5, -1.0]);
-        let Ok(runtime) = MetalRuntime::new() else {
+    fn time_shift_relu2_residual_and_sign_pack_match_cpu() {
+        let Some(runtime) = runtime() else {
             return;
         };
-        runtime.reserve_fp16_activations(1, 4).unwrap();
-        let residual = runtime
-            .upload_resident_fp16_activations(&values, 1, 4)
-            .unwrap();
-        let gated = runtime.resident_tanh_gate_fp16(residual, 1, 2).unwrap();
-        runtime
-            .resident_apply_gate_fp16(residual, gated, ResidentFp16ActivationSlot::Third, 1, 2)
-            .unwrap();
-        runtime
-            .resident_residual_add_fp16(residual, ResidentFp16ActivationSlot::Third, residual, 1, 2)
-            .unwrap();
-        let actual = runtime
-            .download_resident_fp16_activations(residual, 1, 2)
-            .unwrap();
-        for channel in 0..2 {
-            let mixed = values.get(channel);
-            let gate = crate::precision::Fp16::from_f32(values.get(2 + channel).tanh()).to_f32();
-            let update = crate::precision::Fp16::from_f32(mixed * gate).to_f32();
-            assert_eq!(
-                actual.get(channel),
-                crate::precision::Fp16::from_f32(mixed + update).to_f32()
-            );
+        let x = [1.0_f32, -2.0, 0.5, 0.0, 3.0, -0.25];
+        let gpu_xx = runtime.time_shift_delta(&x, 3, 3, 2).unwrap();
+        assert_close(&gpu_xx, &cpu_time_shift(&x, 3, 2), 1e-6);
+
+        let relu = runtime.cmix_relu2(&x).unwrap();
+        let cpu_relu: Vec<f32> = x.iter().map(|v| v.max(0.0) * v.max(0.0)).collect();
+        assert_close(&relu, &cpu_relu, 1e-6);
+        let gy = [1.0_f32, 1.0, 1.0, 1.0, 1.0, 1.0];
+        let gx = runtime.cmix_relu2_backward(&x, &gy).unwrap();
+        let cpu_gx: Vec<f32> = x
+            .iter()
+            .zip(&gy)
+            .map(|(v, g)| if *v > 0.0 { 2.0 * v * g } else { 0.0 })
+            .collect();
+        assert_close(&gx, &cpu_gx, 1e-6);
+
+        let residual = runtime.residual_add(&x, &[0.5; 6]).unwrap();
+        let cpu_res: Vec<f32> = x.iter().map(|v| v + 0.5).collect();
+        assert_close(&residual, &cpu_res, 1e-6);
+
+        let bits = runtime.sign_pack_bits(&x).unwrap();
+        let expected = pack_plus_bits(x.iter().map(|v| *v > 0.0), x.len());
+        assert_eq!(bits, expected);
+    }
+
+    #[test]
+    fn clipped_sgd_fp16_matches_cpu_ulp_floor() {
+        let Some(runtime) = runtime() else {
+            return;
+        };
+        let mut cpu = Fp16Storage::from_f32([0.25, -1.0, 2.0]);
+        let gradient = [0.001_f32, 0.5, -0.25];
+        for (index, g) in gradient.iter().enumerate() {
+            cpu.apply_clipped_sgd(index, *g, 0.01);
         }
+        let original = fp16_bits(&[0.25, -1.0, 2.0]);
+        let gpu = runtime
+            .clipped_sgd_fp16(&original, &gradient, 0.01)
+            .unwrap();
+        assert_eq!(gpu, cpu.as_bits());
+        let _ = gpu;
+    }
+
+    #[test]
+    fn streamed_cross_entropy_matches_cpu_oracle_without_materializing_on_gpu() {
+        let Some(runtime) = runtime() else {
+            return;
+        };
+        let signs = [1_i8, -1, 1, -1, -1, 1, 1, 1];
+        let linear = PackedBinaryLinear::from_signs(4, 2, &signs, 0.5, false).unwrap();
+        let hidden = [0.5_f32, -0.25, 1.0, 0.0, -0.5, 0.75];
+        let tokens = [1_u32, 3, 0];
+        let cpu = cpu_streamed_ce(&hidden, &linear, &tokens, 3, 1);
+        let bits = pack_plus_bits(signs.iter().map(|&s| s >= 0), 8);
+        let gpu = runtime
+            .streamed_cross_entropy_fp16(&hidden, &bits, &[0.5; 4], &tokens, 3, 3, 2, 4, 1)
+            .unwrap();
+        assert!((gpu.mean_loss - cpu.mean_loss).abs() < 3e-3);
+        assert_close(&gpu.hidden_gradient, &cpu.hidden_gradient, 5e-3);
+        assert_close(&gpu.scale_gradient, &cpu.scale_gradient, 5e-3);
+        assert_close(&gpu.logit_gradient, &cpu.logit_gradient, 5e-3);
+        assert_eq!(gpu.row_loss[2], 0.0);
+
+        let fused = runtime
+            .packed_head_train(&hidden, &bits, &[0.5; 4], &tokens, 3, 3, 2, 4, 1)
+            .unwrap();
+        assert!((fused.mean_loss - cpu.mean_loss).abs() < 3e-3);
+        assert_close(&fused.hidden_gradient, &cpu.hidden_gradient, 5e-3);
+        assert_close(&fused.scale_gradient, &cpu.scale_gradient, 5e-3);
+        let mut g_w = vec![0.0; 8];
+        let mut g_x = vec![0.0; 6];
+        let mut g_scale = vec![0.0; 4];
+        linear
+            .backward_ste(
+                &hidden,
+                &cpu.logit_gradient,
+                3,
+                &mut g_w,
+                Some(&mut g_x),
+                &mut g_scale,
+                None,
+            )
+            .unwrap();
+        assert_close(&fused.weight_gradient, &g_w, 5e-3);
     }
 }

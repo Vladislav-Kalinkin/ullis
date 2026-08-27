@@ -1,39 +1,46 @@
 ULLIS(1)                         User Commands                        ULLIS(1)
 
 NAME
-       ullis - train compact ternary Hyena language models on Apple Silicon
+       ullis - train RWKV-8 Heron / ROSA language models on Apple Silicon
 
 SYNOPSIS
+       ullis --smoke
        ullis train --data DATASET --run DIRECTORY [OPTIONS]
        ullis tokenize --data INPUT --output OUTPUT
        ullis inspect --run DIRECTORY
        ullis generate --checkpoint CHECKPOINT --prompt TEXT [--max-tokens N]
        ullis chat --checkpoint CHECKPOINT [--session FILE] [--thinking LEVEL]
+       ullis eval-digits --checkpoint CHECKPOINT --task reverse|plusminus [--max-digits N]
 
 DESCRIPTION
-       Metal is the default and intended Ullis training backend. It requires macOS on Apple Silicon. CPU is available only with --backend cpu and is for numerical checks.
+       Metal is the default training backend and requires macOS on Apple Silicon. CPU is --backend cpu (numerical checks and hybrid digit eval).
 
-       A training directory contains config.json (effective configuration), tokenizer.json (BPE trained from the input corpus), metrics.jsonl (append-only progress), and checkpoint.json (FP16-bit-exact model snapshot). Progress reports raw window loss and an EMA; use the EMA to judge a trend across different windows.
+       Default architecture is heron (ROSA-QKV-1bit + CMix x070). 1-bit names the ROSA alphabet, not the weights: unmatched and matched-0 map to -e, matched-1 to +e. There is no 4-bit profile in 0.10.
+
+       A training directory contains config.json, tokenizer.json, metrics.jsonl, and checkpoint.json (format_version 2: packed bits, scales, bias, FP16 tensors that are officially float; no BinaryConnect latents). Hyena v1 checkpoints cannot be resumed.
+
+       Progress reports raw next-token loss and an EMA. Default train uses stop_grad_bits (frozen QKV) and stateless clipped SGD. Admission budget is 4 GiB; do not set --memory-budget-mib 8192 on an 8 GiB Mac.
 
 TRAIN
-       ullis train --data dataset.jsonl --run runs/first --steps 1000
+       ullis train --data dataset.jsonl --run runs/first --config train_config.json --steps 1000
 
-       --config FILE             Optional TOML TrainConfig. Legacy JSON is accepted.
+       --config FILE             JSON or TOML TrainConfig. The repo default is train_config.json (not config.toml).
+       --architecture heron|rosa-rwkv7
+                                 Default heron. rosa-rwkv7 train is not wired; use it for eval-digits / generate.
        --d-model N               Override model width.
-       --layers N                Override number of Hyena blocks.
-       --context-len N           Override training context; never silently capped.
+       --layers N                Override number of Heron (or hybrid) blocks.
+       --context-len N           Override training context; never silently capped. Hybrid requires a multiple of 16 (not 129).
        --batch-size N            Override batch size.
-       --filter-order N          Override implicit-filter order.
-       --hyena-kernel-len N      Override causal receptive field.
-       --hyena-chunk-len N       Override overlap-save FFT chunk.
-       --vocab-size N            BPE vocabulary ceiling.
+       --vocab-size N            BPE vocabulary ceiling (heron: at least 260).
        --seed N                  Override initialization/BPE seed.
-       --memory-budget-mib N     Override hard allocation budget.
-       --resume CHECKPOINT       Restore checkpoint.json and matching tokenizer.
+       --memory-budget-mib N     Override hard allocation budget. Default profile is 4096 MiB.
+       --optimizer stateless-sgd|lion-fp16
+                                 Default stateless-sgd. lion-fp16 is optional on FP16 tensors.
+       --resume CHECKPOINT       Restore v2 checkpoint.json and matching tokenizer.json. v1 is a hard error. Overrides cannot change architecture/shapes.
        --steps N                 New optimization steps. Default: 1.
        --learning-rate RATE      Positive stateless-SGD rate. Default: 1e-3.
        --checkpoint-every N      Save every N steps and at completion. Default: 100.
-       --backend metal|cpu       Default: metal. CPU is a reference fallback.
+       --backend metal|cpu       Default: metal.
 
 TOKENIZE
        ullis tokenize --data raw.jsonl --output normalized.jsonl
@@ -43,15 +50,22 @@ TOKENIZE
 INSPECT
        ullis inspect --run runs/first
 
+       Prints architecture, param split, checkpoint version, and generate-time SAM / time-shift sizes.
+
 GENERATE
        ullis generate --checkpoint runs/first/checkpoint.json --prompt 'Hello' --max-tokens 64
 
-       Loads tokenizer.json next to the checkpoint and performs greedy t+1 decoding. It is a correctness-oriented decoder, not a sampling server.
+       Loads tokenizer.json next to the checkpoint. Greedy t+1 decode with the same RosaSam::push used in train (incremental, not full recompute). Correctness decoder, not a sampling server.
 
 CHAT
        ullis chat --checkpoint runs/first/checkpoint.json --session sessions/first.jsonl --thinking high
 
-       Starts a line-oriented interactive loop. Commands: /think low|medium|high|xhigh|off, /save, /quit. User and assistant records are written as JSONL. Thinking level is prompt policy metadata; it does not yet impose a separate inference-time compute budget.
+       Line-oriented loop. Commands: /think low|medium|high|xhigh|off, /save, /quit. User and assistant records are JSONL. Thinking level is prompt policy metadata; it does not impose a separate inference-time compute budget.
+
+EVAL-DIGITS
+       ullis eval-digits --checkpoint FILE --task reverse|plusminus [--max-digits 8]
+
+       Requires a rosa_rwkv7 checkpoint. reverse: V=12 {0-9, ',', '#'}, pad '#' to T_wkv=144 (or 272). plusminus: V=13 {0-9, '+', '-', '='}, pad '=' to 144. Accuracy is the unpadded span (p1/p2), not the WKV pad tail. Not a 90% release gate.
 
 DATA FORMAT
        One JSON object per line:
@@ -61,8 +75,9 @@ DATA FORMAT
        Allowed roles: system, user, assistant, tool. Every assistant message requires a non-empty thinking field. Tool messages require tool_call_id. Optional assistant tool_calls have {id, name, arguments}; this reserves the future agent-trace schema but does not execute tools.
 
 FILES
-       examples/first-train.jsonl  Minimal wiring dataset, not a useful corpus.
+       train_config.json           Default M1 8 GiB Heron profile (D=256, L=6, T=2048, 4 GiB budget).
+       data/ullis_dataset.jsonl    Example JSONL corpus.
 
 EXIT STATUS
        0      Command completed successfully.
-       non-0  Invalid dataset/configuration, unavailable Metal device, or I/O failure.
+       non-0  Invalid dataset/configuration, v1 checkpoint, unavailable Metal device, or I/O failure.

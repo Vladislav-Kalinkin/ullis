@@ -1,17 +1,16 @@
 use anyhow::{Context, Result, bail};
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use serde::{Deserialize, Serialize};
+use std::fmt::Display;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::time::Instant;
-use ullis::{
-    ModelCheckpoint, MtpBatcher, OptimizerKind, TrainConfig, UllisHyena,
-    tokenizer::{BpeTokenizer, DEFAULT_VOCAB, train_bpe},
-};
+use ullis::tokenizer::{BpeTokenizer, DEFAULT_VOCAB, MIN_VOCAB, train_bpe};
+use ullis::{Architecture, CausalBatcher, ModelCheckpoint, OptimizerKind, TrainConfig, UllisHeron};
 
 #[derive(Debug, Parser)]
-#[command(name = "ullis", version, about = "Dense ternary Hyena training tools")]
+#[command(name = "ullis", version, about = "RWKV-8 Heron / ROSA training tools")]
 struct Cli {
     #[command(subcommand)]
     command: Option<Command>,
@@ -30,28 +29,18 @@ enum Command {
         config: Option<PathBuf>,
         #[command(flatten)]
         overrides: Box<TrainOverrides>,
-        /// Continue from a previously saved checkpoint instead of initializing.
         #[arg(long)]
         resume: Option<PathBuf>,
         #[arg(long, default_value_t = 1)]
         steps: usize,
         #[arg(long, default_value_t = 1e-3)]
         learning_rate: f32,
-        /// Write a checkpoint after this many steps (and always at the end).
         #[arg(long, default_value_t = 100)]
         checkpoint_every: usize,
-        /// Enable the exact but very expensive implicit-filter backward pass.
-        #[arg(long)]
-        train_filters: bool,
-        /// CPU is a diagnostic fallback. Metal is the normal Ullis trainer.
         #[arg(long, value_enum, default_value_t = Backend::Metal)]
         backend: Backend,
-        /// In-memory corpus budget for training BPE, in MiB. Set 0 for the full corpus.
         #[arg(long, default_value_t = 16)]
         bpe_train_mib: usize,
-        /// Print compact ternary-code learning telemetry every N steps. Set 0 to disable.
-        #[arg(long, default_value_t = 100)]
-        diagnostics_every: usize,
     },
     Tokenize {
         #[arg(long)]
@@ -79,10 +68,20 @@ enum Command {
         #[arg(long, default_value_t = 64)]
         max_tokens: usize,
     },
+    EvalDigits {
+        #[arg(long)]
+        checkpoint: PathBuf,
+        #[arg(long, value_enum)]
+        task: DigitTask,
+        #[arg(long, default_value_t = 8)]
+        max_digits: usize,
+    },
 }
 
 #[derive(Clone, Debug, Args, Default)]
 struct TrainOverrides {
+    #[arg(long, value_enum)]
+    architecture: Option<ArchitectureArg>,
     #[arg(long)]
     d_model: Option<usize>,
     #[arg(long = "layers")]
@@ -92,18 +91,25 @@ struct TrainOverrides {
     #[arg(long)]
     batch_size: Option<usize>,
     #[arg(long)]
-    filter_order: Option<usize>,
-    #[arg(long)]
-    hyena_kernel_len: Option<usize>,
-    #[arg(long)]
-    hyena_chunk_len: Option<usize>,
-    /// Upper bound for corpus-trained BPE vocabulary.
-    #[arg(long)]
     vocab_size: Option<usize>,
     #[arg(long)]
     seed: Option<u64>,
     #[arg(long)]
     memory_budget_mib: Option<usize>,
+    #[arg(long, value_enum)]
+    optimizer: Option<OptimizerArg>,
+}
+
+#[derive(Clone, Copy, Debug, ValueEnum)]
+enum ArchitectureArg {
+    Heron,
+    RosaRwkv7,
+}
+
+#[derive(Clone, Copy, Debug, ValueEnum)]
+enum OptimizerArg {
+    StatelessSgd,
+    LionFp16,
 }
 
 #[derive(Clone, Copy, Debug, ValueEnum, Serialize, Deserialize)]
@@ -120,6 +126,12 @@ enum ThinkingLevel {
 enum Backend {
     Metal,
     Cpu,
+}
+
+#[derive(Clone, Copy, Debug, ValueEnum)]
+enum DigitTask {
+    Reverse,
+    Plusminus,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -142,32 +154,11 @@ struct DatasetMessage {
     tool_call_id: Option<String>,
 }
 
-#[derive(Clone, Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 struct ToolCall {
     id: String,
     name: String,
     arguments: serde_json::Value,
-}
-
-#[derive(Serialize)]
-struct TrainMetric {
-    step: usize,
-    tokens: usize,
-    batch_tokens: usize,
-    supervised_tokens: usize,
-    step_millis: f64,
-    step_tokens_per_second: f64,
-    tokens_per_second: f64,
-    loss: f32,
-    loss_ema: f32,
-    loss_delta: f32,
-    mtp_next: f32,
-    mtp_second: f32,
-    learning_rate: f32,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    ternary_active_fraction: Option<f64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    ternary_code_changes: Option<usize>,
 }
 
 fn validate_record(record: &DatasetRecord) -> Result<()> {
@@ -217,49 +208,77 @@ fn load_dataset(path: &Path) -> Result<Vec<DatasetRecord>> {
         .collect()
 }
 
-fn training_text(record: &DatasetRecord) -> String {
-    record
-        .messages
-        .iter()
-        .map(|message| {
-            let thinking = message
-                .thinking
-                .as_deref()
-                .map(|value| format!("<thinking>{value}</thinking>"))
-                .unwrap_or_default();
-            format!("<{}>{thinking}{}", message.role, message.content)
-        })
-        .collect::<Vec<_>>()
-        .join("\n")
+fn log_status(message: impl Display) {
+    eprintln!("ullis: {message}");
+    let _ = io::stderr().flush();
 }
 
-/// Selects evenly distributed complete records for BPE training in memory.
-/// Encoding still always uses the full just-validated corpus; this only bounds
-/// the expensive merge-discovery phase and never persists derived data.
-fn representative_bpe_texts(texts: &[String], byte_budget: usize) -> Vec<String> {
-    let total_bytes = texts.iter().map(String::len).sum::<usize>();
-    if byte_budget == 0 || total_bytes <= byte_budget {
+/// Stream JSONL into training strings, stopping once `max_bytes` of text is in hand.
+fn load_training_texts(path: &Path, max_bytes: usize) -> Result<(Vec<String>, usize, usize)> {
+    let file = File::open(path).with_context(|| format!("open dataset {}", path.display()))?;
+    let mut texts = Vec::new();
+    let mut records = 0_usize;
+    let mut text_bytes = 0_usize;
+    for (index, line) in BufReader::new(file).lines().enumerate() {
+        let line = line.with_context(|| format!("read dataset line {}", index + 1))?;
+        if line.trim().is_empty() {
+            continue;
+        }
+        let record: DatasetRecord = serde_json::from_str(&line)
+            .with_context(|| format!("parse dataset line {}", index + 1))?;
+        validate_record(&record).with_context(|| format!("validate dataset line {}", index + 1))?;
+        let text = training_text(&record);
+        text_bytes = text_bytes.saturating_add(text.len());
+        texts.push(text);
+        records += 1;
+        if text_bytes >= max_bytes {
+            break;
+        }
+    }
+    if texts.is_empty() {
+        bail!("dataset {} has no training records", path.display());
+    }
+    Ok((texts, records, text_bytes))
+}
+
+fn cap_texts_bytes(texts: &[String], max_bytes: usize) -> Vec<String> {
+    if max_bytes == usize::MAX {
         return texts.to_vec();
     }
-    let sample_count = texts
-        .len()
-        .saturating_mul(byte_budget)
-        .div_ceil(total_bytes)
-        .clamp(1, texts.len());
-    (0..sample_count)
-        .map(|slot| texts[slot * texts.len() / sample_count].clone())
-        .collect()
+    let mut out = Vec::new();
+    let mut used = 0_usize;
+    for text in texts {
+        if used >= max_bytes && !out.is_empty() {
+            break;
+        }
+        used = used.saturating_add(text.len());
+        out.push(text.clone());
+    }
+    out
+}
+
+fn encode_training_stream(
+    texts: &[String],
+    tokenizer: &mut BpeTokenizer,
+    needed: usize,
+) -> Result<Vec<u32>> {
+    if needed == 0 {
+        bail!("encoded corpus is empty");
+    }
+    let mut corpus = Vec::with_capacity(needed);
+    for text in texts {
+        corpus.extend(tokenizer.encode(text, true, true));
+        if corpus.len() >= needed {
+            corpus.truncate(needed);
+            return Ok(corpus);
+        }
+    }
+    cycle_corpus(&corpus, needed)
 }
 
 fn default_train_config(vocab_size: usize) -> TrainConfig {
     TrainConfig {
-        d_model: 256,
-        n_layers: 6,
         vocab_size,
-        context_len: 2_048,
-        batch_size: 1,
-        hyena_kernel_len: 2_048,
-        hyena_chunk_len: 2_048,
         ..Default::default()
     }
 }
@@ -270,34 +289,111 @@ fn smoke_config(vocab_size: usize) -> TrainConfig {
         n_layers: 1,
         vocab_size,
         context_len: 32,
-        hyena_kernel_len: 32,
-        hyena_chunk_len: 32,
+        dim_ffn: 64,
+        tmix_lora_rank: 8,
         ..Default::default()
     }
 }
 
 fn apply_overrides(cfg: &mut TrainConfig, overrides: &TrainOverrides) -> Result<()> {
-    macro_rules! set {
-        ($field:ident) => {
-            if let Some(value) = overrides.$field {
-                cfg.$field = value;
-            }
+    if let Some(architecture) = overrides.architecture {
+        cfg.architecture = match architecture {
+            ArchitectureArg::Heron => Architecture::Heron,
+            ArchitectureArg::RosaRwkv7 => Architecture::RosaRwkv7,
         };
     }
-    set!(d_model);
-    set!(n_layers);
-    set!(context_len);
-    set!(batch_size);
-    set!(filter_order);
-    set!(hyena_kernel_len);
-    set!(hyena_chunk_len);
-    set!(vocab_size);
-    set!(seed);
+    if let Some(value) = overrides.d_model {
+        cfg.d_model = value;
+        if cfg.dim_ffn == 0 || cfg.dim_ffn == 4 * 256 {
+            cfg.dim_ffn = value.saturating_mul(4);
+        }
+        if overrides.architecture.is_none() {
+            cfg.tmix_lora_rank = if value <= 64 { 8 } else { 16 };
+        }
+    }
+    if let Some(value) = overrides.n_layers {
+        cfg.n_layers = value;
+    }
+    if let Some(value) = overrides.context_len {
+        cfg.context_len = value;
+    }
+    if let Some(value) = overrides.batch_size {
+        cfg.batch_size = value;
+    }
+    if let Some(value) = overrides.vocab_size {
+        cfg.vocab_size = value;
+    }
+    if let Some(value) = overrides.seed {
+        cfg.seed = value;
+    }
     if let Some(mib) = overrides.memory_budget_mib {
         cfg.memory_budget_bytes = mib
             .checked_mul(1024 * 1024)
             .ok_or_else(|| anyhow::anyhow!("memory-budget-mib overflows bytes"))?;
     }
+    match overrides.optimizer {
+        Some(OptimizerArg::LionFp16) => cfg.optimizer = OptimizerKind::LionFp16,
+        Some(OptimizerArg::StatelessSgd) | None => cfg.optimizer = OptimizerKind::StatelessSgd,
+    }
+    Ok(())
+}
+
+fn load_config(path: Option<PathBuf>, overrides: &TrainOverrides) -> Result<TrainConfig> {
+    let mut cfg = match path {
+        Some(path) => {
+            let source = fs::read_to_string(&path)?;
+            toml::from_str(&source)
+                .or_else(|_| serde_json::from_str(&source))
+                .with_context(|| format!("parse TOML or JSON config {}", path.display()))?
+        }
+        None => default_train_config(DEFAULT_VOCAB as usize),
+    };
+    apply_overrides(&mut cfg, overrides)?;
+    Ok(cfg)
+}
+
+fn training_text(record: &DatasetRecord) -> String {
+    let mut out = String::new();
+    for message in &record.messages {
+        match message.role.as_str() {
+            "system" => {
+                out.push_str("<system>");
+                out.push_str(&message.content);
+                out.push_str("</system>");
+            }
+            "user" => {
+                out.push_str("<user>");
+                out.push_str(&message.content);
+                out.push_str("</user>");
+            }
+            "assistant" => {
+                out.push_str("<assistant><thinking>");
+                out.push_str(message.thinking.as_deref().unwrap_or(""));
+                out.push_str("</thinking>");
+                out.push_str(&message.content);
+                out.push_str("</assistant>");
+            }
+            "tool" => {
+                out.push_str("<tool>");
+                out.push_str(&message.content);
+                out.push_str("</tool>");
+            }
+            _ => {}
+        }
+    }
+    out
+}
+
+fn cycle_corpus(ids: &[u32], needed: usize) -> Result<Vec<u32>> {
+    if ids.is_empty() {
+        bail!("encoded corpus is empty");
+    }
+    Ok(ids.iter().copied().cycle().take(needed).collect())
+}
+
+fn write_metrics(path: &Path, row: &serde_json::Value) -> Result<()> {
+    let mut file = OpenOptions::new().create(true).append(true).open(path)?;
+    writeln!(file, "{row}")?;
     Ok(())
 }
 
@@ -310,354 +406,279 @@ fn train(
     steps: usize,
     learning_rate: f32,
     checkpoint_every: usize,
-    train_filters: bool,
     backend: Backend,
     bpe_train_mib: usize,
-    diagnostics_every: usize,
 ) -> Result<()> {
     if steps == 0 || checkpoint_every == 0 || !learning_rate.is_finite() || learning_rate <= 0.0 {
         bail!("steps, checkpoint-every, and learning-rate must be positive");
     }
-    let mut cfg = match config_path {
-        Some(path) => {
-            let source = fs::read_to_string(&path)?;
-            toml::from_str(&source)
-                .or_else(|_| serde_json::from_str(&source))
-                .with_context(|| format!("parse TOML or legacy JSON config {}", path.display()))?
-        }
-        None => default_train_config(DEFAULT_VOCAB as usize),
-    };
-    apply_overrides(&mut cfg, &overrides)?;
-    eprintln!("reading and validating dataset {}…", data.display());
-    let ingest_started = Instant::now();
-    let records = load_dataset(&data)?;
-    if records.is_empty() {
-        bail!("dataset has no records");
-    }
-    let training_texts = records.iter().map(training_text).collect::<Vec<_>>();
-    let json_seconds = ingest_started.elapsed().as_secs_f64();
-    let bpe_started = Instant::now();
-    let bpe_train_bytes = bpe_train_mib
-        .checked_mul(1024 * 1024)
-        .ok_or_else(|| anyhow::anyhow!("bpe-train-mib overflows bytes"))?;
-    let bpe_texts = representative_bpe_texts(&training_texts, bpe_train_bytes);
-    let bpe_sample_bytes = bpe_texts.iter().map(String::len).sum::<usize>();
-    let mut tokenizer = train_bpe(&bpe_texts, cfg.vocab_size as u32, cfg.seed)?;
-    let bpe_seconds = bpe_started.elapsed().as_secs_f64();
-    let tokenize_started = Instant::now();
-    let mut tokens = training_texts
-        .iter()
-        .flat_map(|text| tokenizer.encode(text, true, true))
-        .collect::<Vec<_>>();
-    let tokenize_seconds = tokenize_started.elapsed().as_secs_f64();
-    drop(training_texts);
-    drop(records);
-    cfg.vocab_size = tokenizer.vocab_size() as usize;
-    // The CLI's actual updater is stateless SGD. Keep the persisted memory
-    // ledger truthful even when an imported configuration chose Lion.
-    cfg.optimizer = OptimizerKind::StatelessSgd;
-    cfg.validate()?;
-    let time = cfg.context_len;
-    if tokens.len() < time {
-        tokens.resize(time, tokenizer.eos_id);
-    }
-    fs::create_dir_all(&run)?;
-    fs::write(run.join("config.json"), serde_json::to_vec_pretty(&cfg)?)?;
-    tokenizer.save(run.join("tokenizer.json"))?;
-    let mut metrics = OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(run.join("metrics.jsonl"))?;
-    let estimate = cfg.memory_estimate()?;
-    let planned_peak_mib =
-        estimate.low_memory_training.peak().unwrap_or(usize::MAX) as f64 / 1024.0 / 1024.0;
-    let frozen_filter_spectrum_bytes = if train_filters {
-        0
+    let started_all = Instant::now();
+    log_status(format!(
+        "train start steps={steps} data={} run={} backend={backend:?}",
+        data.display(),
+        run.display()
+    ));
+
+    let cfg_for_budget = if resume.is_some() {
+        None
     } else {
-        let chunk = cfg.hyena_chunk_len.min(cfg.context_len);
-        let kernel = cfg.hyena_kernel_len.min(cfg.context_len);
-        let fft_len = chunk
-            .checked_add(kernel)
-            .and_then(|value| value.checked_sub(1))
-            .and_then(usize::checked_next_power_of_two)
-            .ok_or_else(|| anyhow::anyhow!("frozen filter spectrum FFT length overflows"))?;
-        cfg.n_layers
-            .checked_mul(cfg.d_model)
-            .and_then(|value| value.checked_mul(fft_len))
-            .and_then(|value| value.checked_mul(2 * size_of::<f32>()))
-            .ok_or_else(|| anyhow::anyhow!("frozen filter spectrum memory estimate overflows"))?
+        Some(load_config(config_path.clone(), &overrides)?)
     };
-    let frozen_filter_spectrum_mib = frozen_filter_spectrum_bytes as f64 / 1024.0 / 1024.0;
-    let frozen_backward_spectrum_bytes = if train_filters || cfg.context_len <= cfg.hyena_chunk_len
-    {
-        0
-    } else {
-        let fft_len = cfg
-            .context_len
-            .checked_mul(2)
-            .and_then(usize::checked_next_power_of_two)
-            .ok_or_else(|| anyhow::anyhow!("frozen backward spectrum FFT length overflows"))?;
-        cfg.n_layers
-            .checked_mul(cfg.d_model)
-            .and_then(|value| value.checked_mul(fft_len))
-            .and_then(|value| value.checked_mul(2 * size_of::<f32>()))
-            .ok_or_else(|| anyhow::anyhow!("frozen backward spectrum memory estimate overflows"))?
-    };
-    let frozen_backward_spectrum_mib = frozen_backward_spectrum_bytes as f64 / 1024.0 / 1024.0;
-    let ce_logits_bytes = cfg
-        .context_len
-        .checked_mul(cfg.batch_size)
-        .and_then(|value| value.checked_mul(cfg.vocab_size))
-        .and_then(|value| value.checked_mul(size_of::<f32>()))
-        .ok_or_else(|| anyhow::anyhow!("cross-entropy logits memory estimate overflows"))?;
-    let ce_logits_mib = ce_logits_bytes as f64 / 1024.0 / 1024.0;
-    let terminal_gradient_bytes = cfg
-        .context_len
-        .checked_mul(cfg.batch_size)
-        .and_then(|value| value.checked_mul(cfg.d_model))
-        .and_then(|value| value.checked_mul(size_of::<f32>()))
-        .ok_or_else(|| anyhow::anyhow!("terminal gradient memory estimate overflows"))?;
-    let terminal_gradient_mib = terminal_gradient_bytes as f64 / 1024.0 / 1024.0;
-    let mps_embedding_bytes = cfg
-        .vocab_size
-        .checked_mul(cfg.d_model)
-        .and_then(|value| value.checked_mul(size_of::<f32>()))
-        .ok_or_else(|| anyhow::anyhow!("MPS tied-embedding memory estimate overflows"))?;
-    // MPS retains the FP32 table, one output-gradient matrix, and their
-    // per-step accumulator. These are temporary training workspace, not a
-    // second persistent model, but the resident budget must include all three.
-    let mps_tied_workspace_bytes = mps_embedding_bytes
-        .checked_mul(3)
-        .ok_or_else(|| anyhow::anyhow!("MPS tied workspace memory estimate overflows"))?;
-    let mps_tied_workspace_mib = mps_tied_workspace_bytes as f64 / 1024.0 / 1024.0;
-    println!(
-        "train | backend {backend:?} | d {} | layers {} | context {} | kernel {} | chunk {} | batch {} | vocab {} | corpus {} tok | planned resident peak {:.1} MiB (base {planned_peak_mib:.1} + frozen-filter FFT {frozen_filter_spectrum_mib:.1} + backward FFT {frozen_backward_spectrum_mib:.1} + CE logits {ce_logits_mib:.1} + terminal gradient {terminal_gradient_mib:.1} + MPS tied workspace {mps_tied_workspace_mib:.1}) / {} MiB | ingest {json_seconds:.1}s | bpe {bpe_seconds:.1}s ({:.1} MiB sample) | tokenize {tokenize_seconds:.1}s",
-        cfg.d_model,
-        cfg.n_layers,
-        cfg.context_len,
-        cfg.hyena_kernel_len,
-        cfg.hyena_chunk_len,
-        cfg.batch_size,
-        cfg.vocab_size,
-        tokens.len(),
-        planned_peak_mib
-            + frozen_filter_spectrum_mib
-            + frozen_backward_spectrum_mib
-            + ce_logits_mib
-            + terminal_gradient_mib
-            + mps_tied_workspace_mib,
-        cfg.memory_budget_bytes / (1024 * 1024),
-        bpe_sample_bytes as f64 / 1024.0 / 1024.0,
-    );
-    if cfg.hyena_kernel_len > cfg.hyena_chunk_len {
-        eprintln!(
-            "warning: kernel {} > chunk {}; this is valid overlap-save, but FFT length is {}. For faster 8k-context training, start with --hyena-kernel-len {}.",
-            cfg.hyena_kernel_len,
-            cfg.hyena_chunk_len,
-            (cfg.hyena_kernel_len + cfg.hyena_chunk_len - 1).next_power_of_two(),
-            cfg.hyena_chunk_len,
-        );
-    }
-    let mut model = match resume {
-        Some(path) => {
-            let checkpoint: ModelCheckpoint = serde_json::from_slice(&fs::read(&path)?)
-                .with_context(|| format!("parse checkpoint {}", path.display()))?;
-            let mut model = UllisHyena::from_checkpoint(checkpoint)?;
-            if model.cfg.vocab_size != tokenizer.vocab_size() as usize {
-                bail!("checkpoint vocabulary does not match tokenizer");
-            }
-            let checkpoint_shape = (
-                model.cfg.d_model,
-                model.cfg.n_layers,
-                model.cfg.vocab_size,
-                model.cfg.filter_order,
-            );
-            apply_overrides(&mut model.cfg, &overrides)?;
-            if (
-                model.cfg.d_model,
-                model.cfg.n_layers,
-                model.cfg.vocab_size,
-                model.cfg.filter_order,
-            ) != checkpoint_shape
-            {
-                bail!(
-                    "--resume may change context, batch, Hyena kernel/chunk, memory budget, or seed; d-model, layers, vocab-size, and filter-order are checkpoint shapes"
-                );
-            }
-            model.cfg.optimizer = OptimizerKind::StatelessSgd;
-            model.cfg.validate()?;
-            cfg = model.cfg.clone();
-            model
+    if let Some(cfg) = &cfg_for_budget {
+        cfg.validate()?;
+        if matches!(cfg.architecture, Architecture::RosaRwkv7) {
+            bail!("rosa_rwkv7 train is not wired");
         }
-        None => UllisHyena::new(cfg.clone())?,
-    };
-    let mut batcher = MtpBatcher::from_config(&tokens, &cfg, time)?;
-    let started = Instant::now();
-    let mut loss_ema = None;
-    let mut previous_loss = None;
-    #[cfg(target_os = "macos")]
-    let mut previous_ternary_codes: Option<
-        Vec<ullis::model::MetalResidentTernaryCodeSnapshot>,
-    > = None;
-    #[cfg(target_os = "macos")]
-    let metal_runtime = matches!(backend, Backend::Metal)
-        .then(ullis::metal::MetalRuntime::new)
-        .transpose()?;
-    #[cfg(target_os = "macos")]
-    let metal_state = metal_runtime
+        cfg.optimizer.require_train_step()?;
+    }
+    let context_hint = cfg_for_budget
         .as_ref()
-        .map(|runtime| model.new_metal_resident_training_state(runtime))
-        .transpose()?;
+        .map_or(2048, |cfg| cfg.context_len);
+    let batch_hint = cfg_for_budget.as_ref().map_or(1, |cfg| cfg.batch_size);
+    let needed = steps
+        .saturating_mul(batch_hint)
+        .saturating_mul(context_hint);
+    let bpe_bytes = bpe_train_mib.saturating_mul(1024 * 1024);
+    let text_budget = if bpe_bytes == 0 {
+        usize::MAX
+    } else {
+        bpe_bytes.max(needed)
+    };
+
+    let load_started = Instant::now();
+    log_status(format!(
+        "loading dataset {} (text budget {} bytes, bpe-train-mib={bpe_train_mib})",
+        data.display(),
+        if text_budget == usize::MAX {
+            "unlimited".into()
+        } else {
+            text_budget.to_string()
+        }
+    ));
+    let (texts, records, text_bytes) = load_training_texts(&data, text_budget)?;
+    log_status(format!(
+        "loaded {records} records, {text_bytes} bytes of training text in {:.1}s",
+        load_started.elapsed().as_secs_f64()
+    ));
+
+    let (mut model, mut tokenizer) = if let Some(path) = resume {
+        log_status(format!("resuming {}", path.display()));
+        let (model, tokenizer) = load_model(&path)?;
+        reject_resume_overrides(&model.cfg, &overrides)?;
+        if let Some(path) = config_path {
+            let file_cfg = load_config(Some(path), &TrainOverrides::default())?;
+            reject_resume_file_config(&model.cfg, &file_cfg)?;
+        }
+        (model, tokenizer)
+    } else {
+        let mut cfg = cfg_for_budget
+            .ok_or_else(|| anyhow::anyhow!("fresh train is missing a resolved config"))?;
+        fs::create_dir_all(&run)?;
+        let tokenizer_path = run.join("tokenizer.json");
+        let tokenizer = if tokenizer_path.is_file() {
+            log_status(format!(
+                "reusing {} (delete it to retrain BPE)",
+                tokenizer_path.display()
+            ));
+            BpeTokenizer::load(&tokenizer_path)?
+        } else {
+            let bpe_started = Instant::now();
+            let bpe_texts = cap_texts_bytes(&texts, if bpe_bytes == 0 { usize::MAX } else { bpe_bytes });
+            let bpe_text_bytes: usize = bpe_texts.iter().map(String::len).sum();
+            log_status(format!(
+                "training BPE vocab_ceiling={} on {bpe_text_bytes} bytes",
+                cfg.vocab_size
+            ));
+            let tokenizer = train_bpe(&bpe_texts, cfg.vocab_size as u32, cfg.seed)?;
+            log_status(format!(
+                "BPE finished vocab={} merges={} in {:.1}s",
+                tokenizer.vocab_size(),
+                tokenizer.merges.len(),
+                bpe_started.elapsed().as_secs_f64()
+            ));
+            tokenizer
+        };
+        cfg = cfg.with_tokenizer(&tokenizer)?;
+        let model_started = Instant::now();
+        log_status(format!(
+            "initializing heron d={} layers={} vocab={} context={}",
+            cfg.d_model, cfg.n_layers, cfg.vocab_size, cfg.context_len
+        ));
+        let model = UllisHeron::new(cfg)?;
+        log_status(format!(
+            "model ready in {:.1}s",
+            model_started.elapsed().as_secs_f64()
+        ));
+        (model, tokenizer)
+    };
+    if matches!(model.cfg.architecture, Architecture::RosaRwkv7) {
+        bail!("rosa_rwkv7 train is not wired");
+    }
+    model.cfg.optimizer.require_train_step()?;
+    fs::create_dir_all(&run)?;
+    tokenizer.save(run.join("tokenizer.json"))?;
+    fs::write(
+        run.join("config.json"),
+        serde_json::to_string_pretty(&model.cfg)?,
+    )?;
+
+    let needed = steps
+        .saturating_mul(model.cfg.batch_size)
+        .saturating_mul(model.cfg.context_len);
+    let encode_started = Instant::now();
+    log_status(format!("encoding {needed} training tokens"));
+    let stream = encode_training_stream(&texts, &mut tokenizer, needed)?;
+    log_status(format!(
+        "encoded {} tokens in {:.1}s",
+        stream.len(),
+        encode_started.elapsed().as_secs_f64()
+    ));
+    let batcher = CausalBatcher::from_config(&stream, &model.cfg, model.cfg.context_len)?;
+
+    #[cfg(target_os = "macos")]
+    let metal = match backend {
+        Backend::Metal => {
+            let metal_started = Instant::now();
+            log_status("compiling Metal shaders");
+            let runtime = ullis::metal::MetalRuntime::new()?;
+            log_status(format!(
+                "Metal ready in {:.1}s",
+                metal_started.elapsed().as_secs_f64()
+            ));
+            let rows = model.cfg.batch_size.saturating_mul(model.cfg.context_len);
+            let rosa_readback = rows
+                .saturating_mul(model.cfg.d_model)
+                .saturating_mul(model.cfg.n_layers)
+                .saturating_mul(size_of::<f32>().saturating_mul(2).saturating_add(1));
+            log_status(format!(
+                "Metal train: LN/QKV/CMix/head on GPU; ROSA SAM on CPU (~{rosa_readback} bytes idx+y+out/step)"
+            ));
+            Some(runtime)
+        }
+        Backend::Cpu => {
+            log_status("CPU backend; no Metal kernels");
+            None
+        }
+    };
     #[cfg(not(target_os = "macos"))]
     if matches!(backend, Backend::Metal) {
-        bail!(
-            "Metal is Ullis's default trainer and requires macOS Apple Silicon; use --backend cpu only for the reference fallback"
-        );
+        bail!("Metal backend requires macOS on Apple Silicon");
     }
-    for step in 1..=steps {
-        let step_started = Instant::now();
-        let batch = batcher.next().unwrap_or_else(|| {
-            batcher = MtpBatcher::from_config(&tokens, &cfg, time).expect("validated batcher");
-            batcher
-                .next()
-                .expect("padded token corpus yields one batch")
-        });
-        let loss = match backend {
-            Backend::Cpu => model.train_step_stateless_sgd(
+
+    log_status(format!(
+        "starting loop after {:.1}s of setup",
+        started_all.elapsed().as_secs_f64()
+    ));
+    let metrics_path = run.join("metrics.jsonl");
+    let mut loss_ema = None;
+    let ln_v = (model.cfg.vocab_size as f32).ln();
+    let mut still_random = true;
+    for (step_index, batch) in batcher.enumerate() {
+        if step_index >= steps {
+            break;
+        }
+        let started = Instant::now();
+        #[cfg(target_os = "macos")]
+        let loss = if let Some(runtime) = &metal {
+            model.train_step_metal(
+                runtime,
                 batch.tokens(),
                 batch.batch_size(),
                 batch.time(),
                 learning_rate,
-            )?,
-            #[cfg(target_os = "macos")]
-            Backend::Metal => {
-                let runtime = metal_runtime
-                    .as_ref()
-                    .expect("Metal runtime is initialized");
-                let state = metal_state.as_ref().expect("Metal state is initialized");
-                model.train_step_metal_resident_stateless_sgd(
-                    runtime,
-                    state,
-                    batch.tokens(),
-                    batch.batch_size(),
-                    batch.time(),
-                    learning_rate,
-                    train_filters,
-                )?
-            }
-            #[cfg(not(target_os = "macos"))]
-            Backend::Metal => unreachable!("rejected before training"),
-        };
-        let processed = step * batch.tokens().len();
-        let step_seconds = step_started.elapsed().as_secs_f64();
-        let loss_ema_value = match loss_ema {
-            Some(previous) => 0.95 * previous + 0.05 * loss.mean(),
-            None => loss.mean(),
-        };
-        loss_ema = Some(loss_ema_value);
-        let loss_delta = previous_loss.map_or(0.0, |previous| loss.mean() - previous);
-        previous_loss = Some(loss.mean());
-        #[cfg(target_os = "macos")]
-        let ternary_diagnostics = if matches!(backend, Backend::Metal)
-            && diagnostics_every != 0
-            && step % diagnostics_every == 0
-        {
-            let runtime = metal_runtime
-                .as_ref()
-                .expect("Metal runtime is initialized");
-            let state = metal_state.as_ref().expect("Metal state is initialized");
-            runtime.synchronize()?;
-            let current = model.metal_resident_ternary_code_snapshots(runtime, state)?;
-            let mut parameters = 0_usize;
-            let mut active = 0_usize;
-            let mut changes = 0_usize;
-            for (index, snapshot) in current.iter().enumerate() {
-                let previous = previous_ternary_codes
-                    .as_ref()
-                    .and_then(|snapshots| snapshots.get(index))
-                    .filter(|previous| previous.name == snapshot.name)
-                    .map(|previous| &previous.codes);
-                let stats = snapshot.codes.stats_against(previous);
-                parameters += stats.parameters;
-                active += stats.positive + stats.negative;
-                changes += stats.changed;
-            }
-            previous_ternary_codes = Some(current);
-            Some((
-                active as f64 / parameters.max(1) as f64,
-                changes,
-                parameters,
-            ))
+            )?
         } else {
-            None
+            model.train_step(
+                batch.tokens(),
+                batch.batch_size(),
+                batch.time(),
+                learning_rate,
+            )?
         };
         #[cfg(not(target_os = "macos"))]
-        let ternary_diagnostics: Option<(f64, usize, usize)> = None;
-        let metric = TrainMetric {
-            step,
-            tokens: processed,
-            batch_tokens: batch.tokens().len(),
-            supervised_tokens: loss.next_token_count + loss.second_token_count,
-            step_millis: step_seconds * 1_000.0,
-            step_tokens_per_second: batch.tokens().len() as f64
-                / step_seconds.max(f64::MIN_POSITIVE),
-            tokens_per_second: processed as f64
-                / started.elapsed().as_secs_f64().max(f64::MIN_POSITIVE),
-            loss: loss.mean(),
-            loss_ema: loss_ema_value,
-            loss_delta,
-            mtp_next: loss.next_token,
-            mtp_second: loss.second_token,
+        let loss = model.train_step(
+            batch.tokens(),
+            batch.batch_size(),
+            batch.time(),
             learning_rate,
-            ternary_active_fraction: ternary_diagnostics.map(|value| value.0),
-            ternary_code_changes: ternary_diagnostics.map(|value| value.1),
+        )?;
+        let elapsed = started.elapsed();
+        let step = step_index + 1;
+        let ema = match loss_ema {
+            None => loss.next_token,
+            Some(prev) => 0.9 * prev + 0.1 * loss.next_token,
         };
-        writeln!(metrics, "{}", serde_json::to_string(&metric)?)?;
-        println!(
-            "step {step}/{steps} | tok {processed} | batch {} | supervised {} | step {:.1} ms {:.1} tok/s | total {:.1} tok/s | loss {:.4} ({:+.4}) | ema {:.4} | mtp+1 {:.4} | mtp+2 {:.4} | lr {learning_rate:.2e}",
-            metric.batch_tokens,
-            metric.supervised_tokens,
-            metric.step_millis,
-            metric.step_tokens_per_second,
-            metric.tokens_per_second,
-            metric.loss,
-            metric.loss_delta,
-            metric.loss_ema,
-            metric.mtp_next,
-            metric.mtp_second
-        );
-        if let Some((active_fraction, changes, parameters)) = ternary_diagnostics {
-            println!(
-                "ternary codes | active {:.2}% | changed {changes}/{parameters} ({:.4}%) since prior diagnostic",
-                active_fraction * 100.0,
-                changes as f64 * 100.0 / parameters.max(1) as f64,
-            );
+        let delta = loss_ema.map(|prev| loss.next_token - prev).unwrap_or(0.0);
+        loss_ema = Some(ema);
+        if (ema - ln_v).abs() > 0.2 {
+            still_random = false;
         }
-        if step % checkpoint_every == 0 || step == steps {
-            #[cfg(target_os = "macos")]
-            let checkpoint = if let (Some(runtime), Some(state)) =
-                (metal_runtime.as_ref(), metal_state.as_ref())
-            {
-                runtime.synchronize()?;
-                model.checkpoint_metal_resident(runtime, state)?
-            } else {
-                model.checkpoint()
-            };
-            #[cfg(not(target_os = "macos"))]
-            let checkpoint = model.checkpoint();
+        let millis = elapsed.as_secs_f64() * 1_000.0;
+        let tokens = batch.tokens().len();
+        let tps = if elapsed.as_secs_f64() > 0.0 {
+            tokens as f64 / elapsed.as_secs_f64()
+        } else {
+            0.0
+        };
+        let phases = model.last_step_profile().map(|profile| {
+            profile
+                .phases_ms
+                .iter()
+                .map(|(name, ms)| (name.clone(), serde_json::json!(ms)))
+                .collect::<serde_json::Map<_, _>>()
+        });
+        let row = serde_json::json!({
+            "step": step,
+            "tokens": tokens,
+            "batch_tokens": tokens,
+            "supervised_tokens": loss.next_token_count,
+            "step_millis": millis,
+            "step_tokens_per_second": tps,
+            "tokens_per_second": tps,
+            "loss": loss.next_token,
+            "loss_ema": ema,
+            "loss_delta": delta,
+            "learning_rate": learning_rate,
+            "architecture": "heron",
+            "rosa_bits": model.cfg.rosa_bits,
+            "rosa_grad": "stop_grad_bits",
+            "binary_flip_count": loss.binary_flip_count,
+            "phases_ms": phases,
+        });
+        write_metrics(&metrics_path, &row)?;
+        println!(
+            "step {step}/{steps} loss={:.4} ema={:.4} rosa_grad=stop_grad_bits flips={} {millis:.0}ms {tps:.0} tok/s",
+            loss.next_token, ema, loss.binary_flip_count
+        );
+        if let Some(profile) = model.last_step_profile() {
+            log_status(format!("step {step} phases {}", profile.line()));
+        }
+        let _ = io::stdout().flush();
+        if step.is_multiple_of(checkpoint_every) || step == steps {
+            // Snapshot only on a checkpoint boundary: bits+scale+bias, never RAM latents.
             fs::write(
                 run.join("checkpoint.json"),
-                serde_json::to_vec(&checkpoint)?,
+                serde_json::to_string(&model.checkpoint())?,
             )?;
+        }
+        if step == 100 && still_random {
+            eprintln!(
+                "hint: not learning; check rosa_grad and lr (loss_ema stayed near ln(V)={ln_v:.3})"
+            );
         }
     }
     Ok(())
 }
 
-fn load_model(checkpoint: &Path) -> Result<(UllisHyena, BpeTokenizer)> {
-    let checkpoint_data: ModelCheckpoint = serde_json::from_slice(&fs::read(checkpoint)?)
-        .with_context(|| format!("parse checkpoint {}", checkpoint.display()))?;
-    let model = UllisHyena::from_checkpoint(checkpoint_data)?;
+fn load_checkpoint(path: &Path) -> Result<ModelCheckpoint> {
+    let bytes = fs::read(path).with_context(|| format!("read checkpoint {}", path.display()))?;
+    ModelCheckpoint::from_json_bytes(&bytes)
+        .with_context(|| format!("parse checkpoint {}", path.display()))
+}
+
+fn load_model(checkpoint: &Path) -> Result<(UllisHeron, BpeTokenizer)> {
+    let checkpoint_data = load_checkpoint(checkpoint)?;
+    let model = UllisHeron::from_checkpoint(checkpoint_data)?;
     let tokenizer_path = checkpoint
         .parent()
         .unwrap_or_else(|| Path::new("."))
@@ -669,8 +690,98 @@ fn load_model(checkpoint: &Path) -> Result<(UllisHyena, BpeTokenizer)> {
     Ok((model, tokenizer))
 }
 
+fn reject_resume_overrides(cfg: &TrainConfig, overrides: &TrainOverrides) -> Result<()> {
+    if let Some(architecture) = overrides.architecture {
+        let architecture = match architecture {
+            ArchitectureArg::Heron => Architecture::Heron,
+            ArchitectureArg::RosaRwkv7 => Architecture::RosaRwkv7,
+        };
+        if architecture != cfg.architecture {
+            bail!(
+                "--resume cannot change architecture (checkpoint {:?}, override {architecture:?})",
+                cfg.architecture
+            );
+        }
+    }
+    reject_resume_field("d-model", overrides.d_model, cfg.d_model)?;
+    reject_resume_field("layers", overrides.n_layers, cfg.n_layers)?;
+    reject_resume_field("context-len", overrides.context_len, cfg.context_len)?;
+    reject_resume_field("batch-size", overrides.batch_size, cfg.batch_size)?;
+    reject_resume_field("vocab-size", overrides.vocab_size, cfg.vocab_size)?;
+    reject_resume_field("seed", overrides.seed, cfg.seed)?;
+    if let Some(mib) = overrides.memory_budget_mib {
+        let bytes = mib
+            .checked_mul(1024 * 1024)
+            .ok_or_else(|| anyhow::anyhow!("memory-budget-mib overflows bytes"))?;
+        if bytes != cfg.memory_budget_bytes {
+            bail!(
+                "--resume cannot change memory-budget-mib (checkpoint {}, override {mib})",
+                cfg.memory_budget_bytes / (1024 * 1024)
+            );
+        }
+    }
+    if let Some(optimizer) = overrides.optimizer {
+        let optimizer = match optimizer {
+            OptimizerArg::StatelessSgd => OptimizerKind::StatelessSgd,
+            OptimizerArg::LionFp16 => OptimizerKind::LionFp16,
+        };
+        if optimizer != cfg.optimizer {
+            bail!(
+                "--resume cannot change optimizer (checkpoint {:?}, override {optimizer:?})",
+                cfg.optimizer
+            );
+        }
+    }
+    Ok(())
+}
+
+fn reject_resume_field<T: Copy + PartialEq + Display>(
+    name: &str,
+    requested: Option<T>,
+    current: T,
+) -> Result<()> {
+    if let Some(value) = requested
+        && value != current
+    {
+        bail!("--resume cannot change {name} (checkpoint {current}, override {value})");
+    }
+    Ok(())
+}
+
+fn reject_resume_file_config(checkpoint: &TrainConfig, file: &TrainConfig) -> Result<()> {
+    if checkpoint.architecture != file.architecture
+        || checkpoint.d_model != file.d_model
+        || checkpoint.n_layers != file.n_layers
+        || checkpoint.vocab_size != file.vocab_size
+        || checkpoint.context_len != file.context_len
+        || checkpoint.batch_size != file.batch_size
+        || checkpoint.resolved_dim_ffn() != file.resolved_dim_ffn()
+        || checkpoint.rosa_bits != file.rosa_bits
+    {
+        bail!("--config does not match the resumed checkpoint; omit --config when using --resume");
+    }
+    Ok(())
+}
+
+fn inspect_run(run: &Path) -> Result<()> {
+    let checkpoint = load_checkpoint(&run.join("checkpoint.json"))?;
+    let report = checkpoint.inspect()?;
+    println!("{}", serde_json::to_string_pretty(&report)?);
+    Ok(())
+}
+
+fn greedy_token(logits: &[f32], tokenizer: &BpeTokenizer) -> u32 {
+    logits
+        .iter()
+        .enumerate()
+        .filter(|(id, _)| *id as u32 != tokenizer.pad_id && *id as u32 != tokenizer.bos_id)
+        .max_by(|(_, a), (_, b)| a.total_cmp(b))
+        .map(|(id, _)| id as u32)
+        .expect("non-empty vocabulary")
+}
+
 fn greedy_generate(
-    model: &UllisHyena,
+    model: &UllisHeron,
     tokenizer: &mut BpeTokenizer,
     prompt: &str,
     max_tokens: usize,
@@ -679,28 +790,31 @@ fn greedy_generate(
         bail!("max-tokens must be positive");
     }
     let mut ids = tokenizer.encode(prompt, true, false);
+    if ids.is_empty() {
+        ids.push(tokenizer.bos_id);
+    }
+    if ids.len() > model.cfg.context_len {
+        bail!(
+            "prompt is longer than context_len ({})",
+            model.cfg.context_len
+        );
+    }
+    let mut state = model.generate_state()?;
+    let mut logits = Vec::new();
+    for &id in &ids {
+        logits = model.generate_step(&mut state, id)?;
+    }
     let mut produced = Vec::with_capacity(max_tokens);
     for _ in 0..max_tokens {
-        let start = ids.len().saturating_sub(model.cfg.context_len);
-        let mut context = ids[start..].to_vec();
-        while context.len() < 3 {
-            context.insert(0, tokenizer.bos_id);
-        }
-        let time = context.len();
-        let (logits, _) = model.mtp_logits(&context, 1, time)?;
-        let row = &logits[(time - 1) * model.cfg.vocab_size..time * model.cfg.vocab_size];
-        let next = row
-            .iter()
-            .enumerate()
-            .filter(|(id, _)| *id as u32 != tokenizer.pad_id && *id as u32 != tokenizer.bos_id)
-            .max_by(|(_, a), (_, b)| a.total_cmp(b))
-            .map(|(id, _)| id as u32)
-            .expect("non-empty vocabulary");
+        let next = greedy_token(&logits, tokenizer);
         if next == tokenizer.eos_id {
             break;
         }
-        ids.push(next);
+        if state.time() >= model.cfg.context_len {
+            break;
+        }
         produced.push(next);
+        logits = model.generate_step(&mut state, next)?;
     }
     Ok(tokenizer.decode(&produced))
 }
@@ -763,15 +877,194 @@ fn chat(checkpoint: PathBuf, session: PathBuf, mut thinking: ThinkingLevel) -> R
     Ok(())
 }
 
+fn generate(checkpoint: PathBuf, prompt: String, max_tokens: usize) -> Result<()> {
+    if max_tokens == 0 {
+        bail!("max-tokens must be positive");
+    }
+    let (model, mut tokenizer) = load_model(&checkpoint)?;
+    println!(
+        "{}",
+        greedy_generate(&model, &mut tokenizer, &prompt, max_tokens)?
+    );
+    Ok(())
+}
+
+fn splitmix(state: &mut u64) -> u64 {
+    *state = state.wrapping_add(0x9E37_79B9_7F4A_7C15);
+    let mut z = *state;
+    z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+    z ^ (z >> 31)
+}
+
+fn get_randint(digits: usize, rng: &mut u64) -> u64 {
+    let lo = if digits <= 1 {
+        0
+    } else {
+        10_u64.pow((digits - 1) as u32)
+    };
+    let hi = 10_u64.pow(digits as u32) - 1;
+    lo + splitmix(rng) % (hi - lo + 1)
+}
+
+fn wkv_pad_len(script_t: usize) -> usize {
+    script_t.div_ceil(16) * 16
+}
+
+fn eval_digits(checkpoint: PathBuf, task: DigitTask, max_digits: usize) -> Result<()> {
+    if max_digits == 0 {
+        bail!("max-digits must be positive");
+    }
+    let model = UllisHeron::from_checkpoint(load_checkpoint(&checkpoint)?)?;
+    if !matches!(model.cfg.architecture, Architecture::RosaRwkv7) {
+        bail!("eval-digits requires a rosa_rwkv7 checkpoint");
+    }
+    let (script_t, pad, alphabet, vocab) = match task {
+        DigitTask::Reverse => (129_usize, b'#' as u32, "0123456789,#", 12_usize),
+        DigitTask::Plusminus => (129_usize, b'=' as u32, "0123456789+-=", 13_usize),
+    };
+    if model.cfg.vocab_size < vocab {
+        bail!("checkpoint vocab is smaller than the {task:?} alphabet");
+    }
+    let t_wkv = wkv_pad_len(script_t);
+    if model.cfg.context_len < t_wkv {
+        bail!(
+            "checkpoint context_len {} cannot hold padded T_wkv {t_wkv}",
+            model.cfg.context_len
+        );
+    }
+    let mut rng = model.cfg.seed | 1;
+    let mut n_good = 0_usize;
+    let mut n_all = 0_usize;
+    for digits in 1..=max_digits {
+        let sequences: Vec<Vec<u32>> = match task {
+            DigitTask::Reverse => (0..10)
+                .map(|_| {
+                    let raw = get_randint(digits, &mut rng).to_string();
+                    let body = format!("{raw},{}", raw.chars().rev().collect::<String>());
+                    encode_digit_line(&body, alphabet, pad, t_wkv)
+                })
+                .collect(),
+            DigitTask::Plusminus => {
+                let mut out = Vec::new();
+                for ii in 1..2 * digits {
+                    let (aa, bb) = if ii <= digits {
+                        (ii, digits)
+                    } else {
+                        (digits, 2 * digits - ii)
+                    };
+                    let a = get_randint(aa, &mut rng) as i64;
+                    let b = get_randint(bb, &mut rng) as i64;
+                    let plus = splitmix(&mut rng) & 1 == 0;
+                    let result = if plus { a + b } else { a - b };
+                    let op = if plus { '+' } else { '-' };
+                    let body = format!("{a}{op}{b}={result}");
+                    out.push(encode_digit_line(&body, alphabet, pad, t_wkv));
+                }
+                out
+            }
+        };
+        for src in sequences {
+            let input = &src[..t_wkv];
+            let logits = model.logits(input, 1, t_wkv)?;
+            let vocab_size = model.cfg.vocab_size;
+            let predicted: Vec<u32> = (0..t_wkv)
+                .map(|t| {
+                    let row = &logits[t * vocab_size..(t + 1) * vocab_size];
+                    row.iter()
+                        .take(vocab)
+                        .enumerate()
+                        .max_by(|(_, a), (_, b)| a.total_cmp(b))
+                        .map(|(id, _)| id as u32)
+                        .unwrap_or(0)
+                })
+                .collect();
+            let xx: String = input
+                .iter()
+                .map(|&id| {
+                    alphabet
+                        .as_bytes()
+                        .get(id as usize)
+                        .copied()
+                        .unwrap_or(b'?') as char
+                })
+                .collect();
+            let (p1, p2) = match task {
+                DigitTask::Reverse => {
+                    let p1 = xx.find(',').unwrap_or(0);
+                    let p2 = xx.find('#').unwrap_or_else(|| xx.len().saturating_sub(1));
+                    (p1, p2)
+                }
+                DigitTask::Plusminus => {
+                    let p1 = xx.find('=').unwrap_or(0);
+                    let rest = &xx[p1 + 1..];
+                    let p2 = p1 + 1 + rest.find('=').unwrap_or(0);
+                    (p1, p2)
+                }
+            };
+            if p2 <= p1 {
+                continue;
+            }
+            n_all += p2 - p1;
+            for offset in 0..(p2 - p1) {
+                if predicted[p1 + offset] == src[p1 + 1 + offset] {
+                    n_good += 1;
+                }
+            }
+        }
+        println!("digits {digits} running {n_good}/{n_all}");
+    }
+    println!("eval-digits {task:?} correct {n_good} / {n_all} (unpadded span, T_wkv={t_wkv})");
+    Ok(())
+}
+
+fn encode_digit_line(body: &str, alphabet: &str, pad: u32, t_wkv: usize) -> Vec<u32> {
+    let mut ids: Vec<u32> = body
+        .chars()
+        .map(|ch| alphabet.find(ch).map(|i| i as u32).unwrap_or(pad))
+        .collect();
+    ids.resize(t_wkv, pad);
+    ids
+}
+
+fn smoke() -> Result<()> {
+    let cfg = smoke_config(MIN_VOCAB as usize);
+    let mut model = UllisHeron::new(cfg.clone())?;
+    let tokens: Vec<u32> = (0..cfg.context_len).map(|i| 4 + (i as u32 % 8)).collect();
+    let ln_v = (cfg.vocab_size as f32).ln();
+    println!(
+        "heron smoke | architecture {:?} | d {} | layers {} | context {} | vocab {} | rosa_grad {:?}",
+        model.cfg.architecture,
+        model.cfg.d_model,
+        model.cfg.n_layers,
+        model.cfg.context_len,
+        model.cfg.vocab_size,
+        model.cfg.rosa_grad,
+    );
+    #[cfg(target_os = "macos")]
+    let loss = match ullis::metal::MetalRuntime::new() {
+        Ok(runtime) => {
+            println!("metal runtime ready; running stop_grad_bits train_step");
+            model.train_step_metal(&runtime, &tokens, 1, cfg.context_len, 1e-3)?
+        }
+        Err(error) => {
+            println!("metal unavailable ({error}); CPU train_step");
+            model.train_step(&tokens, 1, cfg.context_len, 1e-3)?
+        }
+    };
+    #[cfg(not(target_os = "macos"))]
+    let loss = model.train_step(&tokens, 1, cfg.context_len, 1e-3)?;
+    println!(
+        "smoke loss={:.4} ln(V)={:.4} supervised={} flips={} rosa_grad=stop_grad_bits",
+        loss.next_token, ln_v, loss.next_token_count, loss.binary_flip_count
+    );
+    Ok(())
+}
+
 fn main() -> Result<()> {
     let cli = Cli::parse();
     if cli.smoke {
-        let model = UllisHyena::new(smoke_config(512))?;
-        println!(
-            "hyena smoke: streamed MTP loss {:.4}",
-            model.streamed_mtp_loss(&[4, 5, 6, 7], 1, 4)?.mean()
-        );
-        return Ok(());
+        return smoke();
     }
     match cli.command {
         Some(Command::Train {
@@ -783,10 +1076,8 @@ fn main() -> Result<()> {
             steps,
             learning_rate,
             checkpoint_every,
-            train_filters,
             backend,
             bpe_train_mib,
-            diagnostics_every,
         }) => train(
             data,
             run,
@@ -796,10 +1087,8 @@ fn main() -> Result<()> {
             steps,
             learning_rate,
             checkpoint_every,
-            train_filters,
             backend,
             bpe_train_mib,
-            diagnostics_every,
         ),
         Some(Command::Tokenize { data, output }) => {
             let records = load_dataset(&data)?;
@@ -812,10 +1101,7 @@ fn main() -> Result<()> {
             }
             Ok(())
         }
-        Some(Command::Inspect { run }) => {
-            println!("{}", fs::read_to_string(run.join("config.json"))?);
-            Ok(())
-        }
+        Some(Command::Inspect { run }) => inspect_run(&run),
         Some(Command::Chat {
             checkpoint,
             session,
@@ -825,14 +1111,12 @@ fn main() -> Result<()> {
             checkpoint,
             prompt,
             max_tokens,
-        }) => {
-            let (model, mut tokenizer) = load_model(&checkpoint)?;
-            println!(
-                "{}",
-                greedy_generate(&model, &mut tokenizer, &prompt, max_tokens)?
-            );
-            Ok(())
-        }
+        }) => generate(checkpoint, prompt, max_tokens),
+        Some(Command::EvalDigits {
+            checkpoint,
+            task,
+            max_digits,
+        }) => eval_digits(checkpoint, task, max_digits),
         None => {
             println!("Run `ullis --help` for training, dataset, and chat commands.");
             Ok(())
