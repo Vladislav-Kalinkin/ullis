@@ -679,6 +679,16 @@ impl PackedBinaryLinear {
         &self.scale
     }
 
+    pub fn bias(&self) -> Option<&Fp16Storage> {
+        self.bias.as_ref()
+    }
+
+    fn ensure_bias(&mut self) {
+        if self.bias.is_none() {
+            self.bias = Some(Fp16Storage::zeros(self.out_features));
+        }
+    }
+
     pub fn sign_at(&self, index: usize) -> f32 {
         if bit_is_plus(&self.bits, index) {
             1.0
@@ -2389,7 +2399,7 @@ impl UllisHeron {
                 })
             })
             .collect::<Result<Vec<_>>>()?;
-        let head = PackedBinaryLinear::seeded(v, d, false, cfg.seed ^ 0x9E37)?;
+        let head = PackedBinaryLinear::seeded(v, d, true, cfg.seed ^ 0x9E37)?;
         let max_matrix = d
             .saturating_mul(d)
             .max(d.saturating_mul(dim_ffn))
@@ -2434,7 +2444,7 @@ impl UllisHeron {
                 })
             })
             .collect::<Result<Vec<_>>>()?;
-        let head = PackedBinaryLinear::seeded(v, d, false, cfg.seed ^ 0x9E37)?;
+        let head = PackedBinaryLinear::seeded(v, d, true, cfg.seed ^ 0x9E37)?;
         let max_matrix = d
             .saturating_mul(d)
             .max(d.saturating_mul(dim_ffn))
@@ -2927,6 +2937,7 @@ impl UllisHeron {
                 hidden,
                 self.head.bits(),
                 self.head.scale_bits(),
+                self.head.bias_bits(),
                 self.head.latent_bits(),
                 self.head.latent.residual(),
                 targets,
@@ -2945,6 +2956,13 @@ impl UllisHeron {
                 self.head
                     .scale
                     .apply_clipped_sgd(o, head.scale_gradient[o], learning_rate);
+            }
+            if let (Some(bias), Some(g_bias)) =
+                (self.head.bias.as_mut(), head.bias_gradient.as_ref())
+            {
+                for o in 0..vocab {
+                    bias.apply_clipped_sgd(o, g_bias[o], learning_rate);
+                }
             }
             let flips = bit_flip_count(&before, &self.head.bits);
             let (loss_p10, loss_p50, loss_p90) =
@@ -2973,6 +2991,7 @@ impl UllisHeron {
         let loss_scale = causal_ce_gradient_scale(n_valid, time);
         self.g_w[..weights].fill(0.0);
         let mut g_scale = vec![0.0; vocab];
+        let mut g_bias = self.head.bias.as_ref().map(|_| vec![0.0; vocab]);
         let mut gx = vec![0.0; hidden.len()];
         let mut loss_sum = 0.0;
         let mut row_loss = vec![0.0; rows];
@@ -3004,14 +3023,14 @@ impl UllisHeron {
                 &mut self.g_w[..weights],
                 Some(&mut gx[row * d..(row + 1) * d]),
                 &mut g_scale,
-                None,
+                g_bias.as_deref_mut(),
             )?;
         }
         let before_latent = self.head.latent_bits().to_vec();
         let flips = self.head.flip_after_gradients(
             &self.g_w[..weights],
             &g_scale,
-            None,
+            g_bias.as_deref(),
             learning_rate,
             binaryconnect_ste_scale(time.saturating_sub(1)),
             metal,
@@ -3346,7 +3365,7 @@ fn hybrid_from_checkpoint(checkpoint: ModelCheckpoint) -> Result<UllisHeron> {
     let rank = cfg.resolved_tmix_lora_rank();
     let embedding = Fp16Storage::from_bits(checkpoint.embedding_bits);
     let ln_out = LayerNorm::from_bits(checkpoint.ln_out.weight, checkpoint.ln_out.bias)?;
-    let head = packed_from_checkpoint(checkpoint.head, v, d, false)?;
+    let head = head_from_checkpoint(checkpoint.head, v, d)?;
     let hybrid_blocks = checkpoint
         .hybrid_blocks
         .into_iter()
@@ -3417,6 +3436,17 @@ fn packed_from_checkpoint(
     )
 }
 
+fn head_from_checkpoint(
+    packed: PackedBinaryCheckpoint,
+    vocab: usize,
+    d_model: usize,
+) -> Result<PackedBinaryLinear> {
+    let has_bias = packed.bias_bits.is_some();
+    let mut head = packed_from_checkpoint(packed, vocab, d_model, has_bias)?;
+    head.ensure_bias();
+    Ok(head)
+}
+
 fn seeded_embedding(len: usize, d_model: usize, seed: u64) -> Fp16Storage {
     let scale = (d_model as f32).sqrt().recip();
     let mut state = seed | 1;
@@ -3434,7 +3464,7 @@ fn heron_from_checkpoint(checkpoint: ModelCheckpoint) -> Result<UllisHeron> {
     let dim_ffn = cfg.resolved_dim_ffn();
     let embedding = Fp16Storage::from_bits(checkpoint.embedding_bits);
     let ln_out = LayerNorm::from_bits(checkpoint.ln_out.weight, checkpoint.ln_out.bias)?;
-    let head = packed_from_checkpoint(checkpoint.head, v, d, false)?;
+    let head = head_from_checkpoint(checkpoint.head, v, d)?;
     let blocks = checkpoint
         .blocks
         .into_iter()
@@ -3513,15 +3543,24 @@ fn packed_words(out: usize, in_features: usize) -> usize {
     out.saturating_mul(in_features).div_ceil(32)
 }
 
+fn check_packed_bits_and_scale(
+    matrix: &PackedBinaryCheckpoint,
+    out: usize,
+    in_features: usize,
+) -> Result<()> {
+    if matrix.bits.len() != packed_words(out, in_features) || matrix.scale_bits.len() != out {
+        bail!("checkpoint packed-linear shape mismatch");
+    }
+    Ok(())
+}
+
 fn check_packed(
     matrix: &PackedBinaryCheckpoint,
     out: usize,
     in_features: usize,
     bias: bool,
 ) -> Result<()> {
-    if matrix.bits.len() != packed_words(out, in_features) || matrix.scale_bits.len() != out {
-        bail!("checkpoint packed-linear shape mismatch");
-    }
+    check_packed_bits_and_scale(matrix, out, in_features)?;
     match (&matrix.bias_bits, bias) {
         (Some(bias_bits), true) if bias_bits.len() == out => Ok(()),
         (None, false) => Ok(()),
@@ -3571,7 +3610,12 @@ fn validate_checkpoint_shapes(checkpoint: &ModelCheckpoint) -> Result<()> {
         bail!("checkpoint embedding shape does not match its configuration");
     }
     check_ln(&checkpoint.ln_out, d)?;
-    check_packed(&checkpoint.head, v, d, false)?;
+    check_packed_bits_and_scale(&checkpoint.head, v, d)?;
+    if let Some(bias_bits) = &checkpoint.head.bias_bits
+        && bias_bits.len() != v
+    {
+        bail!("checkpoint head bias length mismatch");
+    }
     match cfg.architecture {
         Architecture::Heron => {
             if checkpoint.blocks.len() != cfg.n_layers || !checkpoint.hybrid_blocks.is_empty() {
@@ -3635,7 +3679,7 @@ mod tests {
         assert_eq!(checkpoint.format_version, 2);
         assert_eq!(checkpoint.blocks.len(), 1);
         assert!(checkpoint.blocks[0].ln0.is_some());
-        assert!(checkpoint.head.bias_bits.is_none());
+        assert!(checkpoint.head.bias_bits.is_some());
         assert!(checkpoint.blocks[0].rosa.q.bias_bits.is_some());
         let restored = UllisHeron::from_checkpoint(checkpoint).unwrap();
         assert_eq!(restored.cfg.d_model, 16);
@@ -3854,6 +3898,7 @@ mod tests {
         let o_bits = model.blocks[0].rosa.o.bits().to_vec();
         let o_scale = model.blocks[0].rosa.o.scale().as_bits().to_vec();
         let head_scale = model.head.scale().as_bits().to_vec();
+        let head_bias = model.head.bias().unwrap().as_bits().to_vec();
         let tokens: Vec<u32> = (0..32).map(|i| 4 + (i % 8) as u32).collect();
         let loss = model.train_step(&tokens, 1, 32, 0.05).unwrap();
         assert!(loss.next_token.is_finite());
@@ -3869,6 +3914,41 @@ mod tests {
                 || model.blocks[0].rosa.o.scale().as_bits() != o_scale.as_slice()
         );
         assert_ne!(model.head.scale().as_bits(), head_scale.as_slice());
+        assert_ne!(model.head.bias().unwrap().as_bits(), head_bias.as_slice());
+    }
+
+    #[test]
+    fn head_bias_rises_for_a_repeated_target() {
+        let mut model = UllisHeron::new(tiny_train_cfg()).unwrap();
+        let target = 7_usize;
+        let tokens = vec![target as u32; 32];
+        let before = model.head.bias().unwrap().get(target);
+        for _ in 0..24 {
+            model.train_step(&tokens, 1, 32, 0.05).unwrap();
+        }
+        let after = model.head.bias().unwrap().get(target);
+        let other = model.head.bias().unwrap().get(20);
+        assert!(
+            after > before,
+            "repeated-target head bias must rise, before={before} after={after}"
+        );
+        assert!(
+            after > other,
+            "repeated-target bias {after} must exceed an unused class {other}"
+        );
+    }
+
+    #[test]
+    fn legacy_head_without_bias_loads_as_zero_bias() {
+        let model = UllisHeron::new(tiny_train_cfg()).unwrap();
+        let tokens: Vec<u32> = (0..8).map(|i| 4 + i).collect();
+        let hidden = model.hidden(&tokens, 1, 8).unwrap();
+        let mut checkpoint = model.checkpoint();
+        checkpoint.head.bias_bits = None;
+        let restored = UllisHeron::from_checkpoint(checkpoint).unwrap();
+        let bias = restored.head.bias().expect("zero head bias on load");
+        assert!((0..bias.len()).all(|i| bias.get(i) == 0.0));
+        assert_eq!(restored.hidden(&tokens, 1, 8).unwrap(), hidden);
     }
 
     #[test]
@@ -3951,7 +4031,7 @@ mod tests {
         assert_eq!(json["config"]["rosa_bits"], 1);
         assert_eq!(json["config"]["rosa_grad"], "stop_grad_bits");
         assert_eq!(json["config"]["optimizer"], "stateless_sgd");
-        assert!(json["head"]["bias_bits"].is_null());
+        assert!(json["head"]["bias_bits"].is_array());
         assert!(json["head"]["bits"].is_array());
         assert!(json["head"]["scale_bits"].is_array());
         assert!(json["ln_out"]["weight"].is_array());
@@ -3988,6 +4068,10 @@ mod tests {
         assert_eq!(
             restored.head.scale().as_bits(),
             model.head.scale().as_bits()
+        );
+        assert_eq!(
+            restored.head.bias().map(Fp16Storage::as_bits),
+            model.head.bias().map(Fp16Storage::as_bits)
         );
     }
 

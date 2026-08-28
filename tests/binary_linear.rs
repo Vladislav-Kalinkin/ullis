@@ -20,7 +20,15 @@ fn ste_gradients_match_the_binaryconnect_contract() {
     let mut g_scale = [0.0_f32; 1];
     let mut g_bias = [0.0_f32; 1];
     linear
-        .backward_ste(&x, &gy, 1, &mut g_w, Some(&mut g_x), &mut g_scale, Some(&mut g_bias))
+        .backward_ste(
+            &x,
+            &gy,
+            1,
+            &mut g_w,
+            Some(&mut g_x),
+            &mut g_scale,
+            Some(&mut g_bias),
+        )
         .unwrap();
     assert!((g_w[0] - 1.0).abs() < 1e-6);
     assert!((g_w[1] - 1.5).abs() < 1e-6);
@@ -42,9 +50,7 @@ fn latent_persists_across_steps_instead_of_reconstructing() {
         .unwrap();
     // Hold the row scale fixed so the assertion isolates latent persistence
     // from scale SGD. Magnitude STE on the proxy must not snap back to scale*sign.
-    linear
-        .apply_clipped_sgd(&g_w, &[0.0], None, 0.1)
-        .unwrap();
+    linear.apply_clipped_sgd(&g_w, &[0.0], None, 0.1).unwrap();
     let latent_after = linear.latent().get(0);
     let reconstructed = linear.scale().get(0) * linear.sign_at(0);
     assert!(
@@ -57,9 +63,7 @@ fn latent_persists_across_steps_instead_of_reconstructing() {
     linear
         .backward_ste(&x, &gy, 1, &mut g_w, None, &mut g_scale, None)
         .unwrap();
-    linear
-        .apply_clipped_sgd(&g_w, &[0.0], None, 0.1)
-        .unwrap();
+    linear.apply_clipped_sgd(&g_w, &[0.0], None, 0.1).unwrap();
     assert_ne!(linear.latent().get(0), latent_after);
 }
 
@@ -76,8 +80,7 @@ fn scale_is_learned_not_mean_abs_latent() {
     linear
         .apply_clipped_sgd(&g_w, &g_scale, None, 0.05)
         .unwrap();
-    let mean_abs = 0.5
-        * (linear.latent().get(0).abs() + linear.latent().get(1).abs());
+    let mean_abs = 0.5 * (linear.latent().get(0).abs() + linear.latent().get(1).abs());
     assert!(
         (linear.scale().get(0) - mean_abs).abs() > 1e-4,
         "scale collapsed to mean|latent|"

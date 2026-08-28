@@ -12,9 +12,9 @@ pub mod rosa;
 pub mod tokenizer;
 pub mod wkv7;
 pub use batch::{CausalBatch, CausalBatcher};
+pub use config::{Architecture, MemoryEstimate, RosaGradMode, TrainConfig};
 pub use conversation::{ChatMessage, generation_prefix, render_messages};
 pub use decode::{DecodeConfig, apply_openai_penalties, select_token};
-pub use config::{Architecture, MemoryEstimate, RosaGradMode, TrainConfig};
 pub use model::{
     CE_NO_IGNORE, CausalLoss, CheckpointInspect, HeronGenerateState, InferenceStateBytes,
     ModelCheckpoint, ParamCounts, TrainStepProfile, UllisHeron, causal_ce_gradient_scale,

@@ -429,7 +429,14 @@ pub fn rosa_qkv_batch(
     if batch == 0 || time == 0 || channels == 0 {
         bail!("rosa_qkv_batch dimensions must be non-zero");
     }
-    rosa_qkv_jobs(batch, time, channels, |index| q[index], |index| k[index], |index| v[index])
+    rosa_qkv_jobs(
+        batch,
+        time,
+        channels,
+        |index| q[index],
+        |index| k[index],
+        |index| v[index],
+    )
 }
 
 /// Same as [`rosa_qkv_batch`], reading LSB-packed bitplanes from `ullis_sign_pack_bits`.
@@ -513,7 +520,13 @@ fn rosa_qkv_jobs(
 }
 
 /// `out[b,t,c] = (2 * idx[b,t,c] - 1) * e[c]`.
-pub fn rosa_qkv_out_batched(idx: &[u8], e: &[f32], batch: usize, time: usize, channels: usize) -> Result<Vec<f32>> {
+pub fn rosa_qkv_out_batched(
+    idx: &[u8],
+    e: &[f32],
+    batch: usize,
+    time: usize,
+    channels: usize,
+) -> Result<Vec<f32>> {
     let elements = batch
         .checked_mul(time)
         .and_then(|rows| rows.checked_mul(channels))

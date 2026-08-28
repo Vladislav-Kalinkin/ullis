@@ -275,6 +275,7 @@ pub struct PackedHeadTrainSgd {
     pub mean_loss: f32,
     pub hidden_gradient: Vec<f32>,
     pub scale_gradient: Vec<f32>,
+    pub bias_gradient: Option<Vec<f32>>,
     pub next_latent: Vec<u16>,
     pub next_residual: Vec<f32>,
     pub next_bits: Vec<u32>,
@@ -3155,6 +3156,7 @@ impl MetalRuntime {
         hidden: &[f32],
         bits: &[u32],
         scale: &[u16],
+        bias: Option<&[u16]>,
         latent: &[u16],
         residual: &[f32],
         tokens: &[u32],
@@ -3169,9 +3171,11 @@ impl MetalRuntime {
     ) -> Result<PackedHeadTrainSgd> {
         let shape = LinearDispatchShape::new(rows, channels, vocab)?;
         let weights = vocab.saturating_mul(channels);
+        let has_bias = bias.is_some();
         if hidden.len() != rows.saturating_mul(channels)
             || bits.len() != shape.packed_words()?
             || scale.len() != vocab
+            || bias.is_some_and(|values| values.len() != vocab)
             || latent.len() != weights
             || residual.len() != weights
             || tokens.len() != rows
@@ -3187,7 +3191,7 @@ impl MetalRuntime {
         let hidden_buffer = self.buffer_f32(hidden)?;
         let bits_buffer = self.buffer_u32(bits)?;
         let scale_buffer = self.buffer_u16(scale)?;
-        let bias_buffer = self.buffer_u16(&[])?;
+        let bias_buffer = self.buffer_u16(bias.unwrap_or(&[]))?;
         let tokens_buffer = self.buffer_u32(tokens)?;
         let latent_buffer = self.buffer_u16(latent)?;
         let residual_buffer = self.buffer_f32(residual)?;
@@ -3197,7 +3201,7 @@ impl MetalRuntime {
         let loss_buffer = self.alloc_f32(rows)?;
         let gx_buffer = self.alloc_f32(hidden.len())?;
         let g_scale_buffer = self.alloc_f32(vocab)?;
-        let g_bias_buffer = self.alloc_f32(vocab)?;
+        let g_bias_buffer = self.zeros_f32(vocab)?;
         let gw_buffer = self.alloc_f32(weights)?;
         self.submit(|encoder| {
             Self::encode_tiled(
@@ -3218,7 +3222,7 @@ impl MetalRuntime {
                             as_u32(rows, "rows")?,
                             as_u32(channels, "in")?,
                             as_u32(vocab, "out")?,
-                            0,
+                            u32::from(has_bias),
                         ],
                     )
                 },
@@ -3278,7 +3282,11 @@ impl MetalRuntime {
                     Self::set_u32s(
                         encoder,
                         6,
-                        &[as_u32(rows, "rows")?, as_u32(vocab, "out")?, 0],
+                        &[
+                            as_u32(rows, "rows")?,
+                            as_u32(vocab, "out")?,
+                            u32::from(has_bias),
+                        ],
                     )
                 },
                 vocab,
@@ -3331,6 +3339,13 @@ impl MetalRuntime {
         latent_buffer.read_u16(&mut next_latent)?;
         residual_buffer.read_f32(&mut next_residual)?;
         next_bits.read_u32(&mut packed)?;
+        let bias_gradient = if has_bias {
+            let mut values = vec![0.0; vocab];
+            g_bias_buffer.read_f32(&mut values)?;
+            Some(values)
+        } else {
+            None
+        };
         let mean_loss = if n_valid == 0 {
             0.0
         } else {
@@ -3340,6 +3355,7 @@ impl MetalRuntime {
             mean_loss,
             hidden_gradient,
             scale_gradient,
+            bias_gradient,
             next_latent,
             next_residual,
             next_bits: packed,

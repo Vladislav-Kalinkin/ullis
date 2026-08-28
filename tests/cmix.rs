@@ -1,4 +1,4 @@
-use ullis::model::{LAYER_NORM_EPS, Fp16Linear, LayerNorm, PackedBinaryLinear, RwkvCMixX070};
+use ullis::model::{Fp16Linear, LAYER_NORM_EPS, LayerNorm, PackedBinaryLinear, RwkvCMixX070};
 
 #[test]
 fn seeded_cmix_value_is_kaiming_not_zero() {

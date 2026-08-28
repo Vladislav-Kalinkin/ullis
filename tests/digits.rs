@@ -1,6 +1,6 @@
+use ullis::UllisHeron;
 use ullis::config::{Architecture, TrainConfig};
 use ullis::tokenizer::MIN_VOCAB;
-use ullis::UllisHeron;
 
 fn reverse_cfg() -> TrainConfig {
     TrainConfig {

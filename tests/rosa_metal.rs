@@ -3,11 +3,11 @@
 use std::time::Instant;
 
 use ullis::config::TrainConfig;
+use ullis::metal::MetalDispatchShape;
 use ullis::metal::{
     MetalRuntime, ROSA_QKV_1BIT_BWD_E_KERNEL_NAME, ROSA_QKV_1BIT_FWD_KERNEL_NAME,
     validate_metal_kernel,
 };
-use ullis::metal::MetalDispatchShape;
 use ullis::rosa::{
     bit_from_activation, pack_bitplane, qkv_bitplane_bytes, rosa_qkv_batch, rosa_qkv_out_batched,
     rosa_qkv_ref, sam_workspace_bytes,
@@ -107,7 +107,11 @@ fn metal_qkv_matches_python_fixture() {
         .unwrap();
     assert_eq!(gpu.idx, QKV_IDX);
     assert_eq!(gpu.idx, rosa_qkv_ref(&QKV_Q, &QKV_K, &QKV_V).unwrap());
-    assert_close(&gpu.out, &[-0.25, 0.25, -0.25, 0.25, 0.25, -0.25, 0.25, -0.25], 2e-3);
+    assert_close(
+        &gpu.out,
+        &[-0.25, 0.25, -0.25, 0.25, 0.25, -0.25, 0.25, -0.25],
+        2e-3,
+    );
 }
 
 #[test]
@@ -132,7 +136,10 @@ fn metal_qkv_matches_t5_c3_and_collapses_unmatched_to_minus_e() {
     let cpu_out = rosa_qkv_out_batched(&cpu_idx, &e, 1, 5, 3).unwrap();
     assert_eq!(gpu.idx, cpu_idx);
     assert_close(&gpu.out, &cpu_out, 2e-3);
-    assert!(gpu.out.iter().all(|v| v.abs() > 0.1), "1-bit QKV never emits 0");
+    assert!(
+        gpu.out.iter().all(|v| v.abs() > 0.1),
+        "1-bit QKV never emits 0"
+    );
 }
 
 #[test]
