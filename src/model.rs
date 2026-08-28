@@ -72,7 +72,27 @@ pub struct CausalLoss {
     pub cmix_value_rms: f32,
     pub head_latent_abs_mean: f32,
     pub head_latent_step_abs: f32,
+    pub head_bias_rms: f32,
 }
+
+/// One-shot LM-head unigram prior applied at train start / resume.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct HeadUnigramInstall {
+    pub applied: bool,
+    pub n_targets: usize,
+    pub bias_rms: f32,
+    pub scale_rms: f32,
+    pub shrunk_kaiming_scale: bool,
+}
+
+/// Extra SGD rate for the LM-head bias relative to `learning_rate`.
+///
+/// Window-mean `gy` leaves `g_bias = O(freq / T)`, so a `5e-3` step moves the
+/// prior ~1e-4 nats. 8× tracks the stream after
+/// [`UllisHeron::install_head_unigram_prior`] without becoming sign-SGD.
+pub const HEAD_BIAS_LR_MULT: f32 = 8.0;
+const HEAD_BIAS_PRIOR_ABS_EPS: f32 = 0.05;
+const HEAD_KAIMING_SCALE_SHRINK: f32 = 0.25;
 
 /// Wall-clock breakdown of one `train_step`. Phases with the same name are summed.
 #[derive(Clone, Debug, Default)]
@@ -2906,7 +2926,113 @@ impl UllisHeron {
                 .unwrap_or(0.0),
             head_latent_abs_mean: mean_abs_fp16(&self.head.latent),
             head_latent_step_abs: head_diag.head_latent_step_abs,
+            head_bias_rms: self.head.bias.as_ref().map(rms_fp16).unwrap_or(0.0),
         })
+    }
+
+    /// Write `bias[v] = log π̂(v)` from supervised labels and, if the row scale
+    /// is still Kaiming `1/sqrt(d)`, shrink it.
+    ///
+    /// Random ±1 rows with that Kaiming scale put `N(0, 1)` on every logit, which
+    /// is the same order as a log-unigram offset and caps CE about a nat above
+    /// the batch unigram. Skip when `|bias|` is already away from zero so a later
+    /// `--resume` does not reset a fitted prior.
+    pub fn install_head_unigram_prior(
+        &mut self,
+        labels: &[u32],
+        ignore_id: u32,
+    ) -> Result<HeadUnigramInstall> {
+        let vocab = self.head.out_features;
+        self.head.ensure_bias();
+        let bias_abs = self.head.bias.as_ref().map(mean_abs_fp16).unwrap_or(0.0);
+        if bias_abs > HEAD_BIAS_PRIOR_ABS_EPS {
+            return Ok(HeadUnigramInstall {
+                applied: false,
+                n_targets: 0,
+                bias_rms: self.head.bias.as_ref().map(rms_fp16).unwrap_or(0.0),
+                scale_rms: rms_fp16(&self.head.scale),
+                shrunk_kaiming_scale: false,
+            });
+        }
+        let mut counts = vec![0_u64; vocab];
+        let mut n_targets = 0_u64;
+        for &id in labels {
+            if id == ignore_id {
+                continue;
+            }
+            let index = id as usize;
+            if index >= vocab {
+                continue;
+            }
+            counts[index] = counts[index].saturating_add(1);
+            n_targets = n_targets.saturating_add(1);
+        }
+        if n_targets == 0 {
+            bail!("head unigram prior needs at least one supervised label");
+        }
+        let denom = (n_targets as f32) + vocab as f32;
+        let mut logs = vec![0.0_f32; vocab];
+        let mut log_sum = 0.0_f32;
+        for (slot, count) in logs.iter_mut().zip(counts.iter()) {
+            let logp = (*count as f32).ln_1p() - denom.ln();
+            *slot = logp;
+            log_sum += logp;
+        }
+        let log_mean = log_sum / vocab as f32;
+        {
+            let bias = self
+                .head
+                .bias
+                .as_mut()
+                .ok_or_else(|| anyhow::anyhow!("head bias missing after ensure_bias"))?;
+            for (index, logp) in logs.iter().enumerate() {
+                bias.set(index, *logp - log_mean);
+            }
+        }
+        let shrunk_kaiming_scale = self.shrink_head_kaiming_scale();
+        Ok(HeadUnigramInstall {
+            applied: true,
+            n_targets: n_targets as usize,
+            bias_rms: self.head.bias.as_ref().map(rms_fp16).unwrap_or(0.0),
+            scale_rms: rms_fp16(&self.head.scale),
+            shrunk_kaiming_scale,
+        })
+    }
+
+    fn shrink_head_kaiming_scale(&mut self) -> bool {
+        let d = self.head.in_features as f32;
+        if d <= 0.0 {
+            return false;
+        }
+        let kaiming = d.sqrt().recip();
+        let n = self.head.scale.len();
+        if n == 0 {
+            return false;
+        }
+        let mean: f32 = (0..n).map(|i| self.head.scale.get(i)).sum::<f32>() / n as f32;
+        if !(mean > kaiming * 0.5 && mean < kaiming * 2.0) {
+            return false;
+        }
+        for i in 0..n {
+            self.head
+                .scale
+                .set(i, self.head.scale.get(i) * HEAD_KAIMING_SCALE_SHRINK);
+        }
+        true
+    }
+
+    fn apply_head_bias_sgd(&mut self, g_bias: Option<&[f32]>, learning_rate: f32) {
+        let Some(g_bias) = g_bias else {
+            return;
+        };
+        let Some(bias) = self.head.bias.as_mut() else {
+            return;
+        };
+        let lr = learning_rate * HEAD_BIAS_LR_MULT;
+        let n = g_bias.len().min(bias.len());
+        for o in 0..n {
+            bias.apply_clipped_sgd(o, g_bias[o], lr);
+        }
     }
 
     fn apply_head_ce(
@@ -2957,13 +3083,7 @@ impl UllisHeron {
                     .scale
                     .apply_clipped_sgd(o, head.scale_gradient[o], learning_rate);
             }
-            if let (Some(bias), Some(g_bias)) =
-                (self.head.bias.as_mut(), head.bias_gradient.as_ref())
-            {
-                for o in 0..vocab {
-                    bias.apply_clipped_sgd(o, g_bias[o], learning_rate);
-                }
-            }
+            self.apply_head_bias_sgd(head.bias_gradient.as_deref(), learning_rate);
             let flips = bit_flip_count(&before, &self.head.bits);
             let (loss_p10, loss_p50, loss_p90) =
                 loss_percentiles(&head.row_loss, time, targets, ignore_id);
@@ -3030,11 +3150,12 @@ impl UllisHeron {
         let flips = self.head.flip_after_gradients(
             &self.g_w[..weights],
             &g_scale,
-            g_bias.as_deref(),
+            None,
             learning_rate,
             binaryconnect_ste_scale(time.saturating_sub(1)),
             metal,
         )?;
+        self.apply_head_bias_sgd(g_bias.as_deref(), learning_rate);
         let mean = if n_valid == 0 {
             0.0
         } else {
@@ -3936,6 +4057,37 @@ mod tests {
             after > other,
             "repeated-target bias {after} must exceed an unused class {other}"
         );
+    }
+
+    #[test]
+    fn unigram_prior_drops_ce_toward_batch_unigram() {
+        let mut model = UllisHeron::new(tiny_train_cfg()).unwrap();
+        let tokens: Vec<u32> = (0..32).map(|i| 4 + (i % 8) as u32).collect();
+        let before = model.train_step(&tokens, 1, 32, 1e-8).unwrap().next_token;
+        let mut fitted = UllisHeron::new(tiny_train_cfg()).unwrap();
+        let corpus: Vec<u32> = (0..4096).map(|i| 4 + (i % 8) as u32).collect();
+        let prior = fitted
+            .install_head_unigram_prior(&corpus, CE_NO_IGNORE)
+            .unwrap();
+        assert!(prior.applied);
+        assert!(prior.shrunk_kaiming_scale);
+        assert!(prior.bias_rms > 0.2, "log-unigram rms={}", prior.bias_rms);
+        let after = fitted.train_step(&tokens, 1, 32, 1e-8).unwrap();
+        assert!(
+            after.next_token < after.unigram_ce + 1.0,
+            "prior CE {} should sit near unigram {}",
+            after.next_token,
+            after.unigram_ce
+        );
+        assert!(
+            after.next_token < before - 0.5,
+            "prior CE {} must beat Kaiming-head CE {before}",
+            after.next_token
+        );
+        let skipped = fitted
+            .install_head_unigram_prior(&corpus, CE_NO_IGNORE)
+            .unwrap();
+        assert!(!skipped.applied);
     }
 
     #[test]

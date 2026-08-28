@@ -16,8 +16,9 @@ pub use config::{Architecture, MemoryEstimate, RosaGradMode, TrainConfig};
 pub use conversation::{ChatMessage, generation_prefix, render_messages};
 pub use decode::{DecodeConfig, apply_openai_penalties, select_token};
 pub use model::{
-    CE_NO_IGNORE, CausalLoss, CheckpointInspect, HeronGenerateState, InferenceStateBytes,
-    ModelCheckpoint, ParamCounts, TrainStepProfile, UllisHeron, causal_ce_gradient_scale,
+    CE_NO_IGNORE, CausalLoss, CheckpointInspect, HEAD_BIAS_LR_MULT, HeadUnigramInstall,
+    HeronGenerateState, InferenceStateBytes, ModelCheckpoint, ParamCounts, TrainStepProfile,
+    UllisHeron, causal_ce_gradient_scale,
 };
 pub use optimizer::{Lion, LionConfig, OptimizerKind};
 pub use precision::{Fp16, Fp16Storage};

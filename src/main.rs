@@ -566,6 +566,18 @@ fn train(
         stream.len(),
         encode_started.elapsed().as_secs_f64()
     ));
+    let prior = model.install_head_unigram_prior(&labels, pad_id)?;
+    if prior.applied {
+        log_status(format!(
+            "head unigram prior n={} bias_rms={:.3} scale_rms={:.4} kaiming_shrink={}",
+            prior.n_targets, prior.bias_rms, prior.scale_rms, prior.shrunk_kaiming_scale
+        ));
+    } else {
+        log_status(format!(
+            "head unigram prior skipped (bias already fitted, rms={:.3})",
+            prior.bias_rms
+        ));
+    }
     let batcher = CausalBatcher::from_config_with_labels(
         &stream,
         &labels,
@@ -708,11 +720,12 @@ fn train(
             "cmix_value_rms": loss.cmix_value_rms,
             "head_latent_abs_mean": loss.head_latent_abs_mean,
             "head_latent_step_abs": loss.head_latent_step_abs,
+            "head_bias_rms": loss.head_bias_rms,
             "phases_ms": phases,
         });
         write_metrics(&metrics_path, &row)?;
         println!(
-            "step {step}/{steps} loss={:.4} ema={:.4} p10={:.3} p50={:.3} p90={:.3} unigram={:.3} unique={} n={} flips={}/{}/{} (head/cmix/o) embed_grms={:.2e} scale_grms={:.2e} cmix_vrms={:.3} |w|={:.3} dw={:.2e} resid={:.2e} {millis:.0}ms {tps:.0} tok/s",
+            "step {step}/{steps} loss={:.4} ema={:.4} p10={:.3} p50={:.3} p90={:.3} unigram={:.3} unique={} n={} flips={}/{}/{} (head/cmix/o) embed_grms={:.2e} scale_grms={:.2e} cmix_vrms={:.3} |w|={:.3} dw={:.2e} bias_rms={:.3} resid={:.2e} {millis:.0}ms {tps:.0} tok/s",
             loss.next_token,
             ema,
             loss.loss_p10,
@@ -729,6 +742,7 @@ fn train(
             loss.cmix_value_rms,
             loss.head_latent_abs_mean,
             loss.head_latent_step_abs,
+            loss.head_bias_rms,
             loss.residual_abs_mean
         );
         if let Some(profile) = model.last_step_profile() {
