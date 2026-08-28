@@ -35,29 +35,47 @@ kernel void ullis_identity(
     }
 }
 
-// Stateless optimizer primitive for FP16 tensors. Matches Fp16Storage::apply_clipped_sgd.
+// Clipped SGD with an FP32 error-diffusion carry. Matches Fp16Storage::apply_clipped_sgd.
 kernel void ullis_clipped_sgd_fp16(
     device half *parameters [[buffer(0)]],
-    device const float *gradient [[buffer(1)]],
-    constant float &learning_rate [[buffer(2)]],
-    constant uint &elements [[buffer(3)]],
+    device float *residual [[buffer(1)]],
+    device const float *gradient [[buffer(2)]],
+    constant float &learning_rate [[buffer(3)]],
+    constant uint &elements [[buffer(4)]],
     uint index [[thread_position_in_grid]]) {
     if (index < elements) {
-        const float update = clamp(gradient[index], -1.0f, 1.0f);
-        const half current = parameters[index];
-        const half rounded = half(float(current) - learning_rate * update);
-        if (rounded != current || update == 0.0f) {
-            parameters[index] = rounded;
-        } else {
-            const half neighbor = update > 0.0f
-                ? nextafter(current, half(-INFINITY))
-                : nextafter(current, half(INFINITY));
-            const float ulp = abs(float(neighbor) - float(current));
-            parameters[index] = abs(learning_rate * update) >= ulp / 32.0f
-                ? neighbor
-                : current;
-        }
+        const float current = float(parameters[index]);
+        const float update = learning_rate * clamp(gradient[index], -1.0f, 1.0f);
+        const float desired = current - update + residual[index];
+        const half rounded = half(desired);
+        residual[index] = desired - float(rounded);
+        parameters[index] = rounded;
     }
+}
+
+// BinaryConnect latent step. Matches Fp16Storage::apply_binaryconnect_sgd.
+// `gradient_scale` undoes the window-length mean so the ±1 proxy sees a sum STE.
+kernel void ullis_binaryconnect_sgd_fp16(
+    device half *parameters [[buffer(0)]],
+    device float *residual [[buffer(1)]],
+    device const float *gradient [[buffer(2)]],
+    constant float &learning_rate [[buffer(3)]],
+    constant uint &elements [[buffer(4)]],
+    constant float &gradient_scale [[buffer(5)]],
+    uint index [[thread_position_in_grid]]) {
+    if (index >= elements) {
+        return;
+    }
+    const float g = gradient[index] * gradient_scale;
+    if (g == 0.0f || !isfinite(g)) {
+        return;
+    }
+    const float current = float(parameters[index]);
+    const float update = learning_rate * clamp(g, -1.0f, 1.0f);
+    const float desired = clamp(current - update + residual[index], -1.0f, 1.0f);
+    const half rounded = half(desired);
+    residual[index] = desired - float(rounded);
+    parameters[index] = rounded;
 }
 
 kernel void ullis_residual_add(
@@ -568,17 +586,13 @@ kernel void ullis_binary_linear_latent_sgd(
             gw += output_gradient[row * out_features + o] * s * input[row * in_features + i];
         }
         weight_gradient[index] = gw;
-        const float update = clamp(gw, -1.0f, 1.0f);
-        const half current = latent[index];
-        const half rounded = half(float(current) - learning_rate * update);
-        half next = rounded;
-        if (rounded == current && update != 0.0f) {
-            const half neighbor = update > 0.0f
-                ? nextafter(current, half(-INFINITY))
-                : nextafter(current, half(INFINITY));
-            const float ulp = abs(float(neighbor) - float(current));
-            next = abs(learning_rate * update) >= ulp / 32.0f ? neighbor : current;
+        const float current = float(latent[index]);
+        float desired = current;
+        if (gw != 0.0f && isfinite(gw)) {
+            const float update = learning_rate * clamp(gw, -1.0f, 1.0f);
+            desired = clamp(current - update, -1.0f, 1.0f);
         }
+        const half next = half(desired);
         latent[index] = next;
         if (float(next) >= 0.0f) {
             packed |= 1u << lane;
@@ -711,13 +725,15 @@ kernel void ullis_streamed_cross_entropy_fp16(
     constant uint &vocab [[buffer(11)]],
     constant uint &horizon [[buffer(12)]],
     constant float &gradient_scale [[buffer(13)]],
+    constant uint &ignore_id [[buffer(14)]],
     uint row [[thread_position_in_grid]]) {
     if (row >= rows) {
         return;
     }
     const uint offset = row * channels;
     const uint position = row % time;
-    if (position + horizon >= time) {
+    const uint target = (position + horizon < time) ? tokens[row + horizon] : ignore_id;
+    if (position + horizon >= time || target == ignore_id) {
         row_loss[row] = 0.0f;
         for (uint c = 0u; c < channels; ++c) {
             hidden_gradient[offset + c] = 0.0f;
@@ -727,7 +743,6 @@ kernel void ullis_streamed_cross_entropy_fp16(
         }
         return;
     }
-    const uint target = tokens[row + horizon];
     const device float *state = hidden + offset;
     float maximum = -INFINITY;
     float target_logit = -INFINITY;
@@ -794,20 +809,21 @@ kernel void ullis_softmax_cross_entropy(
     constant uint &vocab [[buffer(6)]],
     constant uint &horizon [[buffer(7)]],
     constant float &gradient_scale [[buffer(8)]],
+    constant uint &ignore_id [[buffer(9)]],
     uint row [[thread_position_in_grid]]) {
     if (row >= rows) {
         return;
     }
     const uint start = row * vocab;
     const uint position = row % time;
-    if (position + horizon >= time) {
+    const uint target = (position + horizon < time) ? tokens[row + horizon] : ignore_id;
+    if (position + horizon >= time || target == ignore_id) {
         row_loss[row] = 0.0f;
         for (uint token = 0u; token < vocab; ++token) {
             logit_gradient[start + token] = 0.0f;
         }
         return;
     }
-    const uint target = tokens[row + horizon];
     float maximum = -INFINITY;
     for (uint token = 0u; token < vocab; ++token) {
         maximum = max(maximum, logits[start + token]);

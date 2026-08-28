@@ -1,6 +1,22 @@
 use ullis::model::{LAYER_NORM_EPS, Fp16Linear, LayerNorm, PackedBinaryLinear, RwkvCMixX070};
 
 #[test]
+fn seeded_cmix_value_is_kaiming_not_zero() {
+    let ffn = RwkvCMixX070::seeded(8, 32, 7).unwrap();
+    let n = 8 * 32;
+    let mut sum_sq = 0.0_f32;
+    for i in 0..n {
+        let v = ffn.value.weight().get(i);
+        sum_sq += v * v;
+    }
+    let rms = (sum_sq / n as f32).sqrt();
+    assert!(
+        rms > 0.05,
+        "CMix value was zero-initialized; key STE cannot train, rms={rms}"
+    );
+}
+
+#[test]
 fn layer_norm_matches_population_moments() {
     let ln = LayerNorm::new(3);
     let x = [1.0_f32, 2.0, 3.0];

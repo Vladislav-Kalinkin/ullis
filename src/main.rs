@@ -6,6 +6,11 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{self, BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::time::Instant;
+use ullis::conversation::{
+    ByteSpan, ChatMessage, generation_prefix, pack_document_windows, render_messages,
+    supervised_labels, truncate_at_assistant_end,
+};
+use ullis::decode::{DecodeConfig, apply_openai_penalties, bump_count, select_token};
 use ullis::tokenizer::{BpeTokenizer, DEFAULT_VOCAB, MIN_VOCAB, train_bpe};
 use ullis::{Architecture, CausalBatcher, ModelCheckpoint, OptimizerKind, TrainConfig, UllisHeron};
 
@@ -41,6 +46,10 @@ enum Command {
         backend: Backend,
         #[arg(long, default_value_t = 16)]
         bpe_train_mib: usize,
+        /// Cap loaded JSONL text in MiB. 0 (default) reads the whole file.
+        /// Independent of `--bpe-train-mib`, which only sizes the BPE fit.
+        #[arg(long, default_value_t = 0)]
+        data_mib: usize,
     },
     Tokenize {
         #[arg(long)]
@@ -59,6 +68,8 @@ enum Command {
         session: PathBuf,
         #[arg(long, value_enum, default_value_t = ThinkingLevel::Medium)]
         thinking: ThinkingLevel,
+        #[command(flatten)]
+        decode: DecodeArgs,
     },
     Generate {
         #[arg(long)]
@@ -67,6 +78,8 @@ enum Command {
         prompt: String,
         #[arg(long, default_value_t = 64)]
         max_tokens: usize,
+        #[command(flatten)]
+        decode: DecodeArgs,
     },
     EvalDigits {
         #[arg(long)]
@@ -76,6 +89,39 @@ enum Command {
         #[arg(long, default_value_t = 8)]
         max_digits: usize,
     },
+}
+
+#[derive(Clone, Debug, Args)]
+struct DecodeArgs {
+    /// 0 is greedy argmax (Holtzman loops). Default matches Completions-style sampling.
+    #[arg(long, default_value_t = 0.8)]
+    temperature: f32,
+    /// Nucleus mass in (0, 1]. Ignored when temperature is 0.
+    #[arg(long, default_value_t = 0.9)]
+    top_p: f32,
+    /// OpenAI frequency_penalty in [-2, 2]: subtract count·α from each generated id.
+    #[arg(long, default_value_t = 0.5)]
+    frequency_penalty: f32,
+    /// OpenAI presence_penalty in [-2, 2]: subtract α once a generated id has appeared.
+    #[arg(long, default_value_t = 0.0)]
+    presence_penalty: f32,
+    #[arg(long, default_value_t = 7)]
+    seed: u64,
+}
+
+impl DecodeArgs {
+    fn config(&self) -> Result<DecodeConfig> {
+        let cfg = DecodeConfig {
+            temperature: self.temperature,
+            top_p: self.top_p,
+            presence_penalty: self.presence_penalty,
+            frequency_penalty: self.frequency_penalty,
+            min_new_tokens: 1,
+            seed: self.seed,
+        };
+        cfg.validate()?;
+        Ok(cfg)
+    }
 }
 
 #[derive(Clone, Debug, Args, Default)]
@@ -213,8 +259,30 @@ fn log_status(message: impl Display) {
     let _ = io::stderr().flush();
 }
 
+struct TrainingDocument {
+    text: String,
+    spans: Vec<ByteSpan>,
+}
+
+fn training_document(record: &DatasetRecord) -> TrainingDocument {
+    let messages: Vec<ChatMessage<'_>> = record
+        .messages
+        .iter()
+        .map(|message| ChatMessage {
+            role: &message.role,
+            content: &message.content,
+            thinking: message.thinking.as_deref(),
+        })
+        .collect();
+    let (text, spans) = render_messages(&messages);
+    TrainingDocument { text, spans }
+}
+
 /// Stream JSONL into training strings, stopping once `max_bytes` of text is in hand.
-fn load_training_texts(path: &Path, max_bytes: usize) -> Result<(Vec<String>, usize, usize)> {
+fn load_training_texts(
+    path: &Path,
+    max_bytes: usize,
+) -> Result<(Vec<TrainingDocument>, usize, usize)> {
     let file = File::open(path).with_context(|| format!("open dataset {}", path.display()))?;
     let mut texts = Vec::new();
     let mut records = 0_usize;
@@ -227,9 +295,9 @@ fn load_training_texts(path: &Path, max_bytes: usize) -> Result<(Vec<String>, us
         let record: DatasetRecord = serde_json::from_str(&line)
             .with_context(|| format!("parse dataset line {}", index + 1))?;
         validate_record(&record).with_context(|| format!("validate dataset line {}", index + 1))?;
-        let text = training_text(&record);
-        text_bytes = text_bytes.saturating_add(text.len());
-        texts.push(text);
+        let document = training_document(&record);
+        text_bytes = text_bytes.saturating_add(document.text.len());
+        texts.push(document);
         records += 1;
         if text_bytes >= max_bytes {
             break;
@@ -241,39 +309,35 @@ fn load_training_texts(path: &Path, max_bytes: usize) -> Result<(Vec<String>, us
     Ok((texts, records, text_bytes))
 }
 
-fn cap_texts_bytes(texts: &[String], max_bytes: usize) -> Vec<String> {
-    if max_bytes == usize::MAX {
-        return texts.to_vec();
-    }
+fn cap_texts_bytes(texts: &[TrainingDocument], max_bytes: usize) -> Vec<String> {
     let mut out = Vec::new();
     let mut used = 0_usize;
     for text in texts {
-        if used >= max_bytes && !out.is_empty() {
+        if max_bytes != usize::MAX && used >= max_bytes && !out.is_empty() {
             break;
         }
-        used = used.saturating_add(text.len());
-        out.push(text.clone());
+        used = used.saturating_add(text.text.len());
+        out.push(text.text.clone());
     }
     out
 }
 
 fn encode_training_stream(
-    texts: &[String],
+    documents: &[TrainingDocument],
     tokenizer: &mut BpeTokenizer,
+    context_len: usize,
     needed: usize,
-) -> Result<Vec<u32>> {
+) -> Result<(Vec<u32>, Vec<u32>)> {
     if needed == 0 {
         bail!("encoded corpus is empty");
     }
-    let mut corpus = Vec::with_capacity(needed);
-    for text in texts {
-        corpus.extend(tokenizer.encode(text, true, true));
-        if corpus.len() >= needed {
-            corpus.truncate(needed);
-            return Ok(corpus);
-        }
+    let mut packed = Vec::new();
+    for document in documents {
+        let ids = tokenizer.encode(&document.text, true, true);
+        let labels = supervised_labels(tokenizer, &ids, &document.text, &document.spans);
+        packed.push((ids, labels));
     }
-    cycle_corpus(&corpus, needed)
+    pack_document_windows(&packed, context_len, tokenizer.pad_id, needed)
 }
 
 fn default_train_config(vocab_size: usize) -> TrainConfig {
@@ -352,45 +416,6 @@ fn load_config(path: Option<PathBuf>, overrides: &TrainOverrides) -> Result<Trai
     Ok(cfg)
 }
 
-fn training_text(record: &DatasetRecord) -> String {
-    let mut out = String::new();
-    for message in &record.messages {
-        match message.role.as_str() {
-            "system" => {
-                out.push_str("<system>");
-                out.push_str(&message.content);
-                out.push_str("</system>");
-            }
-            "user" => {
-                out.push_str("<user>");
-                out.push_str(&message.content);
-                out.push_str("</user>");
-            }
-            "assistant" => {
-                out.push_str("<assistant><thinking>");
-                out.push_str(message.thinking.as_deref().unwrap_or(""));
-                out.push_str("</thinking>");
-                out.push_str(&message.content);
-                out.push_str("</assistant>");
-            }
-            "tool" => {
-                out.push_str("<tool>");
-                out.push_str(&message.content);
-                out.push_str("</tool>");
-            }
-            _ => {}
-        }
-    }
-    out
-}
-
-fn cycle_corpus(ids: &[u32], needed: usize) -> Result<Vec<u32>> {
-    if ids.is_empty() {
-        bail!("encoded corpus is empty");
-    }
-    Ok(ids.iter().copied().cycle().take(needed).collect())
-}
-
 fn write_metrics(path: &Path, row: &serde_json::Value) -> Result<()> {
     let mut file = OpenOptions::new().create(true).append(true).open(path)?;
     writeln!(file, "{row}")?;
@@ -408,6 +433,7 @@ fn train(
     checkpoint_every: usize,
     backend: Backend,
     bpe_train_mib: usize,
+    data_mib: usize,
 ) -> Result<()> {
     if steps == 0 || checkpoint_every == 0 || !learning_rate.is_finite() || learning_rate <= 0.0 {
         bail!("steps, checkpoint-every, and learning-rate must be positive");
@@ -431,24 +457,22 @@ fn train(
         }
         cfg.optimizer.require_train_step()?;
     }
-    let context_hint = cfg_for_budget
-        .as_ref()
-        .map_or(2048, |cfg| cfg.context_len);
-    let batch_hint = cfg_for_budget.as_ref().map_or(1, |cfg| cfg.batch_size);
-    let needed = steps
-        .saturating_mul(batch_hint)
-        .saturating_mul(context_hint);
     let bpe_bytes = bpe_train_mib.saturating_mul(1024 * 1024);
-    let text_budget = if bpe_bytes == 0 {
+    let text_budget = if data_mib == 0 {
         usize::MAX
     } else {
-        bpe_bytes.max(needed)
+        data_mib.saturating_mul(1024 * 1024)
     };
 
     let load_started = Instant::now();
     log_status(format!(
-        "loading dataset {} (text budget {} bytes, bpe-train-mib={bpe_train_mib})",
+        "loading dataset {} (data-mib={}, text budget {} bytes, bpe-train-mib={bpe_train_mib})",
         data.display(),
+        if data_mib == 0 {
+            "all".into()
+        } else {
+            data_mib.to_string()
+        },
         if text_budget == usize::MAX {
             "unlimited".into()
         } else {
@@ -483,7 +507,14 @@ fn train(
             BpeTokenizer::load(&tokenizer_path)?
         } else {
             let bpe_started = Instant::now();
-            let bpe_texts = cap_texts_bytes(&texts, if bpe_bytes == 0 { usize::MAX } else { bpe_bytes });
+            let bpe_texts = cap_texts_bytes(
+                &texts,
+                if bpe_bytes == 0 {
+                    usize::MAX
+                } else {
+                    bpe_bytes
+                },
+            );
             let bpe_text_bytes: usize = bpe_texts.iter().map(String::len).sum();
             log_status(format!(
                 "training BPE vocab_ceiling={} on {bpe_text_bytes} bytes",
@@ -527,13 +558,20 @@ fn train(
         .saturating_mul(model.cfg.context_len);
     let encode_started = Instant::now();
     log_status(format!("encoding {needed} training tokens"));
-    let stream = encode_training_stream(&texts, &mut tokenizer, needed)?;
+    let pad_id = tokenizer.pad_id;
+    let (stream, labels) =
+        encode_training_stream(&texts, &mut tokenizer, model.cfg.context_len, needed)?;
     log_status(format!(
-        "encoded {} tokens in {:.1}s",
+        "encoded {} tokens (document windows, assistant+EOS CE) in {:.1}s",
         stream.len(),
         encode_started.elapsed().as_secs_f64()
     ));
-    let batcher = CausalBatcher::from_config(&stream, &model.cfg, model.cfg.context_len)?;
+    let batcher = CausalBatcher::from_config_with_labels(
+        &stream,
+        &labels,
+        &model.cfg,
+        model.cfg.context_len,
+    )?;
 
     #[cfg(target_os = "macos")]
     let metal = match backend {
@@ -569,6 +607,12 @@ fn train(
         "starting loop after {:.1}s of setup",
         started_all.elapsed().as_secs_f64()
     ));
+    log_status(format!(
+        "optimizer={:?} lr={learning_rate} rosa_grad={:?} (QKV frozen; window-mean CE on FP16, token-sum STE on BinaryConnect; |w0|={})",
+        model.cfg.optimizer,
+        model.cfg.rosa_grad,
+        ullis::model::BINARYCONNECT_INIT_ABS
+    ));
     let metrics_path = run.join("metrics.jsonl");
     let mut loss_ema = None;
     let ln_v = (model.cfg.vocab_size as f32).ln();
@@ -580,24 +624,30 @@ fn train(
         let started = Instant::now();
         #[cfg(target_os = "macos")]
         let loss = if let Some(runtime) = &metal {
-            model.train_step_metal(
+            model.train_step_metal_with_labels(
                 runtime,
                 batch.tokens(),
+                batch.labels(),
+                pad_id,
                 batch.batch_size(),
                 batch.time(),
                 learning_rate,
             )?
         } else {
-            model.train_step(
+            model.train_step_with_labels(
                 batch.tokens(),
+                batch.labels(),
+                pad_id,
                 batch.batch_size(),
                 batch.time(),
                 learning_rate,
             )?
         };
         #[cfg(not(target_os = "macos"))]
-        let loss = model.train_step(
+        let loss = model.train_step_with_labels(
             batch.tokens(),
+            batch.labels(),
+            pad_id,
             batch.batch_size(),
             batch.time(),
             learning_rate,
@@ -638,17 +688,48 @@ fn train(
             "loss": loss.next_token,
             "loss_ema": ema,
             "loss_delta": delta,
+            "loss_p10": loss.loss_p10,
+            "loss_p50": loss.loss_p50,
+            "loss_p90": loss.loss_p90,
+            "unigram_ce": loss.unigram_ce,
+            "unique_targets": loss.unique_targets,
             "learning_rate": learning_rate,
             "architecture": "heron",
             "rosa_bits": model.cfg.rosa_bits,
             "rosa_grad": "stop_grad_bits",
             "binary_flip_count": loss.binary_flip_count,
+            "flips_head": loss.flips_head,
+            "flips_cmix": loss.flips_cmix,
+            "flips_rosa_o": loss.flips_rosa_o,
+            "embed_grad_rms": loss.embed_grad_rms,
+            "head_scale_grad_rms": loss.head_scale_grad_rms,
+            "head_scale_rms": loss.head_scale_rms,
+            "residual_abs_mean": loss.residual_abs_mean,
+            "cmix_value_rms": loss.cmix_value_rms,
+            "head_latent_abs_mean": loss.head_latent_abs_mean,
+            "head_latent_step_abs": loss.head_latent_step_abs,
             "phases_ms": phases,
         });
         write_metrics(&metrics_path, &row)?;
         println!(
-            "step {step}/{steps} loss={:.4} ema={:.4} rosa_grad=stop_grad_bits flips={} {millis:.0}ms {tps:.0} tok/s",
-            loss.next_token, ema, loss.binary_flip_count
+            "step {step}/{steps} loss={:.4} ema={:.4} p10={:.3} p50={:.3} p90={:.3} unigram={:.3} unique={} n={} flips={}/{}/{} (head/cmix/o) embed_grms={:.2e} scale_grms={:.2e} cmix_vrms={:.3} |w|={:.3} dw={:.2e} resid={:.2e} {millis:.0}ms {tps:.0} tok/s",
+            loss.next_token,
+            ema,
+            loss.loss_p10,
+            loss.loss_p50,
+            loss.loss_p90,
+            loss.unigram_ce,
+            loss.unique_targets,
+            loss.next_token_count,
+            loss.flips_head,
+            loss.flips_cmix,
+            loss.flips_rosa_o,
+            loss.embed_grad_rms,
+            loss.head_scale_grad_rms,
+            loss.cmix_value_rms,
+            loss.head_latent_abs_mean,
+            loss.head_latent_step_abs,
+            loss.residual_abs_mean
         );
         if let Some(profile) = model.last_step_profile() {
             log_status(format!("step {step} phases {}", profile.line()));
@@ -770,26 +851,26 @@ fn inspect_run(run: &Path) -> Result<()> {
     Ok(())
 }
 
-fn greedy_token(logits: &[f32], tokenizer: &BpeTokenizer) -> u32 {
-    logits
-        .iter()
-        .enumerate()
-        .filter(|(id, _)| *id as u32 != tokenizer.pad_id && *id as u32 != tokenizer.bos_id)
-        .max_by(|(_, a), (_, b)| a.total_cmp(b))
-        .map(|(id, _)| id as u32)
-        .expect("non-empty vocabulary")
-}
-
-fn greedy_generate(
+fn generate_completion(
     model: &UllisHeron,
     tokenizer: &mut BpeTokenizer,
     prompt: &str,
     max_tokens: usize,
+    chat_template: bool,
+    decode: DecodeConfig,
 ) -> Result<String> {
     if max_tokens == 0 {
         bail!("max-tokens must be positive");
     }
-    let mut ids = tokenizer.encode(prompt, true, false);
+    decode.validate()?;
+    // Train CE is next-token on assistant spans of `render_messages`. A raw
+    // prompt is OOD unless it is wrapped with the same open assistant turn.
+    let prompt = if chat_template {
+        generation_prefix(prompt)
+    } else {
+        prompt.to_string()
+    };
+    let mut ids = tokenizer.encode(&prompt, true, false);
     if ids.is_empty() {
         ids.push(tokenizer.bos_id);
     }
@@ -805,8 +886,25 @@ fn greedy_generate(
         logits = model.generate_step(&mut state, id)?;
     }
     let mut produced = Vec::with_capacity(max_tokens);
+    let mut counts = vec![0_u32; logits.len()];
+    let mut rng = decode.seed | 1;
     for _ in 0..max_tokens {
-        let next = greedy_token(&logits, tokenizer);
+        apply_openai_penalties(
+            &mut logits,
+            &counts,
+            decode.presence_penalty,
+            decode.frequency_penalty,
+        );
+        let suppress_eos = produced.len() < decode.min_new_tokens;
+        let next = select_token(
+            &logits,
+            decode,
+            &mut rng,
+            tokenizer.pad_id,
+            tokenizer.bos_id,
+            tokenizer.eos_id,
+            suppress_eos,
+        );
         if next == tokenizer.eos_id {
             break;
         }
@@ -814,12 +912,27 @@ fn greedy_generate(
             break;
         }
         produced.push(next);
+        bump_count(&mut counts, next);
+        if chat_template {
+            let decoded = tokenizer.decode(&produced);
+            if let Some(truncated) = truncate_at_assistant_end(&decoded) {
+                return Ok(truncated.to_string());
+            }
+        }
         logits = model.generate_step(&mut state, next)?;
+        if counts.len() != logits.len() {
+            counts.resize(logits.len(), 0);
+        }
     }
     Ok(tokenizer.decode(&produced))
 }
 
-fn chat(checkpoint: PathBuf, session: PathBuf, mut thinking: ThinkingLevel) -> Result<()> {
+fn chat(
+    checkpoint: PathBuf,
+    session: PathBuf,
+    mut thinking: ThinkingLevel,
+    decode: DecodeConfig,
+) -> Result<()> {
     let (model, mut tokenizer) = load_model(&checkpoint)?;
     if let Some(parent) = session.parent() {
         fs::create_dir_all(parent)?;
@@ -862,8 +975,7 @@ fn chat(checkpoint: PathBuf, session: PathBuf, mut thinking: ThinkingLevel) -> R
             tool_call_id: None,
         };
         writeln!(history, "{}", serde_json::to_string(&user)?)?;
-        let prompt = format!("<user>{line}\n<assistant><thinking level=\"{thinking:?}\">");
-        let reply = greedy_generate(&model, &mut tokenizer, &prompt, 64)?;
+        let reply = generate_completion(&model, &mut tokenizer, &line, 64, true, decode)?;
         let assistant = DatasetMessage {
             role: "assistant".into(),
             content: reply.clone(),
@@ -877,14 +989,19 @@ fn chat(checkpoint: PathBuf, session: PathBuf, mut thinking: ThinkingLevel) -> R
     Ok(())
 }
 
-fn generate(checkpoint: PathBuf, prompt: String, max_tokens: usize) -> Result<()> {
+fn generate(
+    checkpoint: PathBuf,
+    prompt: String,
+    max_tokens: usize,
+    decode: DecodeConfig,
+) -> Result<()> {
     if max_tokens == 0 {
         bail!("max-tokens must be positive");
     }
     let (model, mut tokenizer) = load_model(&checkpoint)?;
     println!(
         "{}",
-        greedy_generate(&model, &mut tokenizer, &prompt, max_tokens)?
+        generate_completion(&model, &mut tokenizer, &prompt, max_tokens, true, decode)?
     );
     Ok(())
 }
@@ -1078,6 +1195,7 @@ fn main() -> Result<()> {
             checkpoint_every,
             backend,
             bpe_train_mib,
+            data_mib,
         }) => train(
             data,
             run,
@@ -1089,6 +1207,7 @@ fn main() -> Result<()> {
             checkpoint_every,
             backend,
             bpe_train_mib,
+            data_mib,
         ),
         Some(Command::Tokenize { data, output }) => {
             let records = load_dataset(&data)?;
@@ -1106,12 +1225,14 @@ fn main() -> Result<()> {
             checkpoint,
             session,
             thinking,
-        }) => chat(checkpoint, session, thinking),
+            decode,
+        }) => chat(checkpoint, session, thinking, decode.config()?),
         Some(Command::Generate {
             checkpoint,
             prompt,
             max_tokens,
-        }) => generate(checkpoint, prompt, max_tokens),
+            decode,
+        }) => generate(checkpoint, prompt, max_tokens, decode.config()?),
         Some(Command::EvalDigits {
             checkpoint,
             task,

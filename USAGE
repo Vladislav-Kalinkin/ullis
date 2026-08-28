@@ -9,6 +9,8 @@ SYNOPSIS
        ullis tokenize --data INPUT --output OUTPUT
        ullis inspect --run DIRECTORY
        ullis generate --checkpoint CHECKPOINT --prompt TEXT [--max-tokens N]
+                      [--temperature T] [--top-p P] [--frequency-penalty A]
+                      [--presence-penalty A] [--seed N]
        ullis chat --checkpoint CHECKPOINT [--session FILE] [--thinking LEVEL]
        ullis eval-digits --checkpoint CHECKPOINT --task reverse|plusminus [--max-digits N]
 
@@ -41,6 +43,8 @@ TRAIN
        --learning-rate RATE      Positive stateless-SGD rate. Default: 1e-3.
        --checkpoint-every N      Save every N steps and at completion. Default: 100.
        --backend metal|cpu       Default: metal.
+       --bpe-train-mib N         Bytes of loaded text used to fit BPE. Default: 16. 0 fits BPE on all loaded text.
+       --data-mib N              Cap loaded JSONL text in MiB. Default: 0 (entire file). Independent of BPE.
 
 TOKENIZE
        ullis tokenize --data raw.jsonl --output normalized.jsonl
@@ -55,12 +59,12 @@ INSPECT
 GENERATE
        ullis generate --checkpoint runs/first/checkpoint.json --prompt 'Hello' --max-tokens 64
 
-       Loads tokenizer.json next to the checkpoint. Greedy t+1 decode with the same RosaSam::push used in train (incremental, not full recompute). Correctness decoder, not a sampling server.
+       Loads tokenizer.json next to the checkpoint. Incremental RosaSam::push, same as train. Default decode is Completions-style: temperature 0.8, top-p 0.9, frequency-penalty 0.5, presence-penalty 0. Frequency penalty is OpenAI's additive `μ -= count·α` on generated ids (not a multiplicative Holtzman/HF repetition_penalty). Temperature 0 is greedy argmax; combine with `--frequency-penalty 0` for the old loop-prone decoder. EOS is suppressed until at least one new token so greedy cannot emit an empty completion.
 
 CHAT
        ullis chat --checkpoint runs/first/checkpoint.json --session sessions/first.jsonl --thinking high
 
-       Line-oriented loop. Commands: /think low|medium|high|xhigh|off, /save, /quit. User and assistant records are JSONL. Thinking level is prompt policy metadata; it does not impose a separate inference-time compute budget.
+       Line-oriented loop. Commands: /think low|medium|high|xhigh|off, /save, /quit. User and assistant records are JSONL. Thinking level is prompt policy metadata; it does not impose a separate inference-time compute budget. Accepts the same `--temperature` / `--top-p` / penalty flags as generate.
 
 EVAL-DIGITS
        ullis eval-digits --checkpoint FILE --task reverse|plusminus [--max-digits 8]

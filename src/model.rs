@@ -4,18 +4,51 @@
 //! Checkpoints store bits, learned scales, and bias only.
 
 use crate::config::{Architecture, RosaGradMode, TrainConfig};
-#[cfg(test)]
-use crate::precision::Fp16;
-use crate::precision::Fp16Storage;
+use crate::precision::{Fp16, Fp16Storage};
 #[cfg(target_os = "macos")]
 use crate::rosa::pack_bitplane;
 use crate::rosa::{RosaSam, bit_from_activation, sam_workspace_bytes};
 use crate::wkv7::{self, CHUNK_LEN, HEAD_SIZE};
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::time::Instant;
 
 pub const CHECKPOINT_FORMAT_VERSION: u32 = 2;
+
+/// Sentinel for next-token CE: every in-range target is supervised.
+pub const CE_NO_IGNORE: u32 = u32::MAX;
+
+/// Positions whose *target* (`row + horizon`) is `ignore_id` contribute no CE.
+pub fn causal_ce_row_valid(
+    row: usize,
+    time: usize,
+    horizon: usize,
+    targets: &[u32],
+    ignore_id: u32,
+) -> bool {
+    if time == 0 || row % time + horizon >= time {
+        return false;
+    }
+    let target_row = row + horizon;
+    target_row < targets.len() && targets[target_row] != ignore_id
+}
+
+/// Softmax `gy = p − y` scale for FP16 tensors (embeddings, LN, scales, CMix value).
+///
+/// Denominator is the window length `T−1`, not `n_valid`. Mean-over-valid
+/// (`1/N`) makes a singleton EOS step as large as a 2000-token assistant span
+/// and, with `lr=0.01` plus per-element clip `[-1,1]`, turns head scales into
+/// sign-SGD. Token-sum (`1`) does the same with `scale_grms` in the thousands
+/// and randomizes embeddings until CPU ROSA SAM falls off a cliff. `N = 0`
+/// zeroes `gy`. Reported loss is still the mean over valid tokens.
+pub fn causal_ce_gradient_scale(n_valid: usize, time: usize) -> f32 {
+    if n_valid == 0 || time < 2 {
+        0.0
+    } else {
+        1.0 / (time - 1) as f32
+    }
+}
 
 /// Next-token cross-entropy statistics. Values are means over valid positions;
 /// no `[batch, time, vocab]` logits tensor is retained.
@@ -24,6 +57,21 @@ pub struct CausalLoss {
     pub next_token: f32,
     pub next_token_count: usize,
     pub binary_flip_count: usize,
+    pub loss_p10: f32,
+    pub loss_p50: f32,
+    pub loss_p90: f32,
+    pub unigram_ce: f32,
+    pub unique_targets: usize,
+    pub flips_head: usize,
+    pub flips_cmix: usize,
+    pub flips_rosa_o: usize,
+    pub embed_grad_rms: f32,
+    pub head_scale_grad_rms: f32,
+    pub head_scale_rms: f32,
+    pub residual_abs_mean: f32,
+    pub cmix_value_rms: f32,
+    pub head_latent_abs_mean: f32,
+    pub head_latent_step_abs: f32,
 }
 
 /// Wall-clock breakdown of one `train_step`. Phases with the same name are summed.
@@ -397,16 +445,34 @@ impl Fp16Linear {
         Ok(())
     }
 
+    /// Kaiming-uniform-style init matching `nn.Linear` (`bound = 1/sqrt(fan_in)`).
+    pub fn seeded(out_features: usize, in_features: usize, seed: u64) -> Result<Self> {
+        let weights = out_features
+            .checked_mul(in_features)
+            .ok_or_else(|| anyhow::anyhow!("FP16 linear shape overflow"))?;
+        let scale = (in_features as f32).sqrt().recip();
+        let mut state = seed | 1;
+        Ok(Self {
+            out_features,
+            in_features,
+            weight: Fp16Storage::from_f32((0..weights).map(|_| {
+                let word = splitmix64(&mut state);
+                let unit = (word >> 11) as f32 / ((1_u64 << 53) as f32);
+                (unit * 2.0 - 1.0) * scale
+            })),
+        })
+    }
+
+    pub fn weight(&self) -> &Fp16Storage {
+        &self.weight
+    }
+
     fn weight_bits(&self) -> &[u16] {
         self.weight.as_bits()
     }
 
-    fn replace_weight(&mut self, bits: Vec<u16>) -> Result<()> {
-        if bits.len() != self.weight.len() {
-            bail!("FP16 linear install length mismatch");
-        }
-        self.weight = Fp16Storage::from_bits(bits);
-        Ok(())
+    fn replace_weight(&mut self, bits: Vec<u16>, residual: Vec<f32>) -> Result<()> {
+        self.weight.install(bits, residual)
     }
 
     fn forward_on(
@@ -449,6 +515,21 @@ impl Fp16Linear {
     }
 }
 
+/// Initial |latent| for a freshly packed ±1 matrix.
+///
+/// The forward row scale is `1/sqrt(fan_in)` and must stay that way so logit
+/// variance matches a dense linear. The BinaryConnect proxy is a different
+/// quantity: only `sign(latent)` is used in the forward pass. Starting near
+/// zero lets a token-sum STE gradient cross the decision boundary in a
+/// short run; reconstructing a checkpoint at `±1` keeps a trained sign sticky.
+pub const BINARYCONNECT_INIT_ABS: f32 = 0.01;
+
+/// Undo the window-length mean on a BinaryConnect STE so the ±0.01 proxy sees a
+/// token sum. Pass `T−1` in train (same denominator as [`causal_ce_gradient_scale`]).
+pub fn binaryconnect_ste_scale(slots: usize) -> f32 {
+    slots as f32
+}
+
 /// Packed ±1 linear with a persistent FP16 BinaryConnect latent.
 #[derive(Clone, Debug)]
 pub struct PackedBinaryLinear {
@@ -471,13 +552,9 @@ impl PackedBinaryLinear {
         let plus = (0..weights).map(|_| splitmix64(&mut state) & 1 == 1);
         let bits = pack_plus_bits(plus, weights);
         let mut latent = Fp16Storage::zeros(weights);
-        for o in 0..out_features {
-            let s = scale.get(o);
-            for i in 0..in_features {
-                let index = o * in_features + i;
-                let sign = if bit_is_plus(&bits, index) { 1.0 } else { -1.0 };
-                latent.set(index, s * sign);
-            }
+        for index in 0..weights {
+            let sign = if bit_is_plus(&bits, index) { 1.0 } else { -1.0 };
+            latent.set(index, BINARYCONNECT_INIT_ABS * sign);
         }
         Ok(Self {
             out_features,
@@ -539,13 +616,12 @@ impl PackedBinaryLinear {
             Some(_) => bail!("packed linear bias length mismatch"),
         };
         let mut latent = Fp16Storage::zeros(weights);
-        for o in 0..out_features {
-            let s = scale.get(o);
-            for i in 0..in_features {
-                let index = o * in_features + i;
-                let sign = if bit_is_plus(&bits, index) { 1.0 } else { -1.0 };
-                latent.set(index, s * sign);
-            }
+        // Checkpoints omit the proxy. Reconstruct at the BinaryConnect rails so
+        // a trained sign is sticky (needs 1/lr agreeing steps to flip). Fresh
+        // `seeded` matrices use BINARYCONNECT_INIT_ABS instead.
+        for index in 0..weights {
+            let sign = if bit_is_plus(&bits, index) { 1.0 } else { -1.0 };
+            latent.set(index, sign);
         }
         Ok(Self {
             out_features,
@@ -581,11 +657,16 @@ impl PackedBinaryLinear {
         self.latent.as_bits()
     }
 
-    fn replace_packed(&mut self, latent: Vec<u16>, bits: Vec<u32>) -> Result<()> {
-        if latent.len() != self.latent.len() || bits.len() != packed_word_count(self.latent.len()) {
+    fn replace_packed(
+        &mut self,
+        latent: Vec<u16>,
+        residual: Vec<f32>,
+        bits: Vec<u32>,
+    ) -> Result<()> {
+        if bits.len() != packed_word_count(self.latent.len()) {
             bail!("packed linear install length mismatch");
         }
-        self.latent = Fp16Storage::from_bits(latent);
+        self.latent.install(latent, residual)?;
         self.bits = bits;
         Ok(())
     }
@@ -687,12 +768,24 @@ impl PackedBinaryLinear {
         g_bias: Option<&[f32]>,
         learning_rate: f32,
     ) -> Result<()> {
+        self.apply_packed_sgd(g_w, g_scale, g_bias, learning_rate, 1.0)
+    }
+
+    fn apply_packed_sgd(
+        &mut self,
+        g_w: &[f32],
+        g_scale: &[f32],
+        g_bias: Option<&[f32]>,
+        learning_rate: f32,
+        ste_scale: f32,
+    ) -> Result<()> {
         let weights = self.out_features.saturating_mul(self.in_features);
         if g_w.len() != weights || g_scale.len() != self.out_features {
             bail!("packed linear SGD shape mismatch");
         }
         for i in 0..weights {
-            self.latent.apply_clipped_sgd(i, g_w[i], learning_rate);
+            self.latent
+                .apply_binaryconnect_sgd(i, g_w[i] * ste_scale, learning_rate);
         }
         for o in 0..self.out_features {
             self.scale.apply_clipped_sgd(o, g_scale[o], learning_rate);
@@ -709,32 +802,26 @@ impl PackedBinaryLinear {
         Ok(())
     }
 
-    fn flip_count_after(
-        &mut self,
-        g_w: &[f32],
-        g_scale: &[f32],
-        g_bias: Option<&[f32]>,
-        learning_rate: f32,
-    ) -> Result<usize> {
-        self.flip_after_gradients(g_w, g_scale, g_bias, learning_rate, None)
-    }
-
     fn flip_after_gradients(
         &mut self,
         g_w: &[f32],
         g_scale: &[f32],
         g_bias: Option<&[f32]>,
         learning_rate: f32,
+        ste_scale: f32,
         metal: Option<&MetalTrainRuntime<'_>>,
     ) -> Result<usize> {
         let before = self.bits.clone();
         #[cfg(target_os = "macos")]
         if let Some(device) = metal {
-            let (next_latent, next_bits) =
-                device
-                    .runtime
-                    .apply_latent_sgd(self.latent_bits(), g_w, learning_rate)?;
-            self.replace_packed(next_latent, next_bits)?;
+            let (next_latent, next_residual, next_bits) = device.runtime.apply_latent_sgd(
+                self.latent_bits(),
+                self.latent.residual(),
+                g_w,
+                learning_rate,
+                ste_scale,
+            )?;
+            self.replace_packed(next_latent, next_residual, next_bits)?;
             for o in 0..self.out_features {
                 self.scale.apply_clipped_sgd(o, g_scale[o], learning_rate);
             }
@@ -750,7 +837,7 @@ impl PackedBinaryLinear {
         }
         #[cfg(not(target_os = "macos"))]
         let _ = metal;
-        self.apply_clipped_sgd(g_w, g_scale, g_bias, learning_rate)?;
+        self.apply_packed_sgd(g_w, g_scale, g_bias, learning_rate, ste_scale)?;
         Ok(bit_flip_count(&before, &self.bits))
     }
 
@@ -845,7 +932,9 @@ impl RwkvCMixX070 {
         Ok(Self {
             x_k: Fp16Storage::zeros(d_model),
             key: PackedBinaryLinear::seeded(dim_ffn, d_model, false, seed)?,
-            value: Fp16Linear::zeros(d_model, dim_ffn)?,
+            // Official CMix is nn.Linear, not a zero matrix. A zero value blocks
+            // STE into the packed key (g_key = W_value^T g_y) for the whole run.
+            value: Fp16Linear::seeded(d_model, dim_ffn, seed ^ 0xC0FF_EE11)?,
         })
     }
 
@@ -949,6 +1038,7 @@ impl RwkvCMixX070 {
         g_x: &mut [f32],
         g_w: &mut [f32],
         learning_rate: f32,
+        ste_scale: f32,
         batch: usize,
         time: usize,
         metal: Option<&MetalTrainRuntime<'_>>,
@@ -967,15 +1057,22 @@ impl RwkvCMixX070 {
                 self.key.bits(),
                 self.key.scale_bits(),
                 self.key.latent_bits(),
+                self.key.latent.residual(),
                 self.value.weight_bits(),
+                self.value.weight.residual(),
                 rows,
                 d,
                 self.key.out_features,
                 learning_rate,
+                ste_scale,
             )?;
-            self.value.replace_weight(bwd.next_value_weight)?;
-            self.key
-                .replace_packed(bwd.next_key_latent, bwd.next_key_bits)?;
+            self.value
+                .replace_weight(bwd.next_value_weight, bwd.next_value_residual)?;
+            self.key.replace_packed(
+                bwd.next_key_latent,
+                bwd.next_key_residual,
+                bwd.next_key_bits,
+            )?;
             for o in 0..self.key.out_features {
                 self.key
                     .scale
@@ -1010,9 +1107,14 @@ impl RwkvCMixX070 {
             None,
             metal,
         )?;
-        let flips =
-            self.key
-                .flip_count_after(&g_w[..key_weights], &g_scale, None, learning_rate)?;
+        let flips = self.key.flip_after_gradients(
+            &g_w[..key_weights],
+            &g_scale,
+            None,
+            learning_rate,
+            ste_scale,
+            metal,
+        )?;
         let mut g_mix = vec![0.0; d];
         lerp_shift_backward(
             &tape.xx, &self.x_k, &g_shifted, batch, time, d, g_x, &mut g_mix,
@@ -1200,10 +1302,22 @@ impl RwkvRosaQkv1Bit {
         let rows = batch.saturating_mul(time);
         #[cfg(target_os = "macos")]
         if let Some(device) = metal {
-            let q_bias = self.q.bias_bits().ok_or_else(|| anyhow::anyhow!("ROSA Q bias missing"))?;
-            let k_bias = self.k.bias_bits().ok_or_else(|| anyhow::anyhow!("ROSA K bias missing"))?;
-            let v_bias = self.v.bias_bits().ok_or_else(|| anyhow::anyhow!("ROSA V bias missing"))?;
-            let o_bias = self.o.bias_bits().ok_or_else(|| anyhow::anyhow!("ROSA O bias missing"))?;
+            let q_bias = self
+                .q
+                .bias_bits()
+                .ok_or_else(|| anyhow::anyhow!("ROSA Q bias missing"))?;
+            let k_bias = self
+                .k
+                .bias_bits()
+                .ok_or_else(|| anyhow::anyhow!("ROSA K bias missing"))?;
+            let v_bias = self
+                .v
+                .bias_bits()
+                .ok_or_else(|| anyhow::anyhow!("ROSA V bias missing"))?;
+            let o_bias = self
+                .o
+                .bias_bits()
+                .ok_or_else(|| anyhow::anyhow!("ROSA O bias missing"))?;
             let fwd = device.runtime.rosa_block_forward(
                 x,
                 self.x_q.as_bits(),
@@ -1258,6 +1372,7 @@ impl RwkvRosaQkv1Bit {
         gy: &[f32],
         g_w: &mut [f32],
         learning_rate: f32,
+        ste_scale: f32,
         rows: usize,
         metal: Option<&MetalTrainRuntime<'_>>,
     ) -> Result<usize> {
@@ -1279,11 +1394,14 @@ impl RwkvRosaQkv1Bit {
                 self.o.scale_bits(),
                 o_bias,
                 self.o.latent_bits(),
+                self.o.latent.residual(),
                 rows,
                 d,
                 learning_rate,
+                ste_scale,
             )?;
-            self.o.replace_packed(bwd.next_latent, bwd.next_bits)?;
+            self.o
+                .replace_packed(bwd.next_latent, bwd.next_residual, bwd.next_bits)?;
             for c in 0..d {
                 self.o
                     .scale
@@ -1291,7 +1409,8 @@ impl RwkvRosaQkv1Bit {
                 if let Some(bias) = self.o.bias.as_mut() {
                     bias.apply_clipped_sgd(c, bwd.bias_gradient[c], learning_rate);
                 }
-                self.e.apply_clipped_sgd(c, bwd.e_gradient[c], learning_rate);
+                self.e
+                    .apply_clipped_sgd(c, bwd.e_gradient[c], learning_rate);
             }
             let _ = g_w;
             let _ = weights;
@@ -1316,6 +1435,7 @@ impl RwkvRosaQkv1Bit {
             &g_scale,
             Some(&g_bias),
             learning_rate,
+            ste_scale,
             metal,
         )?;
         let g_e = rosa_e_grad(&g_y, &tape.idx, d, metal)?;
@@ -2521,7 +2641,27 @@ impl UllisHeron {
         time: usize,
         learning_rate: f32,
     ) -> Result<CausalLoss> {
-        self.train_step_on(tokens, batch, time, learning_rate, None)
+        self.train_step_on(
+            tokens,
+            tokens,
+            CE_NO_IGNORE,
+            batch,
+            time,
+            learning_rate,
+            None,
+        )
+    }
+
+    pub fn train_step_with_labels(
+        &mut self,
+        tokens: &[u32],
+        labels: &[u32],
+        ignore_id: u32,
+        batch: usize,
+        time: usize,
+        learning_rate: f32,
+    ) -> Result<CausalLoss> {
+        self.train_step_on(tokens, labels, ignore_id, batch, time, learning_rate, None)
     }
 
     #[cfg(target_os = "macos")]
@@ -2533,8 +2673,32 @@ impl UllisHeron {
         time: usize,
         learning_rate: f32,
     ) -> Result<CausalLoss> {
+        self.train_step_metal_with_labels(
+            runtime,
+            tokens,
+            tokens,
+            CE_NO_IGNORE,
+            batch,
+            time,
+            learning_rate,
+        )
+    }
+
+    #[cfg(target_os = "macos")]
+    pub fn train_step_metal_with_labels(
+        &mut self,
+        runtime: &crate::metal::MetalRuntime,
+        tokens: &[u32],
+        labels: &[u32],
+        ignore_id: u32,
+        batch: usize,
+        time: usize,
+        learning_rate: f32,
+    ) -> Result<CausalLoss> {
         self.train_step_on(
             tokens,
+            labels,
+            ignore_id,
             batch,
             time,
             learning_rate,
@@ -2545,6 +2709,8 @@ impl UllisHeron {
     fn train_step_on(
         &mut self,
         tokens: &[u32],
+        labels: &[u32],
+        ignore_id: u32,
         batch: usize,
         time: usize,
         learning_rate: f32,
@@ -2567,8 +2733,12 @@ impl UllisHeron {
         if batch == 0
             || batch > self.cfg.batch_size
             || tokens.len() != rows
+            || labels.len() != rows
             || time > self.cfg.context_len
             || tokens.iter().any(|&id| id as usize >= self.cfg.vocab_size)
+            || labels
+                .iter()
+                .any(|&id| id != ignore_id && id as usize >= self.cfg.vocab_size)
         {
             bail!("token shape or context length is invalid");
         }
@@ -2617,8 +2787,18 @@ impl UllisHeron {
         profile.add("fwd_ln", started);
 
         let started = Instant::now();
-        let (loss, mut g_x, n_valid, flips_head) =
-            self.apply_head_ce(&hidden, tokens, time, learning_rate, rows, metal_ref)?;
+        let (loss, mut g_x, n_valid, flips_head, head_diag) = self.apply_head_ce(
+            &hidden,
+            labels,
+            ignore_id,
+            time,
+            learning_rate,
+            rows,
+            metal_ref,
+        )?;
+        // FP16 tensors keep the window-length mean. Packed latents undo it so
+        // the ±0.01 BinaryConnect proxy can cross zero in a short run.
+        let ste_scale = binaryconnect_ste_scale(time.saturating_sub(1));
         profile.add("head", started);
         let started = Instant::now();
         let (g_ln_in, g_w_ln, g_b_ln) =
@@ -2629,17 +2809,19 @@ impl UllisHeron {
         g_x = g_ln_in;
         profile.add("bwd_ln", started);
 
-        let mut flips = flips_head;
+        let mut flips_cmix = 0_usize;
+        let mut flips_rosa_o = 0_usize;
         for (block, tape) in self.blocks.iter_mut().zip(tapes).rev() {
             let mut g_after_rosa = g_x.clone();
             let mut g_ln2_out = vec![0.0; rows.saturating_mul(d)];
             let started = Instant::now();
-            flips += block.ffn.backward_update(
+            flips_cmix += block.ffn.backward_update(
                 &tape.cmix,
                 &g_x,
                 &mut g_ln2_out,
                 &mut self.g_w,
                 learning_rate,
+                ste_scale,
                 batch,
                 time,
                 metal_ref,
@@ -2656,11 +2838,12 @@ impl UllisHeron {
 
             let g_residual = g_after_rosa.clone();
             let started = Instant::now();
-            flips += block.rosa.backward_stop_grad(
+            flips_rosa_o += block.rosa.backward_stop_grad(
                 &tape.rosa,
                 &g_after_rosa,
                 &mut self.g_w,
                 learning_rate,
+                ste_scale,
                 rows,
                 metal_ref,
             )?;
@@ -2687,73 +2870,117 @@ impl UllisHeron {
         profile.add("embed_sgd", started);
         self.last_profile = Some(profile);
 
+        let flips = flips_head
+            .saturating_add(flips_cmix)
+            .saturating_add(flips_rosa_o);
         Ok(CausalLoss {
             next_token: loss,
             next_token_count: n_valid,
             binary_flip_count: flips,
+            loss_p10: head_diag.loss_p10,
+            loss_p50: head_diag.loss_p50,
+            loss_p90: head_diag.loss_p90,
+            unigram_ce: head_diag.unigram_ce,
+            unique_targets: head_diag.unique_targets,
+            flips_head,
+            flips_cmix,
+            flips_rosa_o,
+            embed_grad_rms: rms(&g_x),
+            head_scale_grad_rms: head_diag.head_scale_grad_rms,
+            head_scale_rms: rms_fp16(&self.head.scale),
+            residual_abs_mean: mean_abs(self.embedding.residual()),
+            cmix_value_rms: self
+                .blocks
+                .first()
+                .map(|block| rms_fp16(block.ffn.value.weight()))
+                .unwrap_or(0.0),
+            head_latent_abs_mean: mean_abs_fp16(&self.head.latent),
+            head_latent_step_abs: head_diag.head_latent_step_abs,
         })
     }
 
     fn apply_head_ce(
         &mut self,
         hidden: &[f32],
-        tokens: &[u32],
+        targets: &[u32],
+        ignore_id: u32,
         time: usize,
         learning_rate: f32,
         rows: usize,
         metal: Option<&MetalTrainRuntime<'_>>,
-    ) -> Result<(f32, Vec<f32>, usize, usize)> {
+    ) -> Result<(f32, Vec<f32>, usize, usize, HeadTrainDiag)> {
         let d = self.cfg.d_model;
         let vocab = self.head.out_features;
         let mut n_valid = 0_usize;
         for row in 0..rows {
-            if row % time + 1 < time {
+            if causal_ce_row_valid(row, time, 1, targets, ignore_id) {
                 n_valid += 1;
             }
         }
+        let (unigram_ce, unique_targets) = unigram_cross_entropy(targets, time, ignore_id);
         let weights = vocab.saturating_mul(d);
         #[cfg(target_os = "macos")]
         if let Some(device) = metal {
             let before = self.head.bits.clone();
+            let before_latent = self.head.latent_bits().to_vec();
             let head = device.runtime.packed_head_train_sgd(
                 hidden,
                 self.head.bits(),
                 self.head.scale_bits(),
                 self.head.latent_bits(),
-                tokens,
+                self.head.latent.residual(),
+                targets,
                 rows,
                 time,
                 d,
                 vocab,
                 1,
+                ignore_id,
                 learning_rate,
+                binaryconnect_ste_scale(time.saturating_sub(1)),
             )?;
             self.head
-                .replace_packed(head.next_latent, head.next_bits)?;
+                .replace_packed(head.next_latent, head.next_residual, head.next_bits)?;
             for o in 0..vocab {
                 self.head
                     .scale
                     .apply_clipped_sgd(o, head.scale_gradient[o], learning_rate);
             }
             let flips = bit_flip_count(&before, &self.head.bits);
+            let (loss_p10, loss_p50, loss_p90) =
+                loss_percentiles(&head.row_loss, time, targets, ignore_id);
             let _ = weights;
-            return Ok((head.mean_loss, head.hidden_gradient, n_valid, flips));
+            return Ok((
+                head.mean_loss,
+                head.hidden_gradient,
+                n_valid,
+                flips,
+                HeadTrainDiag {
+                    loss_p10,
+                    loss_p50,
+                    loss_p90,
+                    unigram_ce,
+                    unique_targets,
+                    head_scale_grad_rms: rms(&head.scale_gradient),
+                    head_latent_step_abs: mean_abs_delta_fp16(
+                        &before_latent,
+                        self.head.latent_bits(),
+                    ),
+                },
+            ));
         }
         let _ = metal;
-        let loss_scale = if n_valid == 0 {
-            0.0
-        } else {
-            1.0 / n_valid as f32
-        };
+        let loss_scale = causal_ce_gradient_scale(n_valid, time);
         self.g_w[..weights].fill(0.0);
         let mut g_scale = vec![0.0; vocab];
         let mut gx = vec![0.0; hidden.len()];
         let mut loss_sum = 0.0;
+        let mut row_loss = vec![0.0; rows];
         for row in 0..rows {
-            if row % time + 1 >= time {
+            if !causal_ce_row_valid(row, time, 1, targets, ignore_id) {
                 continue;
             }
-            let target = tokens[row + 1] as usize;
+            let target = targets[row + 1] as usize;
             let h = &hidden[row * d..(row + 1) * d];
             let logits = self.head.forward(h, 1)?;
             let max = logits.iter().copied().fold(f32::NEG_INFINITY, f32::max);
@@ -2763,7 +2990,9 @@ impl UllisHeron {
                 exps[v] = (logits[v] - max).exp();
                 exp_sum += exps[v];
             }
-            loss_sum += max + exp_sum.ln() - logits[target];
+            let ce = max + exp_sum.ln() - logits[target];
+            row_loss[row] = ce;
+            loss_sum += ce;
             let mut gy = vec![0.0; vocab];
             for v in 0..vocab {
                 gy[v] = loss_scale * (exps[v] / exp_sum - f32::from(v == target));
@@ -2778,22 +3007,148 @@ impl UllisHeron {
                 None,
             )?;
         }
-        let flips =
-            self.head
-                .flip_count_after(&self.g_w[..weights], &g_scale, None, learning_rate)?;
+        let before_latent = self.head.latent_bits().to_vec();
+        let flips = self.head.flip_after_gradients(
+            &self.g_w[..weights],
+            &g_scale,
+            None,
+            learning_rate,
+            binaryconnect_ste_scale(time.saturating_sub(1)),
+            metal,
+        )?;
         let mean = if n_valid == 0 {
             0.0
         } else {
             loss_sum / n_valid as f32
         };
-        Ok((mean, gx, n_valid, flips))
+        let (loss_p10, loss_p50, loss_p90) = loss_percentiles(&row_loss, time, targets, ignore_id);
+        Ok((
+            mean,
+            gx,
+            n_valid,
+            flips,
+            HeadTrainDiag {
+                loss_p10,
+                loss_p50,
+                loss_p90,
+                unigram_ce,
+                unique_targets,
+                head_scale_grad_rms: rms(&g_scale),
+                head_latent_step_abs: mean_abs_delta_fp16(&before_latent, self.head.latent_bits()),
+            },
+        ))
     }
+}
+
+struct HeadTrainDiag {
+    loss_p10: f32,
+    loss_p50: f32,
+    loss_p90: f32,
+    unigram_ce: f32,
+    unique_targets: usize,
+    head_scale_grad_rms: f32,
+    head_latent_step_abs: f32,
 }
 
 fn add_inplace(dst: &mut [f32], src: &[f32]) {
     for (d, s) in dst.iter_mut().zip(src) {
         *d += *s;
     }
+}
+
+fn rms(values: &[f32]) -> f32 {
+    if values.is_empty() {
+        return 0.0;
+    }
+    let sum_sq: f32 = values.iter().map(|v| v * v).sum();
+    (sum_sq / values.len() as f32).sqrt()
+}
+
+fn rms_fp16(values: &Fp16Storage) -> f32 {
+    if values.is_empty() {
+        return 0.0;
+    }
+    let sum_sq: f32 = (0..values.len())
+        .map(|i| {
+            let v = values.get(i);
+            v * v
+        })
+        .sum();
+    (sum_sq / values.len() as f32).sqrt()
+}
+
+fn mean_abs(values: &[f32]) -> f32 {
+    if values.is_empty() {
+        return 0.0;
+    }
+    values.iter().map(|v| v.abs()).sum::<f32>() / values.len() as f32
+}
+
+fn mean_abs_fp16(values: &Fp16Storage) -> f32 {
+    if values.is_empty() {
+        return 0.0;
+    }
+    let sum: f32 = (0..values.len()).map(|i| values.get(i).abs()).sum();
+    sum / values.len() as f32
+}
+
+fn mean_abs_delta_fp16(before: &[u16], after: &[u16]) -> f32 {
+    if before.is_empty() || before.len() != after.len() {
+        return 0.0;
+    }
+    let sum: f32 = before
+        .iter()
+        .zip(after)
+        .map(|(a, b)| (Fp16::from_bits(*a).to_f32() - Fp16::from_bits(*b).to_f32()).abs())
+        .sum();
+    sum / before.len() as f32
+}
+
+fn loss_percentiles(
+    row_loss: &[f32],
+    time: usize,
+    targets: &[u32],
+    ignore_id: u32,
+) -> (f32, f32, f32) {
+    let mut valid: Vec<f32> = row_loss
+        .iter()
+        .enumerate()
+        .filter(|(row, _)| causal_ce_row_valid(*row, time, 1, targets, ignore_id))
+        .map(|(_, loss)| *loss)
+        .filter(|loss| loss.is_finite())
+        .collect();
+    if valid.is_empty() {
+        return (0.0, 0.0, 0.0);
+    }
+    valid.sort_by(|a, b| a.total_cmp(b));
+    let at = |p: f32| {
+        let index = ((p * (valid.len() - 1) as f32).round() as usize).min(valid.len() - 1);
+        valid[index]
+    };
+    (at(0.10), at(0.50), at(0.90))
+}
+
+fn unigram_cross_entropy(targets: &[u32], time: usize, ignore_id: u32) -> (f32, usize) {
+    let mut counts = HashMap::new();
+    let mut n_valid = 0_usize;
+    for row in 0..targets.len() {
+        if !causal_ce_row_valid(row, time, 1, targets, ignore_id) {
+            continue;
+        }
+        let target = targets[row + 1];
+        *counts.entry(target).or_insert(0_usize) += 1;
+        n_valid += 1;
+    }
+    if n_valid == 0 {
+        return (0.0, 0);
+    }
+    let n = n_valid as f32;
+    let mut ce = 0.0;
+    for count in counts.values() {
+        let p = *count as f32 / n;
+        ce -= *count as f32 * p.ln();
+    }
+    (ce / n, counts.len())
 }
 
 struct BlockTape {
@@ -3306,6 +3661,15 @@ mod tests {
         assert!(error.contains("Hyena checkpoints (v1)"));
     }
 
+    #[test]
+    fn causal_ce_gradient_scale_is_window_length_not_token_sum() {
+        assert_eq!(causal_ce_gradient_scale(0, 2048), 0.0);
+        assert_eq!(causal_ce_gradient_scale(1403, 1), 0.0);
+        let scale = causal_ce_gradient_scale(1, 2048);
+        assert!((scale - 1.0 / 2047.0).abs() < 1e-8);
+        assert!((causal_ce_gradient_scale(2047, 2048) - scale).abs() < 1e-8);
+    }
+
     fn tiny_train_cfg() -> TrainConfig {
         TrainConfig {
             vocab_size: MIN_VOCAB as usize,
@@ -3315,6 +3679,166 @@ mod tests {
             context_len: 32,
             tmix_lora_rank: 8,
             ..Default::default()
+        }
+    }
+
+    #[test]
+    fn ignored_pad_targets_are_excluded_from_ce_count() {
+        let mut model = UllisHeron::new(tiny_train_cfg()).unwrap();
+        let mut tokens: Vec<u32> = (0..32).map(|i| 4 + (i % 8) as u32).collect();
+        let mut labels = tokens.clone();
+        for slot in 16..32 {
+            tokens[slot] = 0;
+            labels[slot] = 0;
+        }
+        let loss = model
+            .train_step_with_labels(&tokens, &labels, 0, 1, 32, 0.05)
+            .unwrap();
+        assert_eq!(loss.next_token_count, 15);
+        assert!(loss.next_token.is_finite());
+    }
+
+    #[test]
+    fn window_length_ce_does_not_let_a_singleton_window_dominate() {
+        let mut dense = UllisHeron::new(tiny_train_cfg()).unwrap();
+        let mut sparse = dense.clone();
+        let tokens: Vec<u32> = (0..32).map(|i| 4 + (i % 8) as u32).collect();
+        let dense_loss = dense.train_step(&tokens, 1, 32, 0.05).unwrap();
+        let mut labels = vec![0_u32; 32];
+        labels[16] = tokens[16];
+        let sparse_loss = sparse
+            .train_step_with_labels(&tokens, &labels, 0, 1, 32, 0.05)
+            .unwrap();
+        assert_eq!(dense_loss.next_token_count, 31);
+        assert_eq!(sparse_loss.next_token_count, 1);
+        assert!(
+            dense_loss.embed_grad_rms > sparse_loss.embed_grad_rms,
+            "dense embed_grms={} must exceed singleton embed_grms={}",
+            dense_loss.embed_grad_rms,
+            sparse_loss.embed_grad_rms
+        );
+        assert!(
+            dense_loss.head_scale_grad_rms < 50.0,
+            "window-length CE must not turn head scales into sign-SGD, scale_grms={}",
+            dense_loss.head_scale_grad_rms
+        );
+    }
+
+    #[test]
+    fn train_diagnostics_report_row_loss_spread_and_unigram_baseline() {
+        let mut model = UllisHeron::new(tiny_train_cfg()).unwrap();
+        let tokens: Vec<u32> = (0..32).map(|i| 4 + (i % 8) as u32).collect();
+        let loss = model.train_step(&tokens, 1, 32, 0.05).unwrap();
+        assert!(loss.next_token.is_finite());
+        assert!(loss.loss_p10 <= loss.loss_p50);
+        assert!(loss.loss_p50 <= loss.loss_p90);
+        assert!(loss.unigram_ce.is_finite() && loss.unigram_ce > 0.0);
+        assert!(loss.unique_targets >= 2);
+        assert_eq!(
+            loss.binary_flip_count,
+            loss.flips_head + loss.flips_cmix + loss.flips_rosa_o
+        );
+        assert!(
+            loss.cmix_value_rms > 0.01,
+            "CMix value must be kaiming-initialized, rms={}",
+            loss.cmix_value_rms
+        );
+    }
+
+    #[test]
+    fn token_sum_ste_flips_mean_reduced_target_row() {
+        let mut linear = PackedBinaryLinear::seeded(1, 256, false, 1).unwrap();
+        let n_valid = 1024_usize;
+        let g_w = vec![1.0 / n_valid as f32 / 16.0; 256];
+        let g_scale = [0.0_f32];
+        let before = linear.sign_at(0);
+        for _ in 0..20 {
+            linear
+                .apply_packed_sgd(&g_w, &g_scale, None, 1e-2, binaryconnect_ste_scale(n_valid))
+                .unwrap();
+        }
+        assert_ne!(
+            linear.sign_at(0),
+            before,
+            "token-sum STE must cross ±0.01 within 20 steps, latent={}",
+            linear.latent().get(0)
+        );
+    }
+
+    #[test]
+    fn binaryconnect_magnitude_ste_preserves_softmax_class_ratio() {
+        let mut linear = PackedBinaryLinear::from_signs(1, 1, &[1], 0.0625, false).unwrap();
+        let tiny = [1e-5_f32];
+        let g_scale = [0.0];
+        for _ in 0..100 {
+            linear
+                .apply_clipped_sgd(&tiny, &g_scale, None, 1e-3)
+                .unwrap();
+        }
+        assert!(
+            linear.sign_at(0) > 0.0,
+            "a 1e-5 wrong-class STE must not flip the bit in 100 lr=1e-3 steps, latent={}",
+            linear.latent().get(0)
+        );
+        let large = [1.0_f32];
+        for _ in 0..20 {
+            linear
+                .apply_clipped_sgd(&large, &g_scale, None, 1e-2)
+                .unwrap();
+        }
+        assert!(
+            linear.sign_at(0) < 0.0,
+            "O(1) STE must flip the BinaryConnect proxy, latent={}",
+            linear.latent().get(0)
+        );
+    }
+
+    fn greedy_argmax(logits: &[f32]) -> u32 {
+        logits
+            .iter()
+            .enumerate()
+            .filter(|(id, _)| *id >= 4)
+            .max_by(|(_, a), (_, b)| a.total_cmp(b))
+            .map(|(id, _)| id as u32)
+            .unwrap()
+    }
+
+    #[test]
+    fn greedy_decode_uses_prefix_not_unigram() {
+        let mut model = UllisHeron::new(tiny_train_cfg()).unwrap();
+        // Bigram 4↔5. A 1-token CMix shift can represent it; unigram is a coin flip.
+        let tokens: Vec<u32> = (0..32).map(|i| 4 + (i % 2) as u32).collect();
+        for _ in 0..80 {
+            model.train_step(&tokens, 1, 32, 0.08).unwrap();
+        }
+        let mut state = model.generate_state().unwrap();
+        let logits_after_4 = model.generate_step(&mut state, 4).unwrap();
+        assert_eq!(
+            greedy_argmax(&logits_after_4),
+            5,
+            "after fitting 4,5,4,5, greedy(4) must emit 5"
+        );
+        let logits_after_45 = model.generate_step(&mut state, 5).unwrap();
+        assert_eq!(
+            greedy_argmax(&logits_after_45),
+            4,
+            "after fitting 4,5,4,5, greedy(4,5) must emit 4"
+        );
+    }
+
+    #[test]
+    fn seeded_binary_latent_is_independent_of_row_scale() {
+        let linear = PackedBinaryLinear::seeded(4, 256, false, 1).unwrap();
+        let scale = (256.0_f32).sqrt().recip();
+        assert!((linear.scale().get(0) - scale).abs() < 1e-3);
+        for i in 0..linear.latent().len() {
+            assert!(
+                (linear.latent().get(i).abs() - BINARYCONNECT_INIT_ABS).abs() < 1e-4,
+                "latent {} should be ±{}, not ±scale {}",
+                linear.latent().get(i),
+                BINARYCONNECT_INIT_ABS,
+                scale
+            );
         }
     }
 

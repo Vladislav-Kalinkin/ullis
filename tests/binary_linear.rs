@@ -40,8 +40,10 @@ fn latent_persists_across_steps_instead_of_reconstructing() {
     linear
         .backward_ste(&x, &gy, 1, &mut g_w, None, &mut g_scale, None)
         .unwrap();
+    // Hold the row scale fixed so the assertion isolates latent persistence
+    // from scale SGD. Magnitude STE on the proxy must not snap back to scale*sign.
     linear
-        .apply_clipped_sgd(&g_w, &g_scale, None, 0.1)
+        .apply_clipped_sgd(&g_w, &[0.0], None, 0.1)
         .unwrap();
     let latent_after = linear.latent().get(0);
     let reconstructed = linear.scale().get(0) * linear.sign_at(0);
@@ -56,7 +58,7 @@ fn latent_persists_across_steps_instead_of_reconstructing() {
         .backward_ste(&x, &gy, 1, &mut g_w, None, &mut g_scale, None)
         .unwrap();
     linear
-        .apply_clipped_sgd(&g_w, &g_scale, None, 0.1)
+        .apply_clipped_sgd(&g_w, &[0.0], None, 0.1)
         .unwrap();
     assert_ne!(linear.latent().get(0), latent_after);
 }

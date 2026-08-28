@@ -10,6 +10,7 @@ use objc2::rc::Retained;
 use objc2::runtime::ProtocolObject;
 use objc2_metal::MTLComputePipelineState;
 
+use crate::model::{CE_NO_IGNORE, causal_ce_gradient_scale, causal_ce_row_valid};
 use crate::precision::Fp16;
 
 pub mod ffi;
@@ -114,6 +115,7 @@ pub const RESIDUAL_ADD_KERNEL_NAME: &str = "ullis_residual_add";
 pub const STREAMED_CROSS_ENTROPY_FP16_KERNEL_NAME: &str = "ullis_streamed_cross_entropy_fp16";
 pub const SOFTMAX_CROSS_ENTROPY_KERNEL_NAME: &str = "ullis_softmax_cross_entropy";
 pub const CLIPPED_SGD_FP16_KERNEL_NAME: &str = "ullis_clipped_sgd_fp16";
+pub const BINARYCONNECT_SGD_FP16_KERNEL_NAME: &str = "ullis_binaryconnect_sgd_fp16";
 pub const WKV7_FORWARD_KERNEL_NAME: &str = "ullis_wkv7_forward";
 pub const WKV7_BACKWARD_KERNEL_NAME: &str = "ullis_wkv7_backward";
 
@@ -143,6 +145,7 @@ pub const PR3_KERNEL_NAMES: &[&str] = &[
     STREAMED_CROSS_ENTROPY_FP16_KERNEL_NAME,
     SOFTMAX_CROSS_ENTROPY_KERNEL_NAME,
     CLIPPED_SGD_FP16_KERNEL_NAME,
+    BINARYCONNECT_SGD_FP16_KERNEL_NAME,
 ];
 
 pub const PR4_KERNEL_NAMES: &[&str] = &[ROSA_SAM_RESET_KERNEL_NAME, ROSA_QKV_1BIT_FWD_KERNEL_NAME];
@@ -273,7 +276,9 @@ pub struct PackedHeadTrainSgd {
     pub hidden_gradient: Vec<f32>,
     pub scale_gradient: Vec<f32>,
     pub next_latent: Vec<u16>,
+    pub next_residual: Vec<f32>,
     pub next_bits: Vec<u32>,
+    pub row_loss: Vec<f32>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -281,8 +286,10 @@ pub struct CmixBlockBackwardSgd {
     pub g_shifted: Vec<f32>,
     pub g_key_scale: Vec<f32>,
     pub next_key_latent: Vec<u16>,
+    pub next_key_residual: Vec<f32>,
     pub next_key_bits: Vec<u32>,
     pub next_value_weight: Vec<u16>,
+    pub next_value_residual: Vec<f32>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -291,6 +298,7 @@ pub struct RosaOStopGradSgd {
     pub scale_gradient: Vec<f32>,
     pub bias_gradient: Vec<f32>,
     pub next_latent: Vec<u16>,
+    pub next_residual: Vec<f32>,
     pub next_bits: Vec<u32>,
 }
 
@@ -381,6 +389,7 @@ struct Pipelines {
     streamed_cross_entropy_fp16: Pipeline,
     softmax_cross_entropy: Pipeline,
     clipped_sgd_fp16: Pipeline,
+    binaryconnect_sgd_fp16: Pipeline,
     wkv7_forward: Pipeline,
     wkv7_backward: Pipeline,
 }
@@ -497,6 +506,11 @@ impl MetalRuntime {
                 &device,
                 &library,
                 CLIPPED_SGD_FP16_KERNEL_NAME,
+            )?,
+            binaryconnect_sgd_fp16: pipeline_from_library(
+                &device,
+                &library,
+                BINARYCONNECT_SGD_FP16_KERNEL_NAME,
             )?,
             wkv7_forward: pipeline_from_library(&device, &library, WKV7_FORWARD_KERNEL_NAME)?,
             wkv7_backward: pipeline_from_library(&device, &library, WKV7_BACKWARD_KERNEL_NAME)?,
@@ -678,6 +692,50 @@ impl MetalRuntime {
             },
         );
         Ok(())
+    }
+
+    fn encode_clipped_sgd_fp16<B: AsRef<MetalBuffer>>(
+        encoder: &ffi::ComputeEncoder,
+        pipeline: &Pipeline,
+        parameters: &B,
+        residual: &B,
+        gradient: &B,
+        learning_rate: f32,
+        elements: usize,
+    ) -> Result<()> {
+        Self::encode_1d(
+            encoder,
+            pipeline,
+            &[parameters, residual, gradient],
+            |encoder| {
+                set_bytes_f32(encoder, 3, &[learning_rate])?;
+                set_bytes_u32(encoder, 4, &[as_u32(elements, "elements")?])
+            },
+            elements,
+        )
+    }
+
+    fn encode_binaryconnect_sgd_fp16<B: AsRef<MetalBuffer>>(
+        encoder: &ffi::ComputeEncoder,
+        pipeline: &Pipeline,
+        parameters: &B,
+        residual: &B,
+        gradient: &B,
+        learning_rate: f32,
+        ste_scale: f32,
+        elements: usize,
+    ) -> Result<()> {
+        Self::encode_1d(
+            encoder,
+            pipeline,
+            &[parameters, residual, gradient],
+            |encoder| {
+                set_bytes_f32(encoder, 3, &[learning_rate])?;
+                set_bytes_u32(encoder, 4, &[as_u32(elements, "elements")?])?;
+                set_bytes_f32(encoder, 5, &[ste_scale])
+            },
+            elements,
+        )
     }
 
     fn encode_tiled<B: AsRef<MetalBuffer>>(
@@ -1349,9 +1407,9 @@ impl MetalRuntime {
         k_packed.read_u32(&mut k_plane)?;
         v_packed.read_u32(&mut v_plane)?;
         drop((
-            x_b, mix_q_b, mix_k_b, mix_v_b, q_in, k_in, v_in, q_bits_b, k_bits_b, v_bits_b, q_scale_b,
-            k_scale_b, v_scale_b, q_bias_b, k_bias_b, v_bias_b, q_act, k_act, v_act, q_packed, k_packed,
-            v_packed,
+            x_b, mix_q_b, mix_k_b, mix_v_b, q_in, k_in, v_in, q_bits_b, k_bits_b, v_bits_b,
+            q_scale_b, k_scale_b, v_scale_b, q_bias_b, k_bias_b, v_bias_b, q_act, k_act, v_act,
+            q_packed, k_packed, v_packed,
         ));
         let idx = crate::rosa::rosa_qkv_batch_packed(
             &q_plane, &k_plane, &v_plane, batch, time, channels,
@@ -2020,11 +2078,14 @@ impl MetalRuntime {
         key_bits: &[u32],
         key_scale: &[u16],
         key_latent: &[u16],
+        key_residual: &[f32],
         value_weight: &[u16],
+        value_residual: &[f32],
         rows: usize,
         d_model: usize,
         dim_ffn: usize,
         learning_rate: f32,
+        ste_scale: f32,
     ) -> Result<CmixBlockBackwardSgd> {
         let key_shape = LinearDispatchShape::new(rows, d_model, dim_ffn)?;
         let value_shape = LinearDispatchShape::new(rows, dim_ffn, d_model)?;
@@ -2036,7 +2097,9 @@ impl MetalRuntime {
             || key.len() != key_len
             || gy.len() != rows.saturating_mul(d_model)
             || key_latent.len() != key_weights
+            || key_residual.len() != key_weights
             || value_weight.len() != value_weights
+            || value_residual.len() != value_weights
         {
             bail!("CMix backward SGD shape mismatch");
         }
@@ -2048,7 +2111,9 @@ impl MetalRuntime {
         let bits_b = self.buffer_u32(key_bits)?;
         let scale_b = self.buffer_u16(key_scale)?;
         let value_w_b = self.buffer_u16(value_weight)?;
+        let value_residual_b = self.buffer_f32(value_residual)?;
         let key_latent_b = self.buffer_u16(key_latent)?;
+        let key_residual_b = self.buffer_f32(key_residual)?;
         let g_relu_b = self.alloc_f32(key_len)?;
         let g_value_b = self.alloc_f32(value_weights)?;
         let g_key_b = self.alloc_f32(key_len)?;
@@ -2164,24 +2229,23 @@ impl MetalRuntime {
                 key_shape.in_features,
                 key_shape.out_features,
             )?;
-            Self::encode_1d(
+            Self::encode_clipped_sgd_fp16(
                 encoder,
                 &self.pipelines.clipped_sgd_fp16,
-                &[&value_w_b, &g_value_b],
-                |encoder| {
-                    set_bytes_f32(encoder, 2, &[learning_rate])?;
-                    set_bytes_u32(encoder, 3, &[as_u32(value_weights, "elements")?])
-                },
+                &value_w_b,
+                &value_residual_b,
+                &g_value_b,
+                learning_rate,
                 value_weights,
             )?;
-            Self::encode_1d(
+            Self::encode_binaryconnect_sgd_fp16(
                 encoder,
-                &self.pipelines.clipped_sgd_fp16,
-                &[&key_latent_b, &g_key_w_b],
-                |encoder| {
-                    set_bytes_f32(encoder, 2, &[learning_rate])?;
-                    set_bytes_u32(encoder, 3, &[as_u32(key_weights, "elements")?])
-                },
+                &self.pipelines.binaryconnect_sgd_fp16,
+                &key_latent_b,
+                &key_residual_b,
+                &g_key_w_b,
+                learning_rate,
+                ste_scale,
                 key_weights,
             )?;
             Self::encode_1d(
@@ -2195,19 +2259,25 @@ impl MetalRuntime {
         let mut g_shifted = vec![0.0; shifted.len()];
         let mut g_key_scale = vec![0.0; dim_ffn];
         let mut next_value = vec![0_u16; value_weights];
+        let mut next_value_residual = vec![0.0; value_weights];
         let mut next_key_latent = vec![0_u16; key_weights];
+        let mut next_key_residual = vec![0.0; key_weights];
         let mut packed = vec![0_u32; key_words];
         g_shifted_b.read_f32(&mut g_shifted)?;
         g_scale_b.read_f32(&mut g_key_scale)?;
         value_w_b.read_u16(&mut next_value)?;
+        value_residual_b.read_f32(&mut next_value_residual)?;
         key_latent_b.read_u16(&mut next_key_latent)?;
+        key_residual_b.read_f32(&mut next_key_residual)?;
         next_key_bits.read_u32(&mut packed)?;
         Ok(CmixBlockBackwardSgd {
             g_shifted,
             g_key_scale,
             next_key_latent,
+            next_key_residual,
             next_key_bits: packed,
             next_value_weight: next_value,
+            next_value_residual,
         })
     }
 
@@ -2221,9 +2291,11 @@ impl MetalRuntime {
         o_scale: &[u16],
         o_bias: &[u16],
         latent: &[u16],
+        residual: &[f32],
         rows: usize,
         channels: usize,
         learning_rate: f32,
+        ste_scale: f32,
     ) -> Result<RosaOStopGradSgd> {
         let shape = LinearDispatchShape::new(rows, channels, channels)?;
         self.check_binary_shape_u16(y, o_bits, o_scale, Some(o_bias), shape)?;
@@ -2231,6 +2303,7 @@ impl MetalRuntime {
             || gy.len() != y.len()
             || idx.len() != y.len()
             || latent.len() != channels.saturating_mul(channels)
+            || residual.len() != latent.len()
         {
             bail!("ROSA O stop-grad shape mismatch");
         }
@@ -2245,6 +2318,7 @@ impl MetalRuntime {
         let scale_b = self.buffer_u16(o_scale)?;
         let bias_b = self.buffer_u16(o_bias)?;
         let latent_b = self.buffer_u16(latent)?;
+        let residual_b = self.buffer_f32(residual)?;
         let g_y_b = self.alloc_f32(y.len())?;
         let g_scale_b = self.alloc_f32(channels)?;
         let g_bias_b = self.alloc_f32(channels)?;
@@ -2278,11 +2352,7 @@ impl MetalRuntime {
                     Self::set_u32s(
                         encoder,
                         6,
-                        &[
-                            as_u32(rows, "rows")?,
-                            as_u32(channels, "out")?,
-                            1,
-                        ],
+                        &[as_u32(rows, "rows")?, as_u32(channels, "out")?, 1],
                     )
                 },
                 channels,
@@ -2313,23 +2383,19 @@ impl MetalRuntime {
                     Self::set_u32s(
                         encoder,
                         3,
-                        &[
-                            1,
-                            as_u32(rows, "time")?,
-                            as_u32(channels, "channels")?,
-                        ],
+                        &[1, as_u32(rows, "time")?, as_u32(channels, "channels")?],
                     )
                 },
                 channels,
             )?;
-            Self::encode_1d(
+            Self::encode_binaryconnect_sgd_fp16(
                 encoder,
-                &self.pipelines.clipped_sgd_fp16,
-                &[&latent_b, &gw_b],
-                |encoder| {
-                    set_bytes_f32(encoder, 2, &[learning_rate])?;
-                    set_bytes_u32(encoder, 3, &[as_u32(weights, "elements")?])
-                },
+                &self.pipelines.binaryconnect_sgd_fp16,
+                &latent_b,
+                &residual_b,
+                &gw_b,
+                learning_rate,
+                ste_scale,
                 weights,
             )?;
             Self::encode_1d(
@@ -2344,17 +2410,20 @@ impl MetalRuntime {
         let mut g_scale = vec![0.0; channels];
         let mut g_bias = vec![0.0; channels];
         let mut next_latent = vec![0_u16; weights];
+        let mut next_residual = vec![0.0; weights];
         let mut packed = vec![0_u32; words];
         ge_b.read_f32(&mut g_e)?;
         g_scale_b.read_f32(&mut g_scale)?;
         g_bias_b.read_f32(&mut g_bias)?;
         latent_b.read_u16(&mut next_latent)?;
+        residual_b.read_f32(&mut next_residual)?;
         next_bits.read_u32(&mut packed)?;
         Ok(RosaOStopGradSgd {
             e_gradient: g_e,
             scale_gradient: g_scale,
             bias_gradient: g_bias,
             next_latent,
+            next_residual,
             next_bits: packed,
         })
     }
@@ -2691,6 +2760,17 @@ impl MetalRuntime {
         })
     }
 
+    fn causal_supervised_count(
+        tokens: &[u32],
+        time: usize,
+        horizon: usize,
+        ignore_id: u32,
+    ) -> usize {
+        (0..tokens.len())
+            .filter(|&row| causal_ce_row_valid(row, time, horizon, tokens, ignore_id))
+            .count()
+    }
+
     pub fn streamed_cross_entropy_fp16(
         &self,
         hidden: &[f32],
@@ -2712,17 +2792,8 @@ impl MetalRuntime {
         {
             bail!("streamed CE shape mismatch");
         }
-        let mut n_valid = 0_usize;
-        for row in 0..rows {
-            if row % time + horizon < time {
-                n_valid += 1;
-            }
-        }
-        let gradient_scale = if n_valid == 0 {
-            0.0
-        } else {
-            1.0 / n_valid as f32
-        };
+        let n_valid = Self::causal_supervised_count(tokens, time, horizon, CE_NO_IGNORE);
+        let gradient_scale = causal_ce_gradient_scale(n_valid, time);
         let hidden_buffer = self.buffer_f32(hidden)?;
         let bits_buffer = self.buffer_u32(bits)?;
         let scale_buffer = self.buffer_u16(&fp16_bits(scale))?;
@@ -2757,7 +2828,8 @@ impl MetalRuntime {
                             as_u32(horizon, "horizon")?,
                         ],
                     )?;
-                    set_bytes_f32(encoder, 13, &[gradient_scale])
+                    set_bytes_f32(encoder, 13, &[gradient_scale])?;
+                    set_bytes_u32(encoder, 14, &[CE_NO_IGNORE])
                 },
                 rows,
             )
@@ -2787,28 +2859,31 @@ impl MetalRuntime {
     pub fn apply_latent_sgd(
         &self,
         latent: &[u16],
+        residual: &[f32],
         gradient: &[f32],
         learning_rate: f32,
-    ) -> Result<(Vec<u16>, Vec<u32>)> {
-        if latent.len() != gradient.len() {
+        ste_scale: f32,
+    ) -> Result<(Vec<u16>, Vec<f32>, Vec<u32>)> {
+        if latent.len() != gradient.len() || residual.len() != latent.len() {
             bail!("latent SGD length mismatch");
         }
         if latent.is_empty() {
-            return Ok((Vec::new(), Vec::new()));
+            return Ok((Vec::new(), Vec::new(), Vec::new()));
         }
         let words = latent.len().div_ceil(32);
         let latent_buffer = self.buffer_u16(latent)?;
+        let residual_buffer = self.buffer_f32(residual)?;
         let grad_buffer = self.buffer_f32(gradient)?;
         let bits_buffer = self.alloc_bytes(words.saturating_mul(size_of::<u32>()).max(4))?;
         self.submit(|encoder| {
-            Self::encode_1d(
+            Self::encode_binaryconnect_sgd_fp16(
                 encoder,
-                &self.pipelines.clipped_sgd_fp16,
-                &[&latent_buffer, &grad_buffer],
-                |encoder| {
-                    set_bytes_f32(encoder, 2, &[learning_rate])?;
-                    set_bytes_u32(encoder, 3, &[as_u32(latent.len(), "elements")?])
-                },
+                &self.pipelines.binaryconnect_sgd_fp16,
+                &latent_buffer,
+                &residual_buffer,
+                &grad_buffer,
+                learning_rate,
+                ste_scale,
                 latent.len(),
             )?;
             Self::encode_1d(
@@ -2820,41 +2895,98 @@ impl MetalRuntime {
             )
         })?;
         let mut next = vec![0_u16; latent.len()];
+        let mut next_residual = vec![0.0; latent.len()];
         let mut bits = vec![0_u32; words];
         latent_buffer.read_u16(&mut next)?;
+        residual_buffer.read_f32(&mut next_residual)?;
         bits_buffer.read_u32(&mut bits)?;
-        Ok((next, bits))
+        Ok((next, next_residual, bits))
     }
 
     pub fn clipped_sgd_fp16(
         &self,
         parameters: &[u16],
+        residual: &[f32],
         gradient: &[f32],
         learning_rate: f32,
-    ) -> Result<Vec<u16>> {
-        if parameters.len() != gradient.len() {
-            bail!("clipped SGD length mismatch");
+    ) -> Result<(Vec<u16>, Vec<f32>)> {
+        self.fp16_sgd(
+            &self.pipelines.clipped_sgd_fp16,
+            parameters,
+            residual,
+            gradient,
+            learning_rate,
+        )
+    }
+
+    pub fn binaryconnect_sgd_fp16(
+        &self,
+        parameters: &[u16],
+        residual: &[f32],
+        gradient: &[f32],
+        learning_rate: f32,
+    ) -> Result<(Vec<u16>, Vec<f32>)> {
+        if parameters.len() != gradient.len() || residual.len() != parameters.len() {
+            bail!("BinaryConnect SGD length mismatch");
         }
         if parameters.is_empty() {
-            return Ok(Vec::new());
+            return Ok((Vec::new(), Vec::new()));
         }
         let param_buffer = self.buffer_u16(parameters)?;
+        let residual_buffer = self.buffer_f32(residual)?;
         let grad_buffer = self.buffer_f32(gradient)?;
         self.submit(|encoder| {
-            Self::encode_1d(
+            Self::encode_binaryconnect_sgd_fp16(
                 encoder,
-                &self.pipelines.clipped_sgd_fp16,
-                &[&param_buffer, &grad_buffer],
-                |encoder| {
-                    set_bytes_f32(encoder, 2, &[learning_rate])?;
-                    set_bytes_u32(encoder, 3, &[as_u32(parameters.len(), "elements")?])
-                },
+                &self.pipelines.binaryconnect_sgd_fp16,
+                &param_buffer,
+                &residual_buffer,
+                &grad_buffer,
+                learning_rate,
+                1.0,
                 parameters.len(),
             )
         })?;
         let mut updated = vec![0_u16; parameters.len()];
+        let mut next_residual = vec![0.0; parameters.len()];
         param_buffer.read_u16(&mut updated)?;
-        Ok(updated)
+        residual_buffer.read_f32(&mut next_residual)?;
+        Ok((updated, next_residual))
+    }
+
+    fn fp16_sgd(
+        &self,
+        pipeline: &Pipeline,
+        parameters: &[u16],
+        residual: &[f32],
+        gradient: &[f32],
+        learning_rate: f32,
+    ) -> Result<(Vec<u16>, Vec<f32>)> {
+        if parameters.len() != gradient.len() || residual.len() != parameters.len() {
+            bail!("clipped SGD length mismatch");
+        }
+        if parameters.is_empty() {
+            return Ok((Vec::new(), Vec::new()));
+        }
+        let param_buffer = self.buffer_u16(parameters)?;
+        let residual_buffer = self.buffer_f32(residual)?;
+        let grad_buffer = self.buffer_f32(gradient)?;
+        self.submit(|encoder| {
+            Self::encode_clipped_sgd_fp16(
+                encoder,
+                pipeline,
+                &param_buffer,
+                &residual_buffer,
+                &grad_buffer,
+                learning_rate,
+                parameters.len(),
+            )
+        })?;
+        let mut updated = vec![0_u16; parameters.len()];
+        let mut next_residual = vec![0.0; parameters.len()];
+        param_buffer.read_u16(&mut updated)?;
+        residual_buffer.read_f32(&mut next_residual)?;
+        Ok((updated, next_residual))
     }
 
     /// Packed ±1 head: logits, softmax CE, and STE gradients in one command buffer.
@@ -2876,17 +3008,9 @@ impl MetalRuntime {
         if tokens.len() != rows || time == 0 || !rows.is_multiple_of(time) {
             bail!("packed head CE shape mismatch");
         }
-        let mut n_valid = 0_usize;
-        for row in 0..rows {
-            if row % time + horizon < time {
-                n_valid += 1;
-            }
-        }
-        let gradient_scale = if n_valid == 0 {
-            0.0
-        } else {
-            1.0 / n_valid as f32
-        };
+        let ignore_id = CE_NO_IGNORE;
+        let n_valid = Self::causal_supervised_count(tokens, time, horizon, ignore_id);
+        let gradient_scale = causal_ce_gradient_scale(n_valid, time);
         let logits_len = rows.saturating_mul(vocab);
         let weights = vocab.saturating_mul(channels);
         let hidden_buffer = self.buffer_f32(hidden)?;
@@ -2942,7 +3066,8 @@ impl MetalRuntime {
                             as_u32(horizon, "horizon")?,
                         ],
                     )?;
-                    set_bytes_f32(encoder, 8, &[gradient_scale])
+                    set_bytes_f32(encoder, 8, &[gradient_scale])?;
+                    set_bytes_u32(encoder, 9, &[ignore_id])
                 },
                 rows,
             )?;
@@ -3031,13 +3156,16 @@ impl MetalRuntime {
         bits: &[u32],
         scale: &[u16],
         latent: &[u16],
+        residual: &[f32],
         tokens: &[u32],
         rows: usize,
         time: usize,
         channels: usize,
         vocab: usize,
         horizon: usize,
+        ignore_id: u32,
         learning_rate: f32,
+        ste_scale: f32,
     ) -> Result<PackedHeadTrainSgd> {
         let shape = LinearDispatchShape::new(rows, channels, vocab)?;
         let weights = vocab.saturating_mul(channels);
@@ -3045,23 +3173,15 @@ impl MetalRuntime {
             || bits.len() != shape.packed_words()?
             || scale.len() != vocab
             || latent.len() != weights
+            || residual.len() != weights
             || tokens.len() != rows
             || time == 0
             || !rows.is_multiple_of(time)
         {
             bail!("packed head SGD shape mismatch");
         }
-        let mut n_valid = 0_usize;
-        for row in 0..rows {
-            if row % time + horizon < time {
-                n_valid += 1;
-            }
-        }
-        let gradient_scale = if n_valid == 0 {
-            0.0
-        } else {
-            1.0 / n_valid as f32
-        };
+        let n_valid = Self::causal_supervised_count(tokens, time, horizon, ignore_id);
+        let gradient_scale = causal_ce_gradient_scale(n_valid, time);
         let logits_len = rows.saturating_mul(vocab);
         let words = weights.div_ceil(32);
         let hidden_buffer = self.buffer_f32(hidden)?;
@@ -3070,6 +3190,7 @@ impl MetalRuntime {
         let bias_buffer = self.buffer_u16(&[])?;
         let tokens_buffer = self.buffer_u32(tokens)?;
         let latent_buffer = self.buffer_u16(latent)?;
+        let residual_buffer = self.buffer_f32(residual)?;
         let next_bits = self.alloc_bytes(words.saturating_mul(size_of::<u32>()).max(4))?;
         let logits_buffer = self.alloc_f32(logits_len)?;
         let gy_buffer = self.alloc_f32(logits_len)?;
@@ -3119,7 +3240,8 @@ impl MetalRuntime {
                             as_u32(horizon, "horizon")?,
                         ],
                     )?;
-                    set_bytes_f32(encoder, 8, &[gradient_scale])
+                    set_bytes_f32(encoder, 8, &[gradient_scale])?;
+                    set_bytes_u32(encoder, 9, &[ignore_id])
                 },
                 rows,
             )?;
@@ -3179,14 +3301,14 @@ impl MetalRuntime {
                 channels,
                 vocab,
             )?;
-            Self::encode_1d(
+            Self::encode_binaryconnect_sgd_fp16(
                 encoder,
-                &self.pipelines.clipped_sgd_fp16,
-                &[&latent_buffer, &gw_buffer],
-                |encoder| {
-                    set_bytes_f32(encoder, 2, &[learning_rate])?;
-                    set_bytes_u32(encoder, 3, &[as_u32(weights, "elements")?])
-                },
+                &self.pipelines.binaryconnect_sgd_fp16,
+                &latent_buffer,
+                &residual_buffer,
+                &gw_buffer,
+                learning_rate,
+                ste_scale,
                 weights,
             )?;
             Self::encode_1d(
@@ -3201,11 +3323,13 @@ impl MetalRuntime {
         let mut scale_gradient = vec![0.0; vocab];
         let mut row_loss = vec![0.0; rows];
         let mut next_latent = vec![0_u16; weights];
+        let mut next_residual = vec![0.0; weights];
         let mut packed = vec![0_u32; words];
         gx_buffer.read_f32(&mut hidden_gradient)?;
         g_scale_buffer.read_f32(&mut scale_gradient)?;
         loss_buffer.read_f32(&mut row_loss)?;
         latent_buffer.read_u16(&mut next_latent)?;
+        residual_buffer.read_f32(&mut next_residual)?;
         next_bits.read_u32(&mut packed)?;
         let mean_loss = if n_valid == 0 {
             0.0
@@ -3217,7 +3341,9 @@ impl MetalRuntime {
             hidden_gradient,
             scale_gradient,
             next_latent,
+            next_residual,
             next_bits: packed,
+            row_loss,
         })
     }
 
@@ -3368,11 +3494,7 @@ mod tests {
                 n_valid += 1;
             }
         }
-        let scale = if n_valid == 0 {
-            0.0
-        } else {
-            1.0 / n_valid as f32
-        };
+        let scale = causal_ce_gradient_scale(n_valid, time);
         let mut row_loss = vec![0.0; rows];
         let mut gy = vec![0.0; rows * vocab];
         for row in 0..rows {
@@ -3720,7 +3842,7 @@ mod tests {
     }
 
     #[test]
-    fn clipped_sgd_fp16_matches_cpu_ulp_floor() {
+    fn clipped_sgd_fp16_matches_cpu_residual() {
         let Some(runtime) = runtime() else {
             return;
         };
@@ -3730,11 +3852,31 @@ mod tests {
             cpu.apply_clipped_sgd(index, *g, 0.01);
         }
         let original = fp16_bits(&[0.25, -1.0, 2.0]);
-        let gpu = runtime
-            .clipped_sgd_fp16(&original, &gradient, 0.01)
+        let residual = [0.0_f32; 3];
+        let (gpu, gpu_residual) = runtime
+            .clipped_sgd_fp16(&original, &residual, &gradient, 0.01)
             .unwrap();
         assert_eq!(gpu, cpu.as_bits());
-        let _ = gpu;
+        assert_eq!(gpu_residual.as_slice(), cpu.residual());
+    }
+
+    #[test]
+    fn binaryconnect_sgd_fp16_matches_cpu_magnitude_clip() {
+        let Some(runtime) = runtime() else {
+            return;
+        };
+        let mut cpu = Fp16Storage::from_f32([0.0625, -0.0625, 0.9]);
+        let gradient = [1e-5_f32, -1e-6, 2.0];
+        for (index, g) in gradient.iter().enumerate() {
+            cpu.apply_binaryconnect_sgd(index, *g, 0.1);
+        }
+        let original = fp16_bits(&[0.0625, -0.0625, 0.9]);
+        let residual = [0.0_f32; 3];
+        let (gpu, gpu_residual) = runtime
+            .binaryconnect_sgd_fp16(&original, &residual, &gradient, 0.1)
+            .unwrap();
+        assert_eq!(gpu, cpu.as_bits());
+        assert_eq!(gpu_residual.as_slice(), cpu.residual());
     }
 
     #[test]

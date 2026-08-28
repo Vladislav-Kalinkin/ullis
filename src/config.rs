@@ -47,6 +47,8 @@ pub struct MemoryEstimate {
     pub wkv_tape: usize,
     pub bwd_rosa_scratch: usize,
     pub command_slack: usize,
+    /// FP32 error-diffusion carry for every resident FP16 parameter, including BinaryConnect latents.
+    pub sgd_residual: usize,
 }
 
 impl MemoryEstimate {
@@ -66,6 +68,7 @@ impl MemoryEstimate {
             self.wkv_tape,
             self.bwd_rosa_scratch,
             self.command_slack,
+            self.sgd_residual,
         ]
         .into_iter()
         .fold(Some(0), add)
@@ -292,6 +295,11 @@ impl TrainConfig {
             FP16_BYTES,
         )?;
         let command_slack = add(COMMAND_SLACK_BYTES, optimizer_state)?;
+        let fp16_elements = add(
+            add(embedding / FP16_BYTES, fp16_matrices / FP16_BYTES)?,
+            add(ln_and_vec / FP16_BYTES, packed_latents / FP16_BYTES)?,
+        )?;
+        let sgd_residual = mul(fp16_elements, size_of::<f32>())?;
 
         Ok(MemoryEstimate {
             embedding,
@@ -307,6 +315,7 @@ impl TrainConfig {
             wkv_tape,
             bwd_rosa_scratch,
             command_slack,
+            sgd_residual,
         })
     }
 
@@ -356,7 +365,11 @@ mod tests {
             ..Default::default()
         };
         cfg.validate().unwrap();
-        assert!(cfg.memory_estimate().unwrap().peak().unwrap() < 512 * 1024 * 1024);
+        let peak = cfg.memory_estimate().unwrap().peak().unwrap();
+        assert!(
+            peak < 1024 * 1024 * 1024,
+            "wide heron peak {peak} should stay under 1 GiB after FP32 SGD residual"
+        );
     }
 
     #[test]
