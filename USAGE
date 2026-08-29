@@ -19,16 +19,14 @@ DESCRIPTION
 
        Default architecture is heron (ROSA-QKV-1bit + CMix x070). 1-bit names the ROSA alphabet, not the weights: unmatched and matched-0 map to -e, matched-1 to +e. There is no 4-bit profile in 0.10.
 
-       A training directory contains config.json, tokenizer.json, metrics.jsonl, and checkpoint.json (format_version 2: packed bits, scales, bias, FP16 tensors that are officially float; no BinaryConnect latents). Hyena v1 checkpoints cannot be resumed.
+       A training directory contains config.json, tokenizer.json, metrics.jsonl, and checkpoint.safetensors (format_version 2: packed bits, scales, bias, FP16 tensors, BinaryConnect latents, and the FP32 SGD carry). Legacy checkpoint.json still loads but reconstructs latents at |w|=0.01. Hyena v1 checkpoints cannot be resumed.
 
-       Progress reports raw next-token loss and an EMA. Default train uses stop_grad_bits (frozen QKV) and stateless clipped SGD. Admission budget is 4 GiB; do not set --memory-budget-mib 8192 on an 8 GiB Mac.
+       Progress reports raw next-token loss, an EMA, and process RSS. Default train uses stop_grad_bits (frozen QKV) and clipped SGD. Admission budget is 4 GiB; do not set --memory-budget-mib 8192 on an 8 GiB Mac.
 
 TRAIN
        ullis train --data dataset.jsonl --run runs/first --config train_config.json --steps 1000
 
        --config FILE             JSON or TOML TrainConfig. The repo default is train_config.json (not config.toml).
-       --architecture heron|rosa-rwkv7
-                                 Default heron. rosa-rwkv7 train is not wired; use it for eval-digits / generate.
        --d-model N               Override model width.
        --layers N                Override number of Heron (or hybrid) blocks.
        --context-len N           Override training context; never silently capped. Hybrid requires a multiple of 16 (not 129).
@@ -36,10 +34,8 @@ TRAIN
        --vocab-size N            BPE vocabulary ceiling (heron: at least 260).
        --seed N                  Override initialization/BPE seed.
        --memory-budget-mib N     Override hard allocation budget. Default profile is 4096 MiB.
-       --optimizer stateless-sgd|lion-fp16
-                                 Default stateless-sgd. lion-fp16 is optional on FP16 tensors.
-       --resume CHECKPOINT       Restore v2 checkpoint.json and matching tokenizer.json. v1 is a hard error. Overrides cannot change architecture/shapes.
-       --steps N                 New optimization steps. Default: 1.
+       --resume CHECKPOINT       Restore a v2 safetensors or JSON snapshot (file or run directory) and matching tokenizer.json. v1 is a hard error. Overrides cannot change shapes.
+       --steps N                 Target global step. Resume continues from the checkpoint until this count. Default: 1.
        --learning-rate RATE      Positive stateless-SGD rate. Default: 1e-3.
        --checkpoint-every N      Save every N steps and at completion. Default: 100.
        --backend metal|cpu       Default: metal.
@@ -57,12 +53,12 @@ INSPECT
        Prints architecture, param split, checkpoint version, and generate-time SAM / time-shift sizes.
 
 GENERATE
-       ullis generate --checkpoint runs/first/checkpoint.json --prompt 'Hello' --max-tokens 64
+       ullis generate --checkpoint runs/first --prompt 'Hello' --max-tokens 64
 
        Loads tokenizer.json next to the checkpoint. Incremental RosaSam::push, same as train. Default decode is Completions-style: temperature 0.8, top-p 0.9, frequency-penalty 0.5, presence-penalty 0. Frequency penalty is OpenAI's additive `μ -= count·α` on generated ids (not a multiplicative Holtzman/HF repetition_penalty). Temperature 0 is greedy argmax; combine with `--frequency-penalty 0` for the old loop-prone decoder. EOS is suppressed until at least one new token so greedy cannot emit an empty completion.
 
 CHAT
-       ullis chat --checkpoint runs/first/checkpoint.json --session sessions/first.jsonl --thinking high
+       ullis chat --checkpoint runs/first --session sessions/first.jsonl --thinking high
 
        Line-oriented loop. Commands: /think low|medium|high|xhigh|off, /save, /quit. User and assistant records are JSONL. Thinking level is prompt policy metadata; it does not impose a separate inference-time compute budget. Accepts the same `--temperature` / `--top-p` / penalty flags as generate.
 
@@ -79,7 +75,7 @@ DATA FORMAT
        Allowed roles: system, user, assistant, tool. Every assistant message requires a non-empty thinking field. Tool messages require tool_call_id. Optional assistant tool_calls have {id, name, arguments}; this reserves the future agent-trace schema but does not execute tools.
 
 FILES
-       train_config.json           Default M1 8 GiB Heron profile (D=256, L=6, T=2048, 4 GiB budget).
+       train_config.json           Default M1 8 GiB Heron profile (D=512, L=12, T=2048, 4 GiB budget).
        data/ullis_dataset.jsonl    Example JSONL corpus.
 
 EXIT STATUS

@@ -1,7 +1,8 @@
 //! CPU Heron: LayerNorm, BinaryConnect linears, CMix x070, and checkpoint v2.
 //!
 //! Packed ±1 matrices keep FP16 latents in RAM for the life of the process.
-//! Checkpoints store bits, learned scales, and bias only.
+//! Safetensors snapshots store bits, scales, bias, BinaryConnect latents, and
+//! the FP32 SGD carry. JSON v2 files still omit latents and reconstruct them.
 
 use crate::config::{Architecture, RosaGradMode, TrainConfig};
 use crate::precision::{Fp16, Fp16Storage};
@@ -10,7 +11,10 @@ use crate::rosa::pack_bitplane;
 use crate::rosa::{RosaSam, bit_from_activation, sam_workspace_bytes};
 use crate::wkv7::{self, CHUNK_LEN, HEAD_SIZE};
 use anyhow::{Context, Result, bail};
+use safetensors::tensor::View;
+use safetensors::{Dtype, SafeTensors, serialize};
 use serde::{Deserialize, Serialize};
+use std::borrow::Cow;
 use std::collections::HashMap;
 use std::time::Instant;
 
@@ -541,7 +545,8 @@ impl Fp16Linear {
 /// variance matches a dense linear. The BinaryConnect proxy is a different
 /// quantity: only `sign(latent)` is used in the forward pass. Starting near
 /// zero lets a token-sum STE gradient cross the decision boundary in a
-/// short run; reconstructing a checkpoint at `±1` keeps a trained sign sticky.
+/// short run. Safetensors resume restores the live proxy; JSON reconstructs
+/// this magnitude so a bits-only snapshot can still flip.
 pub const BINARYCONNECT_INIT_ABS: f32 = 0.01;
 
 /// Undo the window-length mean on a BinaryConnect STE so the ±0.01 proxy sees a
@@ -636,12 +641,11 @@ impl PackedBinaryLinear {
             Some(_) => bail!("packed linear bias length mismatch"),
         };
         let mut latent = Fp16Storage::zeros(weights);
-        // Checkpoints omit the proxy. Reconstruct at the BinaryConnect rails so
-        // a trained sign is sticky (needs 1/lr agreeing steps to flip). Fresh
-        // `seeded` matrices use BINARYCONNECT_INIT_ABS instead.
+        // Bits-only snapshots (JSON v2) omit the proxy. Reconstruct at the live
+        // init magnitude so a later STE step can still cross zero.
         for index in 0..weights {
             let sign = if bit_is_plus(&bits, index) { 1.0 } else { -1.0 };
-            latent.set(index, sign);
+            latent.set(index, BINARYCONNECT_INIT_ABS * sign);
         }
         Ok(Self {
             out_features,
@@ -1038,6 +1042,10 @@ impl RwkvCMixX070 {
                 key: fwd.key,
                 relu2: fwd.relu2,
                 out: fwd.out,
+                gpu_xx: fwd.gpu_xx,
+                gpu_shifted: fwd.gpu_shifted,
+                gpu_key: fwd.gpu_key,
+                gpu_relu2: fwd.gpu_relu2,
             });
         }
         let xx = time_shift_on(x, batch, time, d, metal)?;
@@ -1058,12 +1066,20 @@ impl RwkvCMixX070 {
             key,
             relu2,
             out,
+            #[cfg(target_os = "macos")]
+            gpu_xx: None,
+            #[cfg(target_os = "macos")]
+            gpu_shifted: None,
+            #[cfg(target_os = "macos")]
+            gpu_key: None,
+            #[cfg(target_os = "macos")]
+            gpu_relu2: None,
         })
     }
 
     fn backward_update(
         &mut self,
-        tape: &CmixTape,
+        tape: &mut CmixTape,
         gy: &[f32],
         g_x: &mut [f32],
         g_w: &mut [f32],
@@ -1083,14 +1099,21 @@ impl RwkvCMixX070 {
                 &tape.shifted,
                 &tape.key,
                 &tape.relu2,
+                &tape.xx,
+                tape.gpu_shifted.take(),
+                tape.gpu_key.take(),
+                tape.gpu_relu2.take(),
+                tape.gpu_xx.take(),
                 gy,
+                self.x_k.as_bits(),
                 self.key.bits(),
                 self.key.scale_bits(),
                 self.key.latent_bits(),
                 self.key.latent.residual(),
                 self.value.weight_bits(),
                 self.value.weight.residual(),
-                rows,
+                batch,
+                time,
                 d,
                 self.key.out_features,
                 learning_rate,
@@ -1111,13 +1134,12 @@ impl RwkvCMixX070 {
             let flips = bit_flip_count(&before, &self.key.bits);
             let _ = g_w;
             let _ = key_weights;
-            let g_shifted = bwd.g_shifted;
-            let mut g_mix = vec![0.0; d];
-            lerp_shift_backward(
-                &tape.xx, &self.x_k, &g_shifted, batch, time, d, g_x, &mut g_mix,
-            );
+            if bwd.g_x.len() != g_x.len() || bwd.g_mix.len() != d {
+                bail!("CMix shift backward shape mismatch");
+            }
+            g_x.copy_from_slice(&bwd.g_x);
             for c in 0..d {
-                self.x_k.apply_clipped_sgd(c, g_mix[c], learning_rate);
+                self.x_k.apply_clipped_sgd(c, bwd.g_mix[c], learning_rate);
             }
             return Ok(flips);
         }
@@ -1223,6 +1245,14 @@ struct CmixTape {
     key: Vec<f32>,
     relu2: Vec<f32>,
     out: Vec<f32>,
+    #[cfg(target_os = "macos")]
+    gpu_xx: Option<crate::metal::ffi::MetalBuffer>,
+    #[cfg(target_os = "macos")]
+    gpu_shifted: Option<crate::metal::ffi::MetalBuffer>,
+    #[cfg(target_os = "macos")]
+    gpu_key: Option<crate::metal::ffi::MetalBuffer>,
+    #[cfg(target_os = "macos")]
+    gpu_relu2: Option<crate::metal::ffi::MetalBuffer>,
 }
 
 #[derive(Clone, Debug)]
@@ -2295,14 +2325,20 @@ struct HybridBlockCheckpoint {
 
 /// Versioned snapshot of persistent Heron state.
 ///
-/// Packed ±1 matrices store bits, learned scales, and official bias. FP16
-/// masters for those matrices are process-local BinaryConnect latents and are
-/// not written here. Hyena `format_version: 1` files are intentionally
-/// unloadable.
+/// Packed ±1 matrices store bits, learned scales, and official bias. JSON v2
+/// omits BinaryConnect latents and the FP32 SGD carry; safetensors writes both
+/// so `--resume` continues the same proxy and sub-ULP integrator. Hyena
+/// `format_version: 1` files are intentionally unloadable.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ModelCheckpoint {
     pub format_version: u32,
     pub config: TrainConfig,
+    /// Completed global train steps. Zero on a fresh snapshot or a v2 JSON file
+    /// that predates this field; the trainer may recover it from metrics.jsonl.
+    #[serde(default)]
+    pub step: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub loss_ema: Option<f32>,
     embedding_bits: Vec<u16>,
     ln_out: LayerNormBits,
     head: PackedBinaryCheckpoint,
@@ -2310,6 +2346,21 @@ pub struct ModelCheckpoint {
     blocks: Vec<HeronBlockCheckpoint>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     hybrid_blocks: Vec<HybridBlockCheckpoint>,
+    /// Live BinaryConnect latents and FP32 SGD residuals. Safetensors only.
+    #[serde(default, skip_serializing, skip_deserializing)]
+    train_carry: TrainCarry,
+}
+
+#[derive(Clone, Debug, Default)]
+struct TrainCarry {
+    latents: HashMap<String, Vec<u16>>,
+    residuals: HashMap<String, Vec<f32>>,
+}
+
+impl TrainCarry {
+    fn is_empty(&self) -> bool {
+        self.latents.is_empty() && self.residuals.is_empty()
+    }
 }
 
 /// Persistent-parameter census for `ullis inspect`. Counts are elements, not bytes.
@@ -2377,7 +2428,7 @@ impl HeronGenerateState {
     }
 }
 
-/// Product model. Packed BinaryConnect latents live in RAM; checkpoints omit them.
+/// Product model. Packed BinaryConnect latents live in RAM; safetensors resume restores them.
 #[derive(Clone, Debug)]
 pub struct UllisHeron {
     pub cfg: TrainConfig,
@@ -2490,9 +2541,15 @@ impl UllisHeron {
     }
 
     pub fn checkpoint(&self) -> ModelCheckpoint {
-        ModelCheckpoint {
+        self.checkpoint_at(0, None)
+    }
+
+    pub fn checkpoint_at(&self, step: u64, loss_ema: Option<f32>) -> ModelCheckpoint {
+        let mut checkpoint = ModelCheckpoint {
             format_version: CHECKPOINT_FORMAT_VERSION,
             config: self.cfg.clone(),
+            step,
+            loss_ema,
             embedding_bits: self.embedding.as_bits().to_vec(),
             ln_out: LayerNormBits {
                 weight: self.ln_out.weight.as_bits().to_vec(),
@@ -2540,17 +2597,23 @@ impl UllisHeron {
                     ffn: cmix_live_checkpoint(&block.ffn),
                 })
                 .collect(),
-        }
+            train_carry: TrainCarry::default(),
+        };
+        fill_train_carry(&mut checkpoint.train_carry, self);
+        checkpoint
     }
 
-    pub fn from_checkpoint(checkpoint: ModelCheckpoint) -> Result<Self> {
+    pub fn from_checkpoint(mut checkpoint: ModelCheckpoint) -> Result<Self> {
         require_v2(u64::from(checkpoint.format_version))?;
         checkpoint.config.validate()?;
         validate_checkpoint_shapes(&checkpoint)?;
-        match checkpoint.config.architecture {
-            Architecture::RosaRwkv7 => hybrid_from_checkpoint(checkpoint),
-            Architecture::Heron => heron_from_checkpoint(checkpoint),
-        }
+        let carry = std::mem::take(&mut checkpoint.train_carry);
+        let mut model = match checkpoint.config.architecture {
+            Architecture::RosaRwkv7 => hybrid_from_checkpoint(checkpoint)?,
+            Architecture::Heron => heron_from_checkpoint(checkpoint)?,
+        };
+        apply_train_carry(&mut model, &carry)?;
+        Ok(model)
     }
 
     pub fn hidden(&self, ids: &[u32], batch: usize, time: usize) -> Result<Vec<f32>> {
@@ -2746,7 +2809,6 @@ impl UllisHeron {
         learning_rate: f32,
         metal: Option<MetalTrainRuntime<'_>>,
     ) -> Result<CausalLoss> {
-        self.cfg.optimizer.require_train_step()?;
         if !matches!(self.cfg.rosa_grad, RosaGradMode::StopGradBits) {
             bail!("only rosa_grad=stop_grad_bits is wired");
         }
@@ -2787,7 +2849,11 @@ impl UllisHeron {
 
         let mut tapes = Vec::with_capacity(self.blocks.len());
         for block in &self.blocks {
-            let ln0_in = x.clone();
+            let ln0_in = if block.ln0.is_some() {
+                x.clone()
+            } else {
+                Vec::new()
+            };
             let started = Instant::now();
             if let Some(ln0) = &block.ln0 {
                 x = ln0.forward_on(&x, rows, metal_ref)?;
@@ -2801,8 +2867,9 @@ impl UllisHeron {
             let after_rosa = x.clone();
             let started = Instant::now();
             let ln2_out = block.ln2.forward_on(&x, rows, metal_ref)?;
-            let cmix = block.ffn.forward_tape(&ln2_out, batch, time, metal_ref)?;
+            let mut cmix = block.ffn.forward_tape(&ln2_out, batch, time, metal_ref)?;
             add_inplace(&mut x, &cmix.out);
+            cmix.out.clear();
             profile.add("fwd_cmix", started);
             tapes.push(BlockTape {
                 ln0_in,
@@ -2841,12 +2908,11 @@ impl UllisHeron {
 
         let mut flips_cmix = 0_usize;
         let mut flips_rosa_o = 0_usize;
-        for (block, tape) in self.blocks.iter_mut().zip(tapes).rev() {
-            let mut g_after_rosa = g_x.clone();
+        for (block, mut tape) in self.blocks.iter_mut().zip(tapes).rev() {
             let mut g_ln2_out = vec![0.0; rows.saturating_mul(d)];
             let started = Instant::now();
             flips_cmix += block.ffn.backward_update(
-                &tape.cmix,
+                &mut tape.cmix,
                 &g_x,
                 &mut g_ln2_out,
                 &mut self.g_w,
@@ -2863,14 +2929,13 @@ impl UllisHeron {
                     .ln2
                     .backward_on(&tape.after_rosa, &g_ln2_out, rows, metal_ref)?;
             block.ln2.apply_clipped_sgd(&g_w2, &g_b2, learning_rate)?;
-            add_inplace(&mut g_after_rosa, &g_ln2_in);
+            add_inplace(&mut g_x, &g_ln2_in);
             profile.add("bwd_ln", started);
 
-            let g_residual = g_after_rosa.clone();
             let started = Instant::now();
             flips_rosa_o += block.rosa.backward_stop_grad(
                 &tape.rosa,
-                &g_after_rosa,
+                &g_x,
                 &mut self.g_w,
                 learning_rate,
                 ste_scale,
@@ -2880,11 +2945,9 @@ impl UllisHeron {
             profile.add("bwd_rosa", started);
             let started = Instant::now();
             if let Some(ln0) = &mut block.ln0 {
-                let (g_in, gw, gb) = ln0.backward_on(&tape.ln0_in, &g_residual, rows, metal_ref)?;
+                let (g_in, gw, gb) = ln0.backward_on(&tape.ln0_in, &g_x, rows, metal_ref)?;
                 ln0.apply_clipped_sgd(&gw, &gb, learning_rate)?;
                 g_x = g_in;
-            } else {
-                g_x = g_residual;
             }
             profile.add("bwd_ln", started);
         }
@@ -3299,6 +3362,11 @@ struct BlockTape {
 }
 
 impl ModelCheckpoint {
+    /// True when the snapshot includes BinaryConnect latents (safetensors train state).
+    pub fn has_binaryconnect_latents(&self) -> bool {
+        !self.train_carry.latents.is_empty()
+    }
+
     /// Parse a JSON snapshot, hard-failing any `format_version` other than 2
     /// before the v2 payload schema is applied.
     pub fn from_json_bytes(bytes: &[u8]) -> Result<Self> {
@@ -3311,6 +3379,144 @@ impl ModelCheckpoint {
         require_v2(version)?;
         let checkpoint: Self =
             serde_json::from_value(value).context("parse checkpoint v2 payload")?;
+        validate_checkpoint_shapes(&checkpoint)?;
+        Ok(checkpoint)
+    }
+
+    /// JSON object (`{...}`) or a safetensors v2 snapshot.
+    pub fn from_bytes(bytes: &[u8]) -> Result<Self> {
+        if bytes.first() == Some(&b'{') {
+            Self::from_json_bytes(bytes)
+        } else {
+            Self::from_safetensors_bytes(bytes)
+        }
+    }
+
+    pub fn to_safetensors_bytes(&self) -> Result<Vec<u8>> {
+        let mut tensors = Vec::new();
+        push_f16(&mut tensors, "embedding", &self.embedding_bits);
+        push_f16(&mut tensors, "ln_out.weight", &self.ln_out.weight);
+        push_f16(&mut tensors, "ln_out.bias", &self.ln_out.bias);
+        push_packed(&mut tensors, "head", &self.head);
+        for (index, block) in self.blocks.iter().enumerate() {
+            let prefix = format!("blocks.{index}");
+            if let Some(ln0) = &block.ln0 {
+                push_ln(&mut tensors, &format!("{prefix}.ln0"), ln0);
+            }
+            push_ln(&mut tensors, &format!("{prefix}.ln2"), &block.ln2);
+            push_ln(&mut tensors, &format!("{prefix}.ln3"), &block.ln3);
+            push_rosa(&mut tensors, &format!("{prefix}.rosa"), &block.rosa);
+            push_cmix(&mut tensors, &format!("{prefix}.ffn"), &block.ffn);
+        }
+        for (index, block) in self.hybrid_blocks.iter().enumerate() {
+            let prefix = format!("hybrid_blocks.{index}");
+            push_ln(&mut tensors, &format!("{prefix}.ln_a"), &block.ln_a);
+            push_ln(&mut tensors, &format!("{prefix}.ln_b"), &block.ln_b);
+            push_ln(&mut tensors, &format!("{prefix}.ln_c"), &block.ln_c);
+            push_tmix(&mut tensors, &format!("{prefix}.tmix"), &block.tmix);
+            push_rosa(&mut tensors, &format!("{prefix}.rosa"), &block.rosa);
+            push_cmix(&mut tensors, &format!("{prefix}.ffn"), &block.ffn);
+        }
+        let mut metadata = HashMap::new();
+        metadata.insert("format_version".into(), self.format_version.to_string());
+        metadata.insert(
+            "config".into(),
+            serde_json::to_string(&self.config).context("serialize checkpoint config")?,
+        );
+        metadata.insert("step".into(), self.step.to_string());
+        if let Some(ema) = self.loss_ema {
+            metadata.insert("loss_ema".into(), ema.to_string());
+        }
+        for (name, latent) in &self.train_carry.latents {
+            push_f16(&mut tensors, format!("{name}.latent"), latent);
+        }
+        for (name, residual) in &self.train_carry.residuals {
+            push_f32(&mut tensors, format!("{name}.residual"), residual);
+        }
+        serialize(tensors, Some(metadata)).context("serialize safetensors checkpoint")
+    }
+
+    pub fn from_safetensors_bytes(bytes: &[u8]) -> Result<Self> {
+        let (_, file_meta) =
+            SafeTensors::read_metadata(bytes).context("parse safetensors checkpoint header")?;
+        let meta = file_meta
+            .metadata()
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("safetensors checkpoint is missing metadata"))?;
+        let tensors = SafeTensors::deserialize(bytes).context("parse safetensors checkpoint")?;
+        let version = meta
+            .get("format_version")
+            .and_then(|value| value.parse::<u64>().ok())
+            .unwrap_or(0);
+        require_v2(version)?;
+        let config: TrainConfig = serde_json::from_str(
+            meta.get("config")
+                .ok_or_else(|| anyhow::anyhow!("safetensors checkpoint is missing config"))?,
+        )
+        .context("parse safetensors checkpoint config")?;
+        let step = meta
+            .get("step")
+            .and_then(|value| value.parse::<u64>().ok())
+            .unwrap_or(0);
+        let loss_ema = meta.get("loss_ema").and_then(|value| value.parse().ok());
+        let mut checkpoint = Self {
+            format_version: CHECKPOINT_FORMAT_VERSION,
+            config,
+            step,
+            loss_ema,
+            embedding_bits: pull_f16(&tensor_named(&tensors, "embedding")?)?,
+            ln_out: LayerNormBits {
+                weight: pull_f16(&tensor_named(&tensors, "ln_out.weight")?)?,
+                bias: pull_f16(&tensor_named(&tensors, "ln_out.bias")?)?,
+            },
+            head: pull_packed(&tensors, "head")?,
+            blocks: {
+                let mut blocks = Vec::new();
+                let mut index = 0_usize;
+                while tensors
+                    .tensor(&format!("blocks.{index}.ln2.weight"))
+                    .is_ok()
+                {
+                    let prefix = format!("blocks.{index}");
+                    let ln0 = tensors
+                        .tensor(&format!("{prefix}.ln0.weight"))
+                        .ok()
+                        .map(|_| pull_ln(&tensors, &format!("{prefix}.ln0")))
+                        .transpose()?;
+                    blocks.push(HeronBlockCheckpoint {
+                        ln0,
+                        ln2: pull_ln(&tensors, &format!("{prefix}.ln2"))?,
+                        ln3: pull_ln(&tensors, &format!("{prefix}.ln3"))?,
+                        rosa: pull_rosa(&tensors, &format!("{prefix}.rosa"))?,
+                        ffn: pull_cmix(&tensors, &format!("{prefix}.ffn"))?,
+                    });
+                    index += 1;
+                }
+                blocks
+            },
+            hybrid_blocks: {
+                let mut blocks = Vec::new();
+                let mut index = 0_usize;
+                while tensors
+                    .tensor(&format!("hybrid_blocks.{index}.ln_a.weight"))
+                    .is_ok()
+                {
+                    let prefix = format!("hybrid_blocks.{index}");
+                    blocks.push(HybridBlockCheckpoint {
+                        ln_a: pull_ln(&tensors, &format!("{prefix}.ln_a"))?,
+                        ln_b: pull_ln(&tensors, &format!("{prefix}.ln_b"))?,
+                        ln_c: pull_ln(&tensors, &format!("{prefix}.ln_c"))?,
+                        tmix: pull_tmix(&tensors, &format!("{prefix}.tmix"))?,
+                        rosa: pull_rosa(&tensors, &format!("{prefix}.rosa"))?,
+                        ffn: pull_cmix(&tensors, &format!("{prefix}.ffn"))?,
+                    });
+                    index += 1;
+                }
+                blocks
+            },
+            train_carry: TrainCarry::default(),
+        };
+        pull_train_carry(&tensors, &mut checkpoint.train_carry)?;
         validate_checkpoint_shapes(&checkpoint)?;
         Ok(checkpoint)
     }
@@ -3386,6 +3592,446 @@ fn mul_count(a: usize, b: usize) -> Result<usize> {
 fn add_count(a: usize, b: usize) -> Result<usize> {
     a.checked_add(b)
         .ok_or_else(|| anyhow::anyhow!("parameter count overflow"))
+}
+
+struct OwnedTensor {
+    dtype: Dtype,
+    shape: Vec<usize>,
+    data: Vec<u8>,
+}
+
+impl View for OwnedTensor {
+    fn dtype(&self) -> Dtype {
+        self.dtype
+    }
+
+    fn shape(&self) -> &[usize] {
+        &self.shape
+    }
+
+    fn data(&self) -> Cow<'_, [u8]> {
+        Cow::Borrowed(&self.data)
+    }
+
+    fn data_len(&self) -> usize {
+        self.data.len()
+    }
+}
+
+fn u16_to_le_bytes(values: &[u16]) -> Vec<u8> {
+    let mut bytes = Vec::with_capacity(values.len().saturating_mul(2));
+    for value in values {
+        bytes.extend_from_slice(&value.to_le_bytes());
+    }
+    bytes
+}
+
+fn u32_to_le_bytes(values: &[u32]) -> Vec<u8> {
+    let mut bytes = Vec::with_capacity(values.len().saturating_mul(4));
+    for value in values {
+        bytes.extend_from_slice(&value.to_le_bytes());
+    }
+    bytes
+}
+
+fn le_bytes_to_u16(bytes: &[u8]) -> Result<Vec<u16>> {
+    if !bytes.len().is_multiple_of(2) {
+        bail!("F16 tensor length is not a multiple of 2");
+    }
+    Ok(bytes
+        .chunks_exact(2)
+        .map(|chunk| u16::from_le_bytes([chunk[0], chunk[1]]))
+        .collect())
+}
+
+fn le_bytes_to_u32(bytes: &[u8]) -> Result<Vec<u32>> {
+    if !bytes.len().is_multiple_of(4) {
+        bail!("U32 tensor length is not a multiple of 4");
+    }
+    Ok(bytes
+        .chunks_exact(4)
+        .map(|chunk| u32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]))
+        .collect())
+}
+
+fn push_f32(tensors: &mut Vec<(String, OwnedTensor)>, name: impl Into<String>, values: &[f32]) {
+    tensors.push((
+        name.into(),
+        OwnedTensor {
+            dtype: Dtype::F32,
+            shape: vec![values.len()],
+            data: f32_to_le_bytes(values),
+        },
+    ));
+}
+
+fn f32_to_le_bytes(values: &[f32]) -> Vec<u8> {
+    let mut bytes = Vec::with_capacity(values.len().saturating_mul(4));
+    for value in values {
+        bytes.extend_from_slice(&value.to_le_bytes());
+    }
+    bytes
+}
+
+fn le_bytes_to_f32(bytes: &[u8]) -> Result<Vec<f32>> {
+    if !bytes.len().is_multiple_of(4) {
+        bail!("F32 tensor length is not a multiple of 4");
+    }
+    Ok(bytes
+        .chunks_exact(4)
+        .map(|chunk| f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]))
+        .collect())
+}
+
+fn pull_f32(view: &safetensors::tensor::TensorView<'_>) -> Result<Vec<f32>> {
+    if view.dtype() != Dtype::F32 {
+        bail!("expected F32 tensor, got {:?}", view.dtype());
+    }
+    le_bytes_to_f32(view.data())
+}
+
+fn pull_train_carry(tensors: &SafeTensors<'_>, carry: &mut TrainCarry) -> Result<()> {
+    for name in tensors.names() {
+        if let Some(prefix) = name.strip_suffix(".latent") {
+            if prefix.ends_with(".latent") {
+                continue;
+            }
+            carry
+                .latents
+                .insert(prefix.to_string(), pull_f16(&tensor_named(tensors, name)?)?);
+        } else if let Some(prefix) = name.strip_suffix(".residual") {
+            carry
+                .residuals
+                .insert(prefix.to_string(), pull_f32(&tensor_named(tensors, name)?)?);
+        }
+    }
+    Ok(())
+}
+
+fn carry_storage(carry: &mut TrainCarry, name: &str, storage: &Fp16Storage) {
+    carry
+        .residuals
+        .insert(name.to_string(), storage.residual().to_vec());
+}
+
+fn carry_ln(carry: &mut TrainCarry, prefix: &str, ln: &LayerNorm) {
+    carry_storage(carry, &format!("{prefix}.weight"), &ln.weight);
+    carry_storage(carry, &format!("{prefix}.bias"), &ln.bias);
+}
+
+fn carry_packed(carry: &mut TrainCarry, prefix: &str, linear: &PackedBinaryLinear) {
+    carry
+        .latents
+        .insert(prefix.to_string(), linear.latent_bits().to_vec());
+    carry_storage(carry, &format!("{prefix}.latent"), &linear.latent);
+    carry_storage(carry, &format!("{prefix}.scale"), &linear.scale);
+    if let Some(bias) = &linear.bias {
+        carry_storage(carry, &format!("{prefix}.bias"), bias);
+    }
+}
+
+fn carry_rosa(carry: &mut TrainCarry, prefix: &str, rosa: &RwkvRosaQkv1Bit) {
+    carry_storage(carry, &format!("{prefix}.x_q"), &rosa.x_q);
+    carry_storage(carry, &format!("{prefix}.x_k"), &rosa.x_k);
+    carry_storage(carry, &format!("{prefix}.x_v"), &rosa.x_v);
+    carry_storage(carry, &format!("{prefix}.e"), &rosa.e);
+    carry_packed(carry, &format!("{prefix}.q"), &rosa.q);
+    carry_packed(carry, &format!("{prefix}.k"), &rosa.k);
+    carry_packed(carry, &format!("{prefix}.v"), &rosa.v);
+    carry_packed(carry, &format!("{prefix}.o"), &rosa.o);
+}
+
+fn carry_cmix(carry: &mut TrainCarry, prefix: &str, ffn: &RwkvCMixX070) {
+    carry_storage(carry, &format!("{prefix}.x_k"), &ffn.x_k);
+    carry_packed(carry, &format!("{prefix}.key"), &ffn.key);
+    carry_storage(carry, &format!("{prefix}.value"), &ffn.value.weight);
+}
+
+fn fill_train_carry(carry: &mut TrainCarry, model: &UllisHeron) {
+    carry_storage(carry, "embedding", &model.embedding);
+    carry_ln(carry, "ln_out", &model.ln_out);
+    carry_packed(carry, "head", &model.head);
+    for (index, block) in model.blocks.iter().enumerate() {
+        let prefix = format!("blocks.{index}");
+        if let Some(ln0) = &block.ln0 {
+            carry_ln(carry, &format!("{prefix}.ln0"), ln0);
+        }
+        carry_ln(carry, &format!("{prefix}.ln2"), &block.ln2);
+        carry_ln(carry, &format!("{prefix}.ln3"), &block.ln3);
+        carry_rosa(carry, &format!("{prefix}.rosa"), &block.rosa);
+        carry_cmix(carry, &format!("{prefix}.ffn"), &block.ffn);
+    }
+    for (index, block) in model.hybrid_blocks.iter().enumerate() {
+        let prefix = format!("hybrid_blocks.{index}");
+        carry_ln(carry, &format!("{prefix}.ln_a"), &block.ln_a);
+        carry_ln(carry, &format!("{prefix}.ln_b"), &block.ln_b);
+        carry_ln(carry, &format!("{prefix}.ln_c"), &block.ln_c);
+        carry_rosa(carry, &format!("{prefix}.rosa"), &block.rosa);
+        carry_cmix(carry, &format!("{prefix}.ffn"), &block.ffn);
+    }
+}
+
+fn install_storage(storage: &mut Fp16Storage, carry: &TrainCarry, name: &str) -> Result<()> {
+    if let Some(residual) = carry.residuals.get(name) {
+        storage.install_residual(residual.clone())?;
+    }
+    Ok(())
+}
+
+fn install_ln(ln: &mut LayerNorm, carry: &TrainCarry, prefix: &str) -> Result<()> {
+    install_storage(&mut ln.weight, carry, &format!("{prefix}.weight"))?;
+    install_storage(&mut ln.bias, carry, &format!("{prefix}.bias"))
+}
+
+fn install_packed(linear: &mut PackedBinaryLinear, carry: &TrainCarry, prefix: &str) -> Result<()> {
+    if let Some(latent) = carry.latents.get(prefix) {
+        let residual = carry
+            .residuals
+            .get(&format!("{prefix}.latent"))
+            .cloned()
+            .unwrap_or_else(|| vec![0.0; latent.len()]);
+        linear.latent.install(latent.clone(), residual)?;
+    }
+    install_storage(&mut linear.scale, carry, &format!("{prefix}.scale"))?;
+    if let Some(bias) = linear.bias.as_mut() {
+        install_storage(bias, carry, &format!("{prefix}.bias"))?;
+    }
+    Ok(())
+}
+
+fn install_rosa(rosa: &mut RwkvRosaQkv1Bit, carry: &TrainCarry, prefix: &str) -> Result<()> {
+    install_storage(&mut rosa.x_q, carry, &format!("{prefix}.x_q"))?;
+    install_storage(&mut rosa.x_k, carry, &format!("{prefix}.x_k"))?;
+    install_storage(&mut rosa.x_v, carry, &format!("{prefix}.x_v"))?;
+    install_storage(&mut rosa.e, carry, &format!("{prefix}.e"))?;
+    install_packed(&mut rosa.q, carry, &format!("{prefix}.q"))?;
+    install_packed(&mut rosa.k, carry, &format!("{prefix}.k"))?;
+    install_packed(&mut rosa.v, carry, &format!("{prefix}.v"))?;
+    install_packed(&mut rosa.o, carry, &format!("{prefix}.o"))
+}
+
+fn install_cmix(ffn: &mut RwkvCMixX070, carry: &TrainCarry, prefix: &str) -> Result<()> {
+    install_storage(&mut ffn.x_k, carry, &format!("{prefix}.x_k"))?;
+    install_packed(&mut ffn.key, carry, &format!("{prefix}.key"))?;
+    install_storage(&mut ffn.value.weight, carry, &format!("{prefix}.value"))
+}
+
+fn apply_train_carry(model: &mut UllisHeron, carry: &TrainCarry) -> Result<()> {
+    if carry.is_empty() {
+        return Ok(());
+    }
+    install_storage(&mut model.embedding, carry, "embedding")?;
+    install_ln(&mut model.ln_out, carry, "ln_out")?;
+    install_packed(&mut model.head, carry, "head")?;
+    for (index, block) in model.blocks.iter_mut().enumerate() {
+        let prefix = format!("blocks.{index}");
+        if let Some(ln0) = &mut block.ln0 {
+            install_ln(ln0, carry, &format!("{prefix}.ln0"))?;
+        }
+        install_ln(&mut block.ln2, carry, &format!("{prefix}.ln2"))?;
+        install_ln(&mut block.ln3, carry, &format!("{prefix}.ln3"))?;
+        install_rosa(&mut block.rosa, carry, &format!("{prefix}.rosa"))?;
+        install_cmix(&mut block.ffn, carry, &format!("{prefix}.ffn"))?;
+    }
+    for (index, block) in model.hybrid_blocks.iter_mut().enumerate() {
+        let prefix = format!("hybrid_blocks.{index}");
+        install_ln(&mut block.ln_a, carry, &format!("{prefix}.ln_a"))?;
+        install_ln(&mut block.ln_b, carry, &format!("{prefix}.ln_b"))?;
+        install_ln(&mut block.ln_c, carry, &format!("{prefix}.ln_c"))?;
+        install_rosa(&mut block.rosa, carry, &format!("{prefix}.rosa"))?;
+        install_cmix(&mut block.ffn, carry, &format!("{prefix}.ffn"))?;
+    }
+    Ok(())
+}
+
+fn push_f16(tensors: &mut Vec<(String, OwnedTensor)>, name: impl Into<String>, values: &[u16]) {
+    tensors.push((
+        name.into(),
+        OwnedTensor {
+            dtype: Dtype::F16,
+            shape: vec![values.len()],
+            data: u16_to_le_bytes(values),
+        },
+    ));
+}
+
+fn push_u32(tensors: &mut Vec<(String, OwnedTensor)>, name: impl Into<String>, values: &[u32]) {
+    tensors.push((
+        name.into(),
+        OwnedTensor {
+            dtype: Dtype::U32,
+            shape: vec![values.len()],
+            data: u32_to_le_bytes(values),
+        },
+    ));
+}
+
+fn push_ln(tensors: &mut Vec<(String, OwnedTensor)>, prefix: &str, ln: &LayerNormBits) {
+    push_f16(tensors, format!("{prefix}.weight"), &ln.weight);
+    push_f16(tensors, format!("{prefix}.bias"), &ln.bias);
+}
+
+fn push_packed(
+    tensors: &mut Vec<(String, OwnedTensor)>,
+    prefix: &str,
+    packed: &PackedBinaryCheckpoint,
+) {
+    push_u32(tensors, format!("{prefix}.bits"), &packed.bits);
+    push_f16(tensors, format!("{prefix}.scale"), &packed.scale_bits);
+    if let Some(bias) = &packed.bias_bits {
+        push_f16(tensors, format!("{prefix}.bias"), bias);
+    }
+}
+
+fn push_rosa(tensors: &mut Vec<(String, OwnedTensor)>, prefix: &str, rosa: &RosaCheckpoint) {
+    push_f16(tensors, format!("{prefix}.x_q"), &rosa.x_q.0);
+    push_f16(tensors, format!("{prefix}.x_k"), &rosa.x_k.0);
+    push_f16(tensors, format!("{prefix}.x_v"), &rosa.x_v.0);
+    push_f16(tensors, format!("{prefix}.e"), &rosa.e.0);
+    push_packed(tensors, &format!("{prefix}.q"), &rosa.q);
+    push_packed(tensors, &format!("{prefix}.k"), &rosa.k);
+    push_packed(tensors, &format!("{prefix}.v"), &rosa.v);
+    push_packed(tensors, &format!("{prefix}.o"), &rosa.o);
+}
+
+fn push_cmix(tensors: &mut Vec<(String, OwnedTensor)>, prefix: &str, ffn: &CmixCheckpoint) {
+    push_f16(tensors, format!("{prefix}.x_k"), &ffn.x_k.0);
+    push_packed(tensors, &format!("{prefix}.key"), &ffn.key);
+    push_f16(tensors, format!("{prefix}.value"), &ffn.value_bits.0);
+}
+
+fn push_tmix(tensors: &mut Vec<(String, OwnedTensor)>, prefix: &str, tmix: &TmixCheckpoint) {
+    for (name, values) in [
+        ("x_r", &tmix.x_r.0),
+        ("x_w", &tmix.x_w.0),
+        ("x_k", &tmix.x_k.0),
+        ("x_v", &tmix.x_v.0),
+        ("x_a", &tmix.x_a.0),
+        ("x_g", &tmix.x_g.0),
+        ("w1", &tmix.w1.0),
+        ("a1", &tmix.a1.0),
+        ("v1", &tmix.v1.0),
+        ("g1", &tmix.g1.0),
+        ("w2", &tmix.w2.0),
+        ("a2", &tmix.a2.0),
+        ("v2", &tmix.v2.0),
+        ("g2", &tmix.g2.0),
+        ("w0", &tmix.w0.0),
+        ("a0", &tmix.a0.0),
+        ("v0", &tmix.v0.0),
+        ("k_k", &tmix.k_k.0),
+        ("k_a", &tmix.k_a.0),
+        ("r_k", &tmix.r_k.0),
+        ("receptance", &tmix.receptance.0),
+        ("key", &tmix.key.0),
+        ("value", &tmix.value.0),
+        ("output", &tmix.output.0),
+        ("ln_x_weight", &tmix.ln_x_weight.0),
+        ("ln_x_bias", &tmix.ln_x_bias.0),
+    ] {
+        push_f16(tensors, format!("{prefix}.{name}"), values);
+    }
+}
+
+fn pull_f16(view: &safetensors::tensor::TensorView<'_>) -> Result<Vec<u16>> {
+    if view.dtype() != Dtype::F16 {
+        bail!("expected F16 tensor, got {:?}", view.dtype());
+    }
+    le_bytes_to_u16(view.data())
+}
+
+fn pull_u32(view: &safetensors::tensor::TensorView<'_>) -> Result<Vec<u32>> {
+    if view.dtype() != Dtype::U32 {
+        bail!("expected U32 tensor, got {:?}", view.dtype());
+    }
+    le_bytes_to_u32(view.data())
+}
+
+fn tensor_named<'data>(
+    tensors: &SafeTensors<'data>,
+    name: &str,
+) -> Result<safetensors::tensor::TensorView<'data>> {
+    tensors
+        .tensor(name)
+        .with_context(|| format!("checkpoint tensor {name}"))
+}
+
+fn pull_ln(tensors: &SafeTensors<'_>, prefix: &str) -> Result<LayerNormBits> {
+    Ok(LayerNormBits {
+        weight: pull_f16(&tensor_named(tensors, &format!("{prefix}.weight"))?)?,
+        bias: pull_f16(&tensor_named(tensors, &format!("{prefix}.bias"))?)?,
+    })
+}
+
+fn pull_packed(tensors: &SafeTensors<'_>, prefix: &str) -> Result<PackedBinaryCheckpoint> {
+    Ok(PackedBinaryCheckpoint {
+        bits: pull_u32(&tensor_named(tensors, &format!("{prefix}.bits"))?)?,
+        scale_bits: pull_f16(&tensor_named(tensors, &format!("{prefix}.scale"))?)?,
+        bias_bits: tensors
+            .tensor(&format!("{prefix}.bias"))
+            .ok()
+            .map(|view| pull_f16(&view))
+            .transpose()?,
+    })
+}
+
+fn pull_rosa(tensors: &SafeTensors<'_>, prefix: &str) -> Result<RosaCheckpoint> {
+    Ok(RosaCheckpoint {
+        x_q: Fp16Vec(pull_f16(&tensor_named(tensors, &format!("{prefix}.x_q"))?)?),
+        x_k: Fp16Vec(pull_f16(&tensor_named(tensors, &format!("{prefix}.x_k"))?)?),
+        x_v: Fp16Vec(pull_f16(&tensor_named(tensors, &format!("{prefix}.x_v"))?)?),
+        e: Fp16Vec(pull_f16(&tensor_named(tensors, &format!("{prefix}.e"))?)?),
+        q: pull_packed(tensors, &format!("{prefix}.q"))?,
+        k: pull_packed(tensors, &format!("{prefix}.k"))?,
+        v: pull_packed(tensors, &format!("{prefix}.v"))?,
+        o: pull_packed(tensors, &format!("{prefix}.o"))?,
+    })
+}
+
+fn pull_cmix(tensors: &SafeTensors<'_>, prefix: &str) -> Result<CmixCheckpoint> {
+    Ok(CmixCheckpoint {
+        x_k: Fp16Vec(pull_f16(&tensor_named(tensors, &format!("{prefix}.x_k"))?)?),
+        key: pull_packed(tensors, &format!("{prefix}.key"))?,
+        value_bits: Fp16Vec(pull_f16(&tensor_named(
+            tensors,
+            &format!("{prefix}.value"),
+        )?)?),
+    })
+}
+
+fn pull_f16_vec(tensors: &SafeTensors<'_>, name: &str) -> Result<Fp16Vec> {
+    Ok(Fp16Vec(pull_f16(&tensor_named(tensors, name)?)?))
+}
+
+fn pull_tmix(tensors: &SafeTensors<'_>, prefix: &str) -> Result<TmixCheckpoint> {
+    Ok(TmixCheckpoint {
+        x_r: pull_f16_vec(tensors, &format!("{prefix}.x_r"))?,
+        x_w: pull_f16_vec(tensors, &format!("{prefix}.x_w"))?,
+        x_k: pull_f16_vec(tensors, &format!("{prefix}.x_k"))?,
+        x_v: pull_f16_vec(tensors, &format!("{prefix}.x_v"))?,
+        x_a: pull_f16_vec(tensors, &format!("{prefix}.x_a"))?,
+        x_g: pull_f16_vec(tensors, &format!("{prefix}.x_g"))?,
+        w1: pull_f16_vec(tensors, &format!("{prefix}.w1"))?,
+        a1: pull_f16_vec(tensors, &format!("{prefix}.a1"))?,
+        v1: pull_f16_vec(tensors, &format!("{prefix}.v1"))?,
+        g1: pull_f16_vec(tensors, &format!("{prefix}.g1"))?,
+        w2: pull_f16_vec(tensors, &format!("{prefix}.w2"))?,
+        a2: pull_f16_vec(tensors, &format!("{prefix}.a2"))?,
+        v2: pull_f16_vec(tensors, &format!("{prefix}.v2"))?,
+        g2: pull_f16_vec(tensors, &format!("{prefix}.g2"))?,
+        w0: pull_f16_vec(tensors, &format!("{prefix}.w0"))?,
+        a0: pull_f16_vec(tensors, &format!("{prefix}.a0"))?,
+        v0: pull_f16_vec(tensors, &format!("{prefix}.v0"))?,
+        k_k: pull_f16_vec(tensors, &format!("{prefix}.k_k"))?,
+        k_a: pull_f16_vec(tensors, &format!("{prefix}.k_a"))?,
+        r_k: pull_f16_vec(tensors, &format!("{prefix}.r_k"))?,
+        receptance: pull_f16_vec(tensors, &format!("{prefix}.receptance"))?,
+        key: pull_f16_vec(tensors, &format!("{prefix}.key"))?,
+        value: pull_f16_vec(tensors, &format!("{prefix}.value"))?,
+        output: pull_f16_vec(tensors, &format!("{prefix}.output"))?,
+        ln_x_weight: pull_f16_vec(tensors, &format!("{prefix}.ln_x_weight"))?,
+        ln_x_bias: pull_f16_vec(tensors, &format!("{prefix}.ln_x_bias"))?,
+    })
 }
 
 fn rosa_live_checkpoint(rosa: &RwkvRosaQkv1Bit) -> RosaCheckpoint {
@@ -3814,11 +4460,14 @@ mod tests {
         let checkpoint = ModelCheckpoint {
             format_version: 1,
             config: TrainConfig::default(),
+            step: 0,
+            loss_ema: None,
             embedding_bits: Vec::new(),
             ln_out: layer_norm(1),
             head: packed_linear(1, 1, false, 1.0),
             blocks: Vec::new(),
             hybrid_blocks: Vec::new(),
+            train_carry: TrainCarry::default(),
         };
         let error = UllisHeron::from_checkpoint(checkpoint)
             .unwrap_err()
@@ -3850,7 +4499,7 @@ mod tests {
     #[test]
     fn ignored_pad_targets_are_excluded_from_ce_count() {
         let mut model = UllisHeron::new(tiny_train_cfg()).unwrap();
-        let mut tokens: Vec<u32> = (0..32).map(|i| 4 + (i % 8) as u32).collect();
+        let mut tokens: Vec<u32> = (0..32u32).map(|i| 4 + i % 8).collect();
         let mut labels = tokens.clone();
         for slot in 16..32 {
             tokens[slot] = 0;
@@ -3867,7 +4516,7 @@ mod tests {
     fn window_length_ce_does_not_let_a_singleton_window_dominate() {
         let mut dense = UllisHeron::new(tiny_train_cfg()).unwrap();
         let mut sparse = dense.clone();
-        let tokens: Vec<u32> = (0..32).map(|i| 4 + (i % 8) as u32).collect();
+        let tokens: Vec<u32> = (0..32u32).map(|i| 4 + i % 8).collect();
         let dense_loss = dense.train_step(&tokens, 1, 32, 0.05).unwrap();
         let mut labels = vec![0_u32; 32];
         labels[16] = tokens[16];
@@ -3892,7 +4541,7 @@ mod tests {
     #[test]
     fn train_diagnostics_report_row_loss_spread_and_unigram_baseline() {
         let mut model = UllisHeron::new(tiny_train_cfg()).unwrap();
-        let tokens: Vec<u32> = (0..32).map(|i| 4 + (i % 8) as u32).collect();
+        let tokens: Vec<u32> = (0..32u32).map(|i| 4 + i % 8).collect();
         let loss = model.train_step(&tokens, 1, 32, 0.05).unwrap();
         assert!(loss.next_token.is_finite());
         assert!(loss.loss_p10 <= loss.loss_p50);
@@ -4020,7 +4669,7 @@ mod tests {
         let o_scale = model.blocks[0].rosa.o.scale().as_bits().to_vec();
         let head_scale = model.head.scale().as_bits().to_vec();
         let head_bias = model.head.bias().unwrap().as_bits().to_vec();
-        let tokens: Vec<u32> = (0..32).map(|i| 4 + (i % 8) as u32).collect();
+        let tokens: Vec<u32> = (0..32u32).map(|i| 4 + i % 8).collect();
         let loss = model.train_step(&tokens, 1, 32, 0.05).unwrap();
         assert!(loss.next_token.is_finite());
         assert_eq!(loss.next_token_count, 31);
@@ -4062,7 +4711,7 @@ mod tests {
     #[test]
     fn unigram_prior_drops_ce_toward_batch_unigram() {
         let mut model = UllisHeron::new(tiny_train_cfg()).unwrap();
-        let tokens: Vec<u32> = (0..32).map(|i| 4 + (i % 8) as u32).collect();
+        let tokens: Vec<u32> = (0..32u32).map(|i| 4 + i % 8).collect();
         let before = model.train_step(&tokens, 1, 32, 1e-8).unwrap().next_token;
         let mut fitted = UllisHeron::new(tiny_train_cfg()).unwrap();
         let corpus: Vec<u32> = (0..4096).map(|i| 4 + (i % 8) as u32).collect();
@@ -4182,7 +4831,11 @@ mod tests {
         assert_eq!(json["config"]["dim_ffn"], 64);
         assert_eq!(json["config"]["rosa_bits"], 1);
         assert_eq!(json["config"]["rosa_grad"], "stop_grad_bits");
-        assert_eq!(json["config"]["optimizer"], "stateless_sgd");
+        assert!(
+            json.get("config")
+                .and_then(|c| c.get("optimizer"))
+                .is_none()
+        );
         assert!(json["head"]["bias_bits"].is_array());
         assert!(json["head"]["bits"].is_array());
         assert!(json["head"]["scale_bits"].is_array());
@@ -4203,7 +4856,7 @@ mod tests {
     #[test]
     fn checkpoint_roundtrip_after_train_preserves_forward() {
         let mut model = UllisHeron::new(tiny_train_cfg()).unwrap();
-        let tokens: Vec<u32> = (0..32).map(|i| 4 + (i % 8) as u32).collect();
+        let tokens: Vec<u32> = (0..32u32).map(|i| 4 + i % 8).collect();
         model.train_step(&tokens, 1, 32, 0.05).unwrap();
         let hidden = model.hidden(&tokens, 1, 32).unwrap();
         let bytes = serde_json::to_vec(&model.checkpoint()).unwrap();
@@ -4212,6 +4865,26 @@ mod tests {
             UllisHeron::from_checkpoint(ModelCheckpoint::from_json_bytes(&bytes).unwrap()).unwrap();
         let hidden_restored = restored.hidden(&tokens, 1, 32).unwrap();
         assert_eq!(hidden, hidden_restored);
+        let st = model
+            .checkpoint_at(17, Some(4.5))
+            .to_safetensors_bytes()
+            .unwrap();
+        let json = serde_json::to_vec(&model.checkpoint()).unwrap();
+        assert!(!String::from_utf8_lossy(&json).contains("latent"));
+        let from_st = ModelCheckpoint::from_bytes(&st).unwrap();
+        assert_eq!(from_st.step, 17);
+        assert_eq!(from_st.loss_ema, Some(4.5));
+        assert!(from_st.has_binaryconnect_latents());
+        let mut restored_st = UllisHeron::from_checkpoint(from_st).unwrap();
+        assert_eq!(restored_st.hidden(&tokens, 1, 32).unwrap(), hidden);
+        assert_eq!(
+            restored_st.head.latent().as_bits(),
+            model.head.latent().as_bits()
+        );
+        assert_eq!(
+            restored_st.head.latent().residual(),
+            model.head.latent().residual()
+        );
         assert_eq!(
             restored.blocks[0].rosa.e.as_bits(),
             model.blocks[0].rosa.e.as_bits()
@@ -4224,6 +4897,17 @@ mod tests {
         assert_eq!(
             restored.head.bias().map(Fp16Storage::as_bits),
             model.head.bias().map(Fp16Storage::as_bits)
+        );
+        let live_next = model.train_step(&tokens, 1, 32, 0.05).unwrap();
+        let restored_next = restored_st.train_step(&tokens, 1, 32, 0.05).unwrap();
+        assert_eq!(live_next.next_token, restored_next.next_token);
+        assert_eq!(
+            restored_st.head.latent().as_bits(),
+            model.head.latent().as_bits()
+        );
+        assert_eq!(
+            restored_st.head.latent().residual(),
+            model.head.latent().residual()
         );
     }
 
@@ -4340,7 +5024,7 @@ mod tests {
     #[test]
     fn generate_step_matches_one_shot_after_train() {
         let mut model = UllisHeron::new(tiny_train_cfg()).unwrap();
-        let tokens: Vec<u32> = (0..32).map(|i| 4 + (i % 8) as u32).collect();
+        let tokens: Vec<u32> = (0..32u32).map(|i| 4 + i % 8).collect();
         model.train_step(&tokens, 1, 32, 0.05).unwrap();
         let prefix = &tokens[..8];
         let d = model.cfg.d_model;

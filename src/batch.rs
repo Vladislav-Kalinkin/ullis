@@ -101,6 +101,27 @@ impl<'a> CausalBatcher<'a> {
     pub fn remaining_batches(&self) -> usize {
         self.tokens.len().saturating_sub(self.offset) / self.batch_tokens
     }
+
+    /// Advance past `n` already-completed train steps so resume does not
+    /// replay the prefix of the packed stream.
+    pub fn skip_batches(&mut self, n: usize) -> Result<()> {
+        let skip = n
+            .checked_mul(self.batch_tokens)
+            .ok_or_else(|| anyhow::anyhow!("resume skip overflow"))?;
+        let end = self
+            .offset
+            .checked_add(skip)
+            .ok_or_else(|| anyhow::anyhow!("resume skip overflow"))?;
+        if end > self.tokens.len() {
+            bail!(
+                "resume step {n} needs {} packed tokens but the stream only has {}",
+                end,
+                self.tokens.len()
+            );
+        }
+        self.offset = end;
+        Ok(())
+    }
 }
 
 impl<'a> Iterator for CausalBatcher<'a> {
@@ -162,6 +183,20 @@ mod tests {
         assert_eq!(first.tokens(), &tokens[..4]);
         assert_eq!(first.labels(), &labels[..4]);
         assert!(CausalBatcher::new_with_labels(&[1, 2], &[1], 1, 2).is_err());
+    }
+
+    #[test]
+    fn skip_batches_starts_at_the_resume_window() {
+        let tokens: Vec<u32> = (0..16).collect();
+        let mut batches = CausalBatcher::new(&tokens, 1, 4).unwrap();
+        batches.skip_batches(2).unwrap();
+        assert_eq!(batches.next().unwrap().tokens(), &tokens[8..12]);
+        assert!(
+            CausalBatcher::new(&tokens, 1, 4)
+                .unwrap()
+                .skip_batches(5)
+                .is_err()
+        );
     }
 
     #[test]

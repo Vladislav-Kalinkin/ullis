@@ -2,7 +2,7 @@
 using namespace metal;
 
 constant float ULLIS_LN_EPS = 1e-5f;
-constant uint ULLIS_TILE = 16u;
+constant uint ULLIS_TILE = 32u;
 constant uint ULLIS_SCALE_THREADS = 256u;
 
 inline float packed_sign(device const uint *bits, uint index) {
@@ -290,6 +290,38 @@ kernel void ullis_time_shift_mix(
     shifted[index] = xt + xx * float(mix[c]);
 }
 
+// Matches lerp_shift_backward: g_x[t] = g_s[t] - g_s[t]·mix + (t+1<T ? g_s[t+1]·mix : 0),
+// g_mix[c] = Σ g_s · xx. g_x is assumed zero on entry (CMix residual path).
+kernel void ullis_time_shift_mix_backward(
+    device const float *xx [[buffer(0)]],
+    device const half *mix [[buffer(1)]],
+    device const float *g_shifted [[buffer(2)]],
+    device float *g_x [[buffer(3)]],
+    device atomic_uint *g_mix [[buffer(4)]],
+    constant uint &batch [[buffer(5)]],
+    constant uint &time [[buffer(6)]],
+    constant uint &channels [[buffer(7)]],
+    uint index [[thread_position_in_grid]]) {
+    const uint rows = batch * time;
+    const uint elements = rows * channels;
+    if (index >= elements || time == 0u) {
+        return;
+    }
+    const uint row = index / channels;
+    const uint c = index % channels;
+    const uint t = row % time;
+    const uint b = row / time;
+    const float gs = g_shifted[index];
+    const float mix_c = float(mix[c]);
+    float gx = gs - gs * mix_c;
+    if (t + 1u < time) {
+        const uint next = (b * time + (t + 1u)) * channels + c;
+        gx += g_shifted[next] * mix_c;
+    }
+    g_x[index] = gx;
+    atomic_add_f32(g_mix + c, gs * xx[index]);
+}
+
 kernel void ullis_time_shift_mix3(
     device const float *input [[buffer(0)]],
     device const half *mix_q [[buffer(1)]],
@@ -335,7 +367,7 @@ kernel void ullis_pack_latent_bits(
     bits[word] = packed;
 }
 
-// Tiled Y = scale * X @ Sign^T + bias. Threadgroup 16x16; gid=(o, row).
+// Tiled Y = scale * X @ Sign^T + bias. Threadgroup 32x32; gid=(o, row).
 kernel void ullis_binary_linear(
     device const float *input [[buffer(0)]],
     device const uint *bits [[buffer(1)]],
@@ -352,8 +384,8 @@ kernel void ullis_binary_linear(
     const uint row = tgid.y * ULLIS_TILE + tid.y;
     const uint tg_o = tgid.x * ULLIS_TILE;
     const uint tg_row = tgid.y * ULLIS_TILE;
-    threadgroup float a_tile[16][17];
-    threadgroup float b_tile[16][17];
+    threadgroup float a_tile[32][33];
+    threadgroup float b_tile[32][33];
     float sum = 0.0f;
     for (uint k0 = 0u; k0 < in_features; k0 += ULLIS_TILE) {
         const uint k = k0 + tid.x;
@@ -367,7 +399,7 @@ kernel void ullis_binary_linear(
             : 0.0f;
         threadgroup_barrier(mem_flags::mem_threadgroup);
 #pragma unroll
-        for (uint kk = 0u; kk < 16u; ++kk) {
+        for (uint kk = 0u; kk < ULLIS_TILE; ++kk) {
             sum += a_tile[tid.y][kk] * b_tile[tid.x][kk];
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -393,8 +425,8 @@ kernel void ullis_binary_linear_input_bwd(
     const uint row = tgid.y * ULLIS_TILE + tid.y;
     const uint tg_i = tgid.x * ULLIS_TILE;
     const uint tg_row = tgid.y * ULLIS_TILE;
-    threadgroup float a_tile[16][17];
-    threadgroup float b_tile[16][17];
+    threadgroup float a_tile[32][33];
+    threadgroup float b_tile[32][33];
     float gx = 0.0f;
     for (uint k0 = 0u; k0 < out_features; k0 += ULLIS_TILE) {
         const uint k = k0 + tid.x;
@@ -408,7 +440,7 @@ kernel void ullis_binary_linear_input_bwd(
             : 0.0f;
         threadgroup_barrier(mem_flags::mem_threadgroup);
 #pragma unroll
-        for (uint kk = 0u; kk < 16u; ++kk) {
+        for (uint kk = 0u; kk < ULLIS_TILE; ++kk) {
             gx += a_tile[tid.y][kk] * b_tile[tid.x][kk];
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -530,8 +562,8 @@ kernel void ullis_binary_linear_weight_bwd(
     const uint o = tgid.y * ULLIS_TILE + tid.y;
     const uint tg_i = tgid.x * ULLIS_TILE;
     const uint tg_o = tgid.y * ULLIS_TILE;
-    threadgroup float a_tile[16][17];
-    threadgroup float b_tile[16][17];
+    threadgroup float a_tile[32][33];
+    threadgroup float b_tile[32][33];
     float gw = 0.0f;
     for (uint k0 = 0u; k0 < rows; k0 += ULLIS_TILE) {
         const uint k = k0 + tid.x;
@@ -545,7 +577,7 @@ kernel void ullis_binary_linear_weight_bwd(
             : 0.0f;
         threadgroup_barrier(mem_flags::mem_threadgroup);
 #pragma unroll
-        for (uint kk = 0u; kk < 16u; ++kk) {
+        for (uint kk = 0u; kk < ULLIS_TILE; ++kk) {
             gw += a_tile[tid.y][kk] * b_tile[tid.x][kk];
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -615,8 +647,8 @@ kernel void ullis_fp16_linear(
     const uint row = tgid.y * ULLIS_TILE + tid.y;
     const uint tg_o = tgid.x * ULLIS_TILE;
     const uint tg_row = tgid.y * ULLIS_TILE;
-    threadgroup float a_tile[16][17];
-    threadgroup float b_tile[16][17];
+    threadgroup float a_tile[32][33];
+    threadgroup float b_tile[32][33];
     float sum = 0.0f;
     for (uint k0 = 0u; k0 < in_features; k0 += ULLIS_TILE) {
         const uint k = k0 + tid.x;
@@ -630,7 +662,7 @@ kernel void ullis_fp16_linear(
             : 0.0f;
         threadgroup_barrier(mem_flags::mem_threadgroup);
 #pragma unroll
-        for (uint kk = 0u; kk < 16u; ++kk) {
+        for (uint kk = 0u; kk < ULLIS_TILE; ++kk) {
             sum += a_tile[tid.y][kk] * b_tile[tid.x][kk];
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -653,8 +685,8 @@ kernel void ullis_fp16_linear_bwd(
     constant uint &kind [[buffer(8)]],
     uint2 tid [[thread_position_in_threadgroup]],
     uint2 tgid [[threadgroup_position_in_grid]]) {
-    threadgroup float a_tile[16][17];
-    threadgroup float b_tile[16][17];
+    threadgroup float a_tile[32][33];
+    threadgroup float b_tile[32][33];
     if (kind == 0u) {
         const uint i = tgid.x * ULLIS_TILE + tid.x;
         const uint row = tgid.y * ULLIS_TILE + tid.y;
@@ -672,7 +704,7 @@ kernel void ullis_fp16_linear_bwd(
                 ? float(weight[k * in_features + load_i])
                 : 0.0f;
             threadgroup_barrier(mem_flags::mem_threadgroup);
-            for (uint kk = 0u; kk < 16u; ++kk) {
+            for (uint kk = 0u; kk < ULLIS_TILE; ++kk) {
                 gx += a_tile[tid.y][kk] * b_tile[tid.x][kk];
             }
             threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -697,7 +729,7 @@ kernel void ullis_fp16_linear_bwd(
                 ? input[k * in_features + load_i]
                 : 0.0f;
             threadgroup_barrier(mem_flags::mem_threadgroup);
-            for (uint kk = 0u; kk < 16u; ++kk) {
+            for (uint kk = 0u; kk < ULLIS_TILE; ++kk) {
                 gw += a_tile[tid.y][kk] * b_tile[tid.x][kk];
             }
             threadgroup_barrier(mem_flags::mem_threadgroup);

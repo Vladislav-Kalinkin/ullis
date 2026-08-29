@@ -92,6 +92,7 @@ pub const LAYER_NORM_BACKWARD_KERNEL_NAME: &str = "ullis_layer_norm_backward";
 pub const LAYER_NORM_PARAM_BWD_KERNEL_NAME: &str = "ullis_layer_norm_param_bwd";
 pub const TIME_SHIFT_DELTA_KERNEL_NAME: &str = "ullis_time_shift_delta";
 pub const TIME_SHIFT_MIX_KERNEL_NAME: &str = "ullis_time_shift_mix";
+pub const TIME_SHIFT_MIX_BACKWARD_KERNEL_NAME: &str = "ullis_time_shift_mix_backward";
 pub const TIME_SHIFT_MIX3_KERNEL_NAME: &str = "ullis_time_shift_mix3";
 pub const BINARY_LINEAR_KERNEL_NAME: &str = "ullis_binary_linear";
 pub const BINARY_LINEAR_INPUT_BWD_KERNEL_NAME: &str = "ullis_binary_linear_input_bwd";
@@ -100,7 +101,7 @@ pub const BINARY_LINEAR_WEIGHT_BWD_KERNEL_NAME: &str = "ullis_binary_linear_weig
 pub const BINARY_LINEAR_SCALE_BWD_FROM_OUTPUT_KERNEL_NAME: &str =
     "ullis_binary_linear_scale_bwd_from_output";
 pub const BINARY_LINEAR_LATENT_SGD_KERNEL_NAME: &str = "ullis_binary_linear_latent_sgd";
-pub const LINEAR_TILE: usize = 16;
+pub const LINEAR_TILE: usize = 32;
 pub const SCALE_BWD_THREADS: usize = 256;
 pub const FP16_LINEAR_KERNEL_NAME: &str = "ullis_fp16_linear";
 pub const FP16_LINEAR_BWD_KERNEL_NAME: &str = "ullis_fp16_linear_bwd";
@@ -128,6 +129,7 @@ pub const PR3_KERNEL_NAMES: &[&str] = &[
     LAYER_NORM_PARAM_BWD_KERNEL_NAME,
     TIME_SHIFT_DELTA_KERNEL_NAME,
     TIME_SHIFT_MIX_KERNEL_NAME,
+    TIME_SHIFT_MIX_BACKWARD_KERNEL_NAME,
     TIME_SHIFT_MIX3_KERNEL_NAME,
     BINARY_LINEAR_KERNEL_NAME,
     BINARY_LINEAR_INPUT_BWD_KERNEL_NAME,
@@ -260,13 +262,20 @@ pub struct RosaQkvBlockForward {
 }
 
 /// Fused CMix block activations kept for STE backward.
-#[derive(Clone, Debug, PartialEq)]
+///
+/// `shifted`/`key`/`relu2` stay on GPU for the train hot path. The host copies
+/// of those arrays are only filled when a caller still wants a CPU tape.
+#[derive(Debug)]
 pub struct CmixBlockForward {
     pub xx: Vec<f32>,
     pub shifted: Vec<f32>,
     pub key: Vec<f32>,
     pub relu2: Vec<f32>,
     pub out: Vec<f32>,
+    pub gpu_xx: Option<MetalBuffer>,
+    pub gpu_shifted: Option<MetalBuffer>,
+    pub gpu_key: Option<MetalBuffer>,
+    pub gpu_relu2: Option<MetalBuffer>,
 }
 
 /// Packed head train with BinaryConnect SGD applied on GPU. `g_w` stays resident.
@@ -284,7 +293,8 @@ pub struct PackedHeadTrainSgd {
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct CmixBlockBackwardSgd {
-    pub g_shifted: Vec<f32>,
+    pub g_x: Vec<f32>,
+    pub g_mix: Vec<f32>,
     pub g_key_scale: Vec<f32>,
     pub next_key_latent: Vec<u16>,
     pub next_key_residual: Vec<f32>,
@@ -333,13 +343,46 @@ impl RecycledBuffer<'_> {
             .as_ref()
             .expect("scratch buffer is returned to the pool")
     }
+
+    fn into_owned(mut self) -> MetalBuffer {
+        self.inner
+            .take()
+            .expect("scratch buffer is returned to the pool")
+    }
 }
 
 impl Drop for RecycledBuffer<'_> {
     fn drop(&mut self) {
         if let Some(buffer) = self.inner.take() {
-            self.scratch.borrow_mut().push(buffer);
+            retain_scratch(&mut self.scratch.borrow_mut(), buffer);
         }
+    }
+}
+
+/// Keep a couple of small scratch buffers. Head logits are ~67 MiB and must
+/// not be rounded to 128 MiB or retained for the rest of the step.
+const SCRATCH_RETAIN_BYTES: usize = 16 * 1024 * 1024;
+const SCRATCH_PER_SIZE: usize = 2;
+
+fn retain_scratch(free: &mut Vec<MetalBuffer>, buffer: MetalBuffer) {
+    if buffer.len() > SCRATCH_RETAIN_BYTES {
+        return;
+    }
+    let similar = free
+        .iter()
+        .filter(|candidate| candidate.len() == buffer.len())
+        .count();
+    if similar >= SCRATCH_PER_SIZE {
+        return;
+    }
+    free.push(buffer);
+}
+
+fn scratch_alloc_bytes(bytes: usize) -> usize {
+    if bytes <= 256 * 1024 {
+        bytes.next_power_of_two().max(bytes)
+    } else {
+        bytes
     }
 }
 
@@ -370,6 +413,7 @@ struct Pipelines {
     layer_norm_param_bwd: Pipeline,
     time_shift_delta: Pipeline,
     time_shift_mix: Pipeline,
+    time_shift_mix_backward: Pipeline,
     time_shift_mix3: Pipeline,
     binary_linear: Pipeline,
     binary_linear_input_bwd: Pipeline,
@@ -440,6 +484,11 @@ impl MetalRuntime {
                 TIME_SHIFT_DELTA_KERNEL_NAME,
             )?,
             time_shift_mix: pipeline_from_library(&device, &library, TIME_SHIFT_MIX_KERNEL_NAME)?,
+            time_shift_mix_backward: pipeline_from_library(
+                &device,
+                &library,
+                TIME_SHIFT_MIX_BACKWARD_KERNEL_NAME,
+            )?,
             time_shift_mix3: pipeline_from_library(&device, &library, TIME_SHIFT_MIX3_KERNEL_NAME)?,
             binary_linear: pipeline_from_library(&device, &library, BINARY_LINEAR_KERNEL_NAME)?,
             binary_linear_input_bwd: pipeline_from_library(
@@ -555,15 +604,20 @@ impl MetalRuntime {
     }
 
     fn shared_buffer(&self, bytes: usize) -> Result<RecycledBuffer<'_>> {
+        let bytes = scratch_alloc_bytes(bytes.max(1));
         let recycled = {
             let mut free = self.scratch.borrow_mut();
-            free.iter()
-                .position(|buffer| buffer.len() >= bytes)
-                .map(|index| free.swap_remove(index))
+            let exact = free.iter().position(|buffer| buffer.len() == bytes);
+            let index = exact.or_else(|| {
+                free.iter().position(|buffer| {
+                    buffer.len() >= bytes && buffer.len() <= bytes.saturating_mul(2)
+                })
+            });
+            index.map(|index| free.swap_remove(index))
         };
         let inner = match recycled {
             Some(buffer) => buffer,
-            None => self.alloc_shared(bytes.next_power_of_two().max(bytes))?,
+            None => self.alloc_shared(bytes)?,
         };
         Ok(RecycledBuffer {
             inner: Some(inner),
@@ -630,6 +684,20 @@ impl MetalRuntime {
 
     fn alloc_bytes(&self, bytes: usize) -> Result<RecycledBuffer<'_>> {
         self.shared_buffer(bytes.max(1))
+    }
+
+    fn adopt_buffer(&self, buffer: MetalBuffer) -> RecycledBuffer<'_> {
+        RecycledBuffer {
+            inner: Some(buffer),
+            scratch: &self.scratch,
+        }
+    }
+
+    fn activation_f32(&self, host: &[f32], gpu: Option<MetalBuffer>) -> Result<RecycledBuffer<'_>> {
+        match gpu {
+            Some(buffer) => Ok(self.adopt_buffer(buffer)),
+            None => self.buffer_f32(host),
+        }
     }
 
     fn submit(&self, encode: impl FnOnce(&ffi::ComputeEncoder) -> Result<()>) -> Result<()> {
@@ -1893,22 +1961,18 @@ impl MetalRuntime {
                 value_shape.rows,
             )
         })?;
-        let mut xx = vec![0.0; x.len()];
-        let mut shifted = vec![0.0; x.len()];
-        let mut key = vec![0.0; key_len];
-        let mut relu2 = vec![0.0; key_len];
         let mut out = vec![0.0; out_len];
-        xx_b.read_f32(&mut xx)?;
-        shifted_b.read_f32(&mut shifted)?;
-        key_b.read_f32(&mut key)?;
-        relu_b.read_f32(&mut relu2)?;
         out_b.read_f32(&mut out)?;
         Ok(CmixBlockForward {
-            xx,
-            shifted,
-            key,
-            relu2,
+            xx: Vec::new(),
+            shifted: Vec::new(),
+            key: Vec::new(),
+            relu2: Vec::new(),
             out,
+            gpu_xx: Some(xx_b.into_owned()),
+            gpu_shifted: Some(shifted_b.into_owned()),
+            gpu_key: Some(key_b.into_owned()),
+            gpu_relu2: Some(relu_b.into_owned()),
         })
     }
 
@@ -2075,28 +2139,49 @@ impl MetalRuntime {
         shifted: &[f32],
         key: &[f32],
         relu2: &[f32],
+        xx: &[f32],
+        shifted_gpu: Option<MetalBuffer>,
+        key_gpu: Option<MetalBuffer>,
+        relu2_gpu: Option<MetalBuffer>,
+        xx_gpu: Option<MetalBuffer>,
         gy: &[f32],
+        mix: &[u16],
         key_bits: &[u32],
         key_scale: &[u16],
         key_latent: &[u16],
         key_residual: &[f32],
         value_weight: &[u16],
         value_residual: &[f32],
-        rows: usize,
+        batch: usize,
+        time: usize,
         d_model: usize,
         dim_ffn: usize,
         learning_rate: f32,
         ste_scale: f32,
     ) -> Result<CmixBlockBackwardSgd> {
+        let rows = batch
+            .checked_mul(time)
+            .ok_or_else(|| anyhow::anyhow!("CMix shape overflow"))?;
         let key_shape = LinearDispatchShape::new(rows, d_model, dim_ffn)?;
         let value_shape = LinearDispatchShape::new(rows, dim_ffn, d_model)?;
-        self.check_binary_shape_u16(shifted, key_bits, key_scale, None, key_shape)?;
+        if shifted_gpu.is_none() {
+            self.check_binary_shape_u16(shifted, key_bits, key_scale, None, key_shape)?;
+        } else if key_bits.len() != key_shape.packed_words()?
+            || key_scale.len() != key_shape.out_features
+        {
+            bail!("binary linear shape mismatch");
+        }
         let key_len = rows.saturating_mul(dim_ffn);
+        let x_len = rows.saturating_mul(d_model);
         let value_weights = d_model.saturating_mul(dim_ffn);
         let key_weights = dim_ffn.saturating_mul(d_model);
-        if relu2.len() != key_len
-            || key.len() != key_len
-            || gy.len() != rows.saturating_mul(d_model)
+        let host_tape_ok = (shifted_gpu.is_some() || shifted.len() == x_len)
+            && (key_gpu.is_some() || key.len() == key_len)
+            && (relu2_gpu.is_some() || relu2.len() == key_len)
+            && (xx_gpu.is_some() || xx.len() == x_len);
+        if !host_tape_ok
+            || gy.len() != x_len
+            || mix.len() != d_model
             || key_latent.len() != key_weights
             || key_residual.len() != key_weights
             || value_weight.len() != value_weights
@@ -2105,10 +2190,14 @@ impl MetalRuntime {
             bail!("CMix backward SGD shape mismatch");
         }
         let key_words = key_weights.div_ceil(32);
-        let shifted_b = self.buffer_f32(shifted)?;
-        let key_b = self.buffer_f32(key)?;
-        let relu_b = self.buffer_f32(relu2)?;
+        let shifted_b = self.activation_f32(shifted, shifted_gpu)?;
+        let key_b = self.activation_f32(key, key_gpu)?;
+        let relu_b = self.activation_f32(relu2, relu2_gpu)?;
+        let xx_b = self.activation_f32(xx, xx_gpu)?;
+        let mix_b = self.buffer_u16(mix)?;
         let gy_b = self.buffer_f32(gy)?;
+        let g_x_b = self.alloc_f32(x_len)?;
+        let g_mix_b = self.zeros_f32(d_model)?;
         let bits_b = self.buffer_u32(key_bits)?;
         let scale_b = self.buffer_u16(key_scale)?;
         let value_w_b = self.buffer_u16(value_weight)?;
@@ -2118,7 +2207,7 @@ impl MetalRuntime {
         let g_relu_b = self.alloc_f32(key_len)?;
         let g_value_b = self.alloc_f32(value_weights)?;
         let g_key_b = self.alloc_f32(key_len)?;
-        let g_shifted_b = self.alloc_f32(shifted.len())?;
+        let g_shifted_b = self.alloc_f32(x_len)?;
         let g_scale_b = self.alloc_f32(dim_ffn)?;
         let g_bias_b = self.alloc_f32(dim_ffn)?;
         let g_key_w_b = self.alloc_f32(key_weights)?;
@@ -2255,16 +2344,35 @@ impl MetalRuntime {
                 &[&key_latent_b, &next_key_bits],
                 |encoder| set_bytes_u32(encoder, 2, &[as_u32(key_weights, "elements")?]),
                 key_words,
+            )?;
+            Self::encode_1d(
+                encoder,
+                &self.pipelines.time_shift_mix_backward,
+                &[&xx_b, &mix_b, &g_shifted_b, &g_x_b, &g_mix_b],
+                |encoder| {
+                    Self::set_u32s(
+                        encoder,
+                        5,
+                        &[
+                            as_u32(batch, "batch")?,
+                            as_u32(time, "time")?,
+                            as_u32(d_model, "channels")?,
+                        ],
+                    )
+                },
+                x_len,
             )
         })?;
-        let mut g_shifted = vec![0.0; shifted.len()];
+        let mut g_x = vec![0.0; x_len];
+        let mut g_mix = vec![0.0; d_model];
         let mut g_key_scale = vec![0.0; dim_ffn];
         let mut next_value = vec![0_u16; value_weights];
         let mut next_value_residual = vec![0.0; value_weights];
         let mut next_key_latent = vec![0_u16; key_weights];
         let mut next_key_residual = vec![0.0; key_weights];
         let mut packed = vec![0_u32; key_words];
-        g_shifted_b.read_f32(&mut g_shifted)?;
+        g_x_b.read_f32(&mut g_x)?;
+        g_mix_b.read_f32(&mut g_mix)?;
         g_scale_b.read_f32(&mut g_key_scale)?;
         value_w_b.read_u16(&mut next_value)?;
         value_residual_b.read_f32(&mut next_value_residual)?;
@@ -2272,7 +2380,8 @@ impl MetalRuntime {
         key_residual_b.read_f32(&mut next_key_residual)?;
         next_key_bits.read_u32(&mut packed)?;
         Ok(CmixBlockBackwardSgd {
-            g_shifted,
+            g_x,
+            g_mix,
             g_key_scale,
             next_key_latent,
             next_key_residual,

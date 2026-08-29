@@ -8,9 +8,9 @@ This is not a claim of production chat quality. 0.10 is a local trainer/infer th
 
 ## What 0.10 actually is
 
-- **Default architecture `heron`:** six layers, `d_model=256`, `context_len=2048`, vocab ceiling 8192, batch 1. Config: [`train_config.json`](train_config.json).
+- **Default architecture `heron`:** `train_config.json` is D=512, L=12, T=2048, vocab ceiling 8192, batch 1. The in-code `TrainConfig::default()` stays the smaller D=256 / L=6 admission profile.
 - **1-bit ROSA is an activation alphabet, not weight quantization.** QKV bits are `{0,1}` from `x > 0`. The float output is `out = (2·idx − 1)·e`: unmatched and matched-0 go to **−e**, matched-1 to **+e**. This is not 4-bit ROSA (unmatched → 0); 4-bit is not in 0.10.
-- **Packed ±1** only where official linears are large and not zero-init (QKVO, CMix key, head), with a learned FP16 row scale and official bias. CMix value, Tmix (hybrid), LayerNorm, embeddings, and ROSA `e` stay FP16. BinaryConnect latents live in RAM for the process; checkpoints store bits+scale+bias only.
+- **Packed ±1** only where official linears are large and not zero-init (QKVO, CMix key, head), with a learned FP16 row scale and official bias. CMix value, Tmix (hybrid), LayerNorm, embeddings, and ROSA `e` stay FP16. BinaryConnect latents and the FP32 SGD carry live in RAM and are written into `checkpoint.safetensors`. Legacy JSON v2 files still omit them and reconstruct `|w|=0.01`.
 - **Train 0.10 is `stop_grad_bits`:** ROSA QKV / `ln3` / `x_qkv` are frozen. Learning is `g_e` plus BinaryConnect on `o`, CMix, head, and SGD on embeddings / LN / `e`. Next-token CE only (`t+1`). There is no MTP `t+2`.
 - **Metal-resident** LN, packed linear, FP16 linear, streamed CE, and 1-bit ROSA forward. No MPS GEMM. Host traffic is token ids, loss scalars, and checkpoint I/O.
 - **Checkpoints are v2.** Hyena `format_version: 1` files are intentionally unloadable (`--resume` hard-fails). Old Hyena run directories (`runs/diagnostic`, `runs/ullis_gradient_fixed`, …) are leftover artifacts: delete them by hand; there is no converter.
@@ -39,12 +39,12 @@ cargo run -- train --data data/ullis_dataset.jsonl --run runs/hello --config tra
 
 `--config` accepts JSON or TOML. The file in this repo is **`train_config.json`**, not `config.toml`.
 
-A run directory contains `config.json` (effective config), `tokenizer.json`, append-only `metrics.jsonl`, and `checkpoint.json` (v2 snapshot). Progress prints raw window loss and an EMA; use the EMA.
+A run directory contains `config.json` (effective config), `tokenizer.json`, append-only `metrics.jsonl`, and `checkpoint.safetensors` (v2 weights, completed step, BinaryConnect latents, and SGD carry). Legacy `checkpoint.json` still loads (bits only; latents are reconstructed). Progress prints raw window loss, an EMA, and process RSS; use the EMA.
 
-Resume (v2 only):
+Resume continues from the saved (or metrics-inferred) step until `--steps`, which is the **target global step**:
 
 ```sh
-cargo run -- train --data data/ullis_dataset.jsonl --run runs/hello --resume runs/hello/checkpoint.json --steps 100
+cargo run -- train --data data/ullis_dataset.jsonl --run runs/hello --resume runs/hello --steps 10000
 ```
 
 CPU is explicit:
@@ -57,9 +57,9 @@ Inspect, generate, chat, and digit eval:
 
 ```sh
 cargo run -- inspect --run runs/hello
-cargo run -- generate --checkpoint runs/hello/checkpoint.json --prompt 'Hello' --max-tokens 64
-cargo run -- chat --checkpoint runs/hello/checkpoint.json --session sessions/first.jsonl
-cargo run -- eval-digits --checkpoint runs/hello/checkpoint.json --task reverse --max-digits 8
+cargo run -- generate --checkpoint runs/hello --prompt 'Hello' --max-tokens 64
+cargo run -- chat --checkpoint runs/hello --session sessions/first.jsonl
+cargo run -- eval-digits --checkpoint runs/hello --task reverse --max-digits 8
 ```
 
 `eval-digits` needs a `rosa_rwkv7` checkpoint (vocab 12 reverse / 13 plusminus). Sequences are padded to T=144 or 272; accuracy is the unpadded digit span. Full flags: [USAGE](USAGE).

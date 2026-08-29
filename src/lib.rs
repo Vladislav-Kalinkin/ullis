@@ -6,7 +6,6 @@ pub mod decode;
 #[cfg(target_os = "macos")]
 pub mod metal;
 pub mod model;
-pub mod optimizer;
 pub mod precision;
 pub mod rosa;
 pub mod tokenizer;
@@ -20,6 +19,5 @@ pub use model::{
     HeronGenerateState, InferenceStateBytes, ModelCheckpoint, ParamCounts, TrainStepProfile,
     UllisHeron, causal_ce_gradient_scale,
 };
-pub use optimizer::{Lion, LionConfig, OptimizerKind};
 pub use precision::{Fp16, Fp16Storage};
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");

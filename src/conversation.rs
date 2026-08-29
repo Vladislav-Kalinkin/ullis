@@ -150,11 +150,28 @@ pub fn pack_document_windows(
     pad_id: u32,
     needed: usize,
 ) -> Result<(Vec<u32>, Vec<u32>)> {
+    pack_document_windows_skip(documents, context_len, pad_id, needed, 0)
+}
+
+/// Pack `needed` tokens after discarding the first `skip` packed tokens.
+///
+/// `skip` must be a multiple of `context_len`. Resume uses this so the skipped
+/// prefix is never materialized.
+pub fn pack_document_windows_skip(
+    documents: &[(Vec<u32>, Vec<u32>)],
+    context_len: usize,
+    pad_id: u32,
+    needed: usize,
+    skip: usize,
+) -> Result<(Vec<u32>, Vec<u32>)> {
     if context_len < 2 {
         bail!("packed windows require context_len >= 2");
     }
     if needed == 0 {
         bail!("encoded corpus is empty");
+    }
+    if !skip.is_multiple_of(context_len) {
+        bail!("packed skip {skip} is not a multiple of context_len {context_len}");
     }
     let mut tokens = Vec::new();
     let mut labels = Vec::new();
@@ -164,6 +181,29 @@ pub fn pack_document_windows(
         }
         tokens.extend_from_slice(ids);
         labels.extend_from_slice(targets);
+    }
+    pack_concat_windows(&tokens, &labels, context_len, pad_id, needed, skip)
+}
+
+pub fn pack_concat_windows(
+    tokens: &[u32],
+    labels: &[u32],
+    context_len: usize,
+    pad_id: u32,
+    needed: usize,
+    skip: usize,
+) -> Result<(Vec<u32>, Vec<u32>)> {
+    if context_len < 2 {
+        bail!("packed windows require context_len >= 2");
+    }
+    if needed == 0 {
+        bail!("encoded corpus is empty");
+    }
+    if !skip.is_multiple_of(context_len) {
+        bail!("packed skip {skip} is not a multiple of context_len {context_len}");
+    }
+    if tokens.len() != labels.len() {
+        bail!("packed token and label lengths must match");
     }
     if tokens.is_empty() || tokens.iter().all(|&id| id == pad_id) {
         bail!("encoded corpus is empty");
@@ -175,15 +215,20 @@ pub fn pack_document_windows(
     let min_supervised = min_supervised_targets(context_len);
     let mut out_tokens = Vec::with_capacity(needed);
     let mut out_labels = Vec::with_capacity(needed);
+    let mut skipped = 0_usize;
     let mut pos = 0_usize;
     let mut scanned = 0_usize;
     let scan_limit = n
         .saturating_mul(2)
+        .saturating_add(skip)
         .saturating_add(needed)
         .saturating_add(context_len);
     while out_tokens.len() < needed {
         if scanned > scan_limit {
-            bail!("could not pack {needed} windows with supervised next-token targets");
+            bail!(
+                "could not pack {} windows with supervised next-token targets",
+                skip.saturating_add(needed)
+            );
         }
         scanned += 1;
         let mut supervised = 0_usize;
@@ -204,6 +249,10 @@ pub fn pack_document_windows(
                 break;
             }
             let index = (pos + i) % n;
+            if skipped < skip {
+                skipped += 1;
+                continue;
+            }
             out_tokens.push(tokens[index]);
             out_labels.push(labels[index]);
         }
@@ -363,5 +412,19 @@ mod tests {
         let (tokens, labels) = pack_document_windows(&[(ids, targets)], 32, pad, 32).unwrap();
         assert_eq!(tokens.len(), 32);
         assert!(labels[1..].iter().filter(|&&id| id != pad).count() >= min_supervised_targets(32));
+    }
+
+    #[test]
+    fn pack_windows_skip_drops_the_prefix_without_changing_the_tail() {
+        let pad = 0_u32;
+        let docs = vec![(
+            vec![1_u32, 2, 3, 4, 5, 6, 7, 8],
+            vec![1_u32, 2, 3, 4, 5, 6, 7, 8],
+        )];
+        let full = pack_document_windows(&docs, 4, pad, 8).unwrap();
+        let tail = pack_document_windows_skip(&docs, 4, pad, 4, 4).unwrap();
+        assert_eq!(tail.0, full.0[4..]);
+        assert_eq!(tail.1, full.1[4..]);
+        assert!(pack_document_windows_skip(&docs, 4, pad, 4, 3).is_err());
     }
 }

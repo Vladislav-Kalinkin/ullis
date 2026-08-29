@@ -1,5 +1,4 @@
 //! Configuration for the Heron / ROSA-RWKV7 architectures.
-use crate::optimizer::{LionConfig, OptimizerKind};
 use crate::tokenizer::{BpeTokenizer, MIN_VOCAB};
 use anyhow::{Result, bail};
 use serde::{Deserialize, Serialize};
@@ -96,10 +95,6 @@ pub struct TrainConfig {
     #[serde(default)]
     pub tmix_lora_rank: usize,
     pub seed: u64,
-    #[serde(default)]
-    pub optimizer: OptimizerKind,
-    #[serde(default)]
-    pub lion: LionConfig,
     #[serde(default = "default_memory_budget_bytes")]
     pub memory_budget_bytes: usize,
 }
@@ -131,8 +126,6 @@ impl Default for TrainConfig {
             head_size: DEFAULT_HEAD_SIZE,
             tmix_lora_rank: 16,
             seed: 7,
-            optimizer: OptimizerKind::StatelessSgd,
-            lion: LionConfig::default(),
             memory_budget_bytes: DEFAULT_MEMORY_BUDGET_BYTES,
         }
     }
@@ -195,7 +188,6 @@ impl TrainConfig {
                 bail!("rosa_rwkv7 requires context_len to be a multiple of 16");
             }
         }
-        self.lion.validate()?;
         let estimate = self.memory_estimate()?;
         if !matches!(estimate.peak(), Some(n) if n <= self.memory_budget_bytes) {
             bail!(
@@ -290,11 +282,7 @@ impl TrainConfig {
             0
         };
         let bwd_rosa_scratch = 0;
-        let optimizer_state = self.optimizer.state_bytes(
-            add(embedding / FP16_BYTES, fp16_matrices / FP16_BYTES)?,
-            FP16_BYTES,
-        )?;
-        let command_slack = add(COMMAND_SLACK_BYTES, optimizer_state)?;
+        let command_slack = COMMAND_SLACK_BYTES;
         let fp16_elements = add(
             add(embedding / FP16_BYTES, fp16_matrices / FP16_BYTES)?,
             add(ln_and_vec / FP16_BYTES, packed_latents / FP16_BYTES)?,
@@ -350,7 +338,6 @@ mod tests {
         assert_eq!(estimate.qkv_bitplanes, 3 * 2048 * 256 / 8);
         assert_eq!(estimate.binaryconnect_workspace, 8192 * 256 * 4);
         assert_eq!(estimate.wkv_tape, 0);
-        assert_eq!(cfg.optimizer, OptimizerKind::StatelessSgd);
         assert_eq!(cfg.context_len, 2048);
     }
 
@@ -392,19 +379,6 @@ mod tests {
         let tokenizer = train_bpe(&["tiny tiny corpus".into()], 512, 1).unwrap();
         let config = TrainConfig::default().with_tokenizer(&tokenizer).unwrap();
         assert_eq!(config.vocab_size, tokenizer.vocab_size() as usize);
-    }
-
-    #[test]
-    fn stateless_sgd_has_no_persistent_optimizer_budget() {
-        let cfg = TrainConfig::default();
-        let sgd = cfg.memory_estimate().unwrap();
-        let lion = TrainConfig {
-            optimizer: OptimizerKind::LionFp16,
-            ..cfg
-        }
-        .memory_estimate()
-        .unwrap();
-        assert!(lion.command_slack > sgd.command_slack);
     }
 
     #[test]

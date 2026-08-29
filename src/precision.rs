@@ -81,8 +81,8 @@ impl Fp16 {
 /// Mean-reduced language-model gradients are routinely smaller than one FP16 ULP.
 /// A zero-state ULP floor either drops those updates or inflates them to a full
 /// ULP, so packed BinaryConnect latents and embeddings never actually integrate
-/// the STE gradient. The carry is process-local (like BinaryConnect latents) and
-/// is reconstructed as zeros when a checkpoint is loaded.
+/// the STE gradient. Safetensors snapshots store the carry; JSON v2 files still
+/// reconstruct it as zeros.
 #[derive(Clone, Debug)]
 pub struct Fp16Storage {
     values: Vec<u16>,
@@ -152,6 +152,23 @@ impl Fp16Storage {
     pub fn from_bits(values: Vec<u16>) -> Self {
         let residual = vec![0.0; values.len()];
         Self { values, residual }
+    }
+
+    /// Restore FP16 values and their FP32 error-diffusion carry.
+    pub fn from_bits_and_residual(values: Vec<u16>, residual: Vec<f32>) -> Result<Self> {
+        if residual.len() != values.len() {
+            bail!("FP16 residual length mismatch");
+        }
+        Ok(Self { values, residual })
+    }
+
+    /// Replace the carry in place, keeping the current FP16 payload.
+    pub fn install_residual(&mut self, residual: Vec<f32>) -> Result<()> {
+        if residual.len() != self.residual.len() {
+            bail!("FP16 residual length mismatch");
+        }
+        self.residual = residual;
+        Ok(())
     }
 
     pub fn residual(&self) -> &[f32] {
@@ -263,6 +280,19 @@ mod tests {
         assert_eq!(storage.get(0), 1.0);
         storage.apply_binaryconnect_sgd(0, 1.0, 4.0);
         assert_eq!(storage.get(0), -1.0);
+    }
+
+    #[test]
+    fn from_bits_and_residual_roundtrips() {
+        let mut storage = Fp16Storage::from_f32([0.25]);
+        storage.apply_clipped_sgd(0, 0.001, 0.01);
+        let restored = Fp16Storage::from_bits_and_residual(
+            storage.as_bits().to_vec(),
+            storage.residual().to_vec(),
+        )
+        .unwrap();
+        assert_eq!(restored.get(0), storage.get(0));
+        assert_eq!(restored.residual(), storage.residual());
     }
 
     #[test]
