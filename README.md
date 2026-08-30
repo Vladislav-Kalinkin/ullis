@@ -1,12 +1,12 @@
 # Ullis
 
-**Ullis 0.10 trains RWKV-8 Heron / ROSA language models on Apple Silicon.** The default stack is `LayerNorm → ROSA-QKV-1bit → CMix x070`. There is no Hyena, no FFT, and no hidden FP32/FP16 master matrix in the checkpoint file.
+**Ullis trains RWKV-8 Heron / ROSA language models on Apple Silicon.** The default stack is `LayerNorm → ROSA-QKV-1bit → CMix x070`.
 
 The normal training backend is Metal. CPU is a deterministic fallback for tests, debugging, and hybrid digit eval.
 
-This is not a claim of production chat quality. 0.10 is a local trainer/infer that fits an M1 8 GiB Mac with a **4 GiB** process budget.
+This is not a claim of production chat quality. Ullis is a local trainer/infer that fits an M1 8 GiB Mac with a **4 GiB** process budget.
 
-## What 0.10 actually is
+## What actually is
 
 - **Default architecture `heron`:** `train_config.json` is D=512, L=12, T=2048, vocab ceiling 8192, batch 1. The in-code `TrainConfig::default()` stays the smaller D=256 / L=6 admission profile.
 - **1-bit ROSA is an activation alphabet, not weight quantization.** QKV bits are `{0,1}` from `x > 0`. The float output is `out = (2·idx − 1)·e`: unmatched and matched-0 go to **−e**, matched-1 to **+e**. This is not 4-bit ROSA (unmatched → 0); 4-bit is not in 0.10.
@@ -83,7 +83,3 @@ JSONL, one conversation per line. `assistant.thinking` is required. Roles: `syst
   "metadata": { "split": "train" }
 }
 ```
-
-## Status
-
-0.10 is a clean cut from dense ternary Hyena. Training, v2 checkpoints, resume, inspect, incremental generate, chat, and WKV7 hybrid eval are connected. Packed Tmix and 4-bit ROSA are out of scope. Linear QKV bit-grad (`exact_bitflip`) exists as CPU tests, not the default train path.
