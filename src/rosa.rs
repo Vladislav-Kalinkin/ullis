@@ -13,11 +13,10 @@ pub const BITFLIP_TAU: f32 = 1e-3;
 /// Online suffix automaton over a binary alphabet, matching `rosa_qkv_ref`.
 #[derive(Clone, Debug)]
 pub struct RosaSam {
-    trans0: Vec<i32>,
-    trans1: Vec<i32>,
-    fail: Vec<i32>,
-    maxlen: Vec<i32>,
-    last: Vec<i32>,
+    // A SAM step follows several fields of the same node in quick succession.
+    // Keep them together: the former structure-of-arrays layout turned each
+    // suffix-link chase into up to five unrelated cache-line reads on CPU.
+    nodes: Vec<SamNode>,
     v_hist: Vec<u8>,
     u: i32,
     g: i32,
@@ -26,16 +25,29 @@ pub struct RosaSam {
     i: i32,
 }
 
+#[derive(Clone, Copy, Debug)]
+struct SamNode {
+    trans: [i32; 2],
+    fail: i32,
+    maxlen: i32,
+    last: i32,
+}
+
+impl SamNode {
+    const EMPTY: Self = Self {
+        trans: [-1, -1],
+        fail: -1,
+        maxlen: 0,
+        last: -1,
+    };
+}
+
 impl RosaSam {
     /// Allocates `2 * max_time + 1` nodes, the same bound as Python `s=2*n+1`.
     pub fn with_max_time(max_time: usize) -> Self {
         let nodes = sam_node_count(max_time);
         Self {
-            trans0: vec![-1; nodes],
-            trans1: vec![-1; nodes],
-            fail: vec![-1; nodes],
-            maxlen: vec![0; nodes],
-            last: vec![-1; nodes],
+            nodes: vec![SamNode::EMPTY; nodes],
             v_hist: Vec::with_capacity(max_time),
             u: 1,
             g: 0,
@@ -50,11 +62,7 @@ impl RosaSam {
             return -1;
         }
         let index = p as usize;
-        if bit == 0 {
-            self.trans0[index]
-        } else {
-            self.trans1[index]
-        }
+        self.nodes[index].trans[usize::from(bit)]
     }
 
     pub fn set_child(&mut self, p: i32, bit: u8, to: i32) {
@@ -62,22 +70,14 @@ impl RosaSam {
             return;
         }
         let index = p as usize;
-        if bit == 0 {
-            self.trans0[index] = to;
-        } else {
-            self.trans1[index] = to;
-        }
+        self.nodes[index].trans[usize::from(bit)] = to;
     }
 
     fn grow_to(&mut self, len: usize) {
-        if len <= self.trans0.len() {
+        if len <= self.nodes.len() {
             return;
         }
-        self.trans0.resize(len, -1);
-        self.trans1.resize(len, -1);
-        self.fail.resize(len, -1);
-        self.maxlen.resize(len, 0);
-        self.last.resize(len, -1);
+        self.nodes.resize(len, SamNode::EMPTY);
     }
 
     /// One step of `rosa_qkv_ref`. Returns collapsed idx ∈ {0, 1}.
@@ -88,11 +88,11 @@ impl RosaSam {
         let mut p = self.w;
         let mut x = self.h;
         while p != -1 && self.child(p, q_bit) < 0 {
-            let mp = self.maxlen[p as usize];
+            let mp = self.nodes[p as usize].maxlen;
             if x > mp {
                 x = mp;
             }
-            p = self.fail[p as usize];
+            p = self.nodes[p as usize].fail;
         }
         if p == -1 {
             p = 0;
@@ -102,16 +102,18 @@ impl RosaSam {
             x += 1;
         }
         let mut v = p;
-        while self.fail[v as usize] != -1 && self.maxlen[self.fail[v as usize] as usize] >= x {
-            v = self.fail[v as usize];
+        while self.nodes[v as usize].fail != -1
+            && self.nodes[self.nodes[v as usize].fail as usize].maxlen >= x
+        {
+            v = self.nodes[v as usize].fail;
         }
-        while v != -1 && (self.maxlen[v as usize] <= 0 || self.last[v as usize] < 0) {
-            v = self.fail[v as usize];
+        while v != -1 && (self.nodes[v as usize].maxlen <= 0 || self.nodes[v as usize].last < 0) {
+            v = self.nodes[v as usize].fail;
         }
         let y = if v == -1 {
             -1
         } else {
-            let pos = (self.last[v as usize] + 1) as usize;
+            let pos = (self.nodes[v as usize].last + 1) as usize;
             i32::from(self.v_hist[pos])
         };
         let idx = y.max(0) as u8;
@@ -121,40 +123,37 @@ impl RosaSam {
         let j = self.u;
         self.u += 1;
         self.grow_to(self.u as usize + 2);
-        self.maxlen[j as usize] = self.maxlen[self.g as usize] + 1;
+        self.nodes[j as usize].maxlen = self.nodes[self.g as usize].maxlen + 1;
         p = self.g;
         while p != -1 && self.child(p, k_bit) < 0 {
             self.set_child(p, k_bit, j);
-            p = self.fail[p as usize];
+            p = self.nodes[p as usize].fail;
         }
         if p == -1 {
-            self.fail[j as usize] = 0;
+            self.nodes[j as usize].fail = 0;
         } else {
             let d = self.child(p, k_bit);
-            if self.maxlen[p as usize] + 1 == self.maxlen[d as usize] {
-                self.fail[j as usize] = d;
+            if self.nodes[p as usize].maxlen + 1 == self.nodes[d as usize].maxlen {
+                self.nodes[j as usize].fail = d;
             } else {
                 let b = self.u;
                 self.u += 1;
                 self.grow_to(self.u as usize);
-                self.trans0[b as usize] = self.trans0[d as usize];
-                self.trans1[b as usize] = self.trans1[d as usize];
-                self.maxlen[b as usize] = self.maxlen[p as usize] + 1;
-                self.fail[b as usize] = self.fail[d as usize];
-                self.last[b as usize] = self.last[d as usize];
-                self.fail[d as usize] = b;
-                self.fail[j as usize] = b;
+                self.nodes[b as usize] = self.nodes[d as usize];
+                self.nodes[b as usize].maxlen = self.nodes[p as usize].maxlen + 1;
+                self.nodes[d as usize].fail = b;
+                self.nodes[j as usize].fail = b;
                 while p != -1 && self.child(p, k_bit) == d {
                     self.set_child(p, k_bit, b);
-                    p = self.fail[p as usize];
+                    p = self.nodes[p as usize].fail;
                 }
             }
         }
         v = j;
         self.g = j;
-        while v != -1 && self.last[v as usize] < i {
-            self.last[v as usize] = i;
-            v = self.fail[v as usize];
+        while v != -1 && self.nodes[v as usize].last < i {
+            self.nodes[v as usize].last = i;
+            v = self.nodes[v as usize].fail;
         }
         self.i += 1;
         idx
