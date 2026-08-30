@@ -98,6 +98,7 @@ pub const BINARY_LINEAR_KERNEL_NAME: &str = "ullis_binary_linear";
 pub const BINARY_LINEAR_INPUT_BWD_KERNEL_NAME: &str = "ullis_binary_linear_input_bwd";
 pub const BINARY_LINEAR_SCALE_BWD_KERNEL_NAME: &str = "ullis_binary_linear_scale_bwd";
 pub const BINARY_LINEAR_WEIGHT_BWD_KERNEL_NAME: &str = "ullis_binary_linear_weight_bwd";
+pub const BINARY_LINEAR_WEIGHT_SGD_KERNEL_NAME: &str = "ullis_binary_linear_weight_sgd";
 pub const BINARY_LINEAR_SCALE_BWD_FROM_OUTPUT_KERNEL_NAME: &str =
     "ullis_binary_linear_scale_bwd_from_output";
 pub const BINARY_LINEAR_LATENT_SGD_KERNEL_NAME: &str = "ullis_binary_linear_latent_sgd";
@@ -105,6 +106,7 @@ pub const LINEAR_TILE: usize = 32;
 pub const SCALE_BWD_THREADS: usize = 256;
 pub const FP16_LINEAR_KERNEL_NAME: &str = "ullis_fp16_linear";
 pub const FP16_LINEAR_BWD_KERNEL_NAME: &str = "ullis_fp16_linear_bwd";
+pub const FP16_LINEAR_WEIGHT_SGD_KERNEL_NAME: &str = "ullis_fp16_linear_weight_sgd";
 pub const SIGN_PACK_BITS_KERNEL_NAME: &str = "ullis_sign_pack_bits";
 pub const PACK_LATENT_BITS_KERNEL_NAME: &str = "ullis_pack_latent_bits";
 pub const ROSA_SAM_RESET_KERNEL_NAME: &str = "ullis_rosa_sam_reset";
@@ -254,11 +256,16 @@ pub struct RosaQkvForward {
 }
 
 /// Fused ROSA-QKV block: time-mix, QKV, SAM, and output projection.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Debug)]
 pub struct RosaQkvBlockForward {
     pub idx: Vec<u8>,
     pub y: Vec<f32>,
     pub out: Vec<f32>,
+    /// Train-only tapes held in shared Metal buffers to avoid uploading the
+    /// same activations again during the matching backward pass.
+    pub gpu_idx: Option<MetalBuffer>,
+    pub gpu_y: Option<MetalBuffer>,
+    pub gpu_out: Option<MetalBuffer>,
 }
 
 /// Fused CMix block activations kept for STE backward.
@@ -419,10 +426,12 @@ struct Pipelines {
     binary_linear_input_bwd: Pipeline,
     binary_linear_scale_bwd: Pipeline,
     binary_linear_weight_bwd: Pipeline,
+    binary_linear_weight_sgd: Pipeline,
     binary_linear_scale_bwd_from_output: Pipeline,
     binary_linear_latent_sgd: Pipeline,
     fp16_linear: Pipeline,
     fp16_linear_bwd: Pipeline,
+    fp16_linear_weight_sgd: Pipeline,
     sign_pack_bits: Pipeline,
     pack_latent_bits: Pipeline,
     rosa_sam_reset: Pipeline,
@@ -506,6 +515,11 @@ impl MetalRuntime {
                 &library,
                 BINARY_LINEAR_WEIGHT_BWD_KERNEL_NAME,
             )?,
+            binary_linear_weight_sgd: pipeline_from_library(
+                &device,
+                &library,
+                BINARY_LINEAR_WEIGHT_SGD_KERNEL_NAME,
+            )?,
             binary_linear_scale_bwd_from_output: pipeline_from_library(
                 &device,
                 &library,
@@ -518,6 +532,11 @@ impl MetalRuntime {
             )?,
             fp16_linear: pipeline_from_library(&device, &library, FP16_LINEAR_KERNEL_NAME)?,
             fp16_linear_bwd: pipeline_from_library(&device, &library, FP16_LINEAR_BWD_KERNEL_NAME)?,
+            fp16_linear_weight_sgd: pipeline_from_library(
+                &device,
+                &library,
+                FP16_LINEAR_WEIGHT_SGD_KERNEL_NAME,
+            )?,
             sign_pack_bits: pipeline_from_library(&device, &library, SIGN_PACK_BITS_KERNEL_NAME)?,
             pack_latent_bits: pipeline_from_library(
                 &device,
@@ -1475,12 +1494,9 @@ impl MetalRuntime {
         q_packed.read_u32(&mut q_plane)?;
         k_packed.read_u32(&mut k_plane)?;
         v_packed.read_u32(&mut v_plane)?;
-        drop((
-            x_b, mix_q_b, mix_k_b, mix_v_b, q_in, k_in, v_in, q_bits_b, k_bits_b, v_bits_b,
-            q_scale_b, k_scale_b, v_scale_b, q_bias_b, k_bias_b, v_bias_b, q_act, k_act, v_act,
-            q_packed, k_packed, v_packed,
-        ));
-        let idx = crate::rosa::rosa_qkv_batch_packed(
+        // Keep CPU SAM's native [B, C, T] layout through the e-gradient.
+        // Projected activations are expanded directly to [B, T, C] below.
+        let idx = crate::rosa::rosa_qkv_batch_packed_channel_major(
             &q_plane, &k_plane, &v_plane, batch, time, channels,
         )?;
         let e_f32: Vec<f32> = e
@@ -1488,7 +1504,10 @@ impl MetalRuntime {
             .copied()
             .map(|bits| Fp16::from_bits(bits).to_f32())
             .collect();
-        let y = crate::rosa::rosa_qkv_out_batched(&idx, &e_f32, batch, time, channels)?;
+        let y =
+            crate::rosa::rosa_qkv_out_batched_channel_major(&idx, &e_f32, batch, time, channels)?;
+        let idx_buffer = self.alloc_bytes(idx.len())?;
+        idx_buffer.write_bytes(&idx)?;
         let y_buffer = self.buffer_f32(&y)?;
         let out_buffer = self.alloc_f32(bit_count)?;
         self.submit(|encoder| {
@@ -1508,7 +1527,16 @@ impl MetalRuntime {
         })?;
         let mut out = vec![0.0_f32; bit_count];
         out_buffer.read_f32(&mut out)?;
-        Ok(RosaQkvBlockForward { idx, y, out })
+        Ok(RosaQkvBlockForward {
+            // The backward pass consumes the resident tapes. Keeping host-side
+            // copies would only duplicate 10 MiB/layer at the 2k×1024 shape.
+            idx: Vec::new(),
+            y: Vec::new(),
+            out,
+            gpu_idx: Some(idx_buffer.into_owned()),
+            gpu_y: Some(y_buffer.into_owned()),
+            gpu_out: Some(out_buffer.into_owned()),
+        })
     }
 
     pub fn cmix_relu2(&self, input: &[f32]) -> Result<Vec<f32>> {
@@ -2205,19 +2233,17 @@ impl MetalRuntime {
         let key_latent_b = self.buffer_u16(key_latent)?;
         let key_residual_b = self.buffer_f32(key_residual)?;
         let g_relu_b = self.alloc_f32(key_len)?;
-        let g_value_b = self.alloc_f32(value_weights)?;
         let g_key_b = self.alloc_f32(key_len)?;
         let g_shifted_b = self.alloc_f32(x_len)?;
         let g_scale_b = self.alloc_f32(dim_ffn)?;
         let g_bias_b = self.alloc_f32(dim_ffn)?;
-        let g_key_w_b = self.alloc_f32(key_weights)?;
         let empty_bias_b = self.buffer_u16(&[])?;
         let next_key_bits = self.alloc_bytes(key_words.saturating_mul(size_of::<u32>()).max(4))?;
         self.submit(|encoder| {
             Self::encode_tiled(
                 encoder,
                 &self.pipelines.fp16_linear_bwd,
-                &[&relu_b, &gy_b, &value_w_b, &g_relu_b, &g_value_b],
+                &[&relu_b, &gy_b, &value_w_b, &g_relu_b, &g_key_b],
                 |encoder| {
                     Self::set_u32s(
                         encoder,
@@ -2235,19 +2261,19 @@ impl MetalRuntime {
             )?;
             Self::encode_tiled(
                 encoder,
-                &self.pipelines.fp16_linear_bwd,
-                &[&relu_b, &gy_b, &value_w_b, &g_relu_b, &g_value_b],
+                &self.pipelines.fp16_linear_weight_sgd,
+                &[&relu_b, &gy_b, &value_w_b, &value_residual_b],
                 |encoder| {
                     Self::set_u32s(
                         encoder,
-                        5,
+                        4,
                         &[
                             as_u32(value_shape.rows, "rows")?,
                             as_u32(value_shape.in_features, "in")?,
                             as_u32(value_shape.out_features, "out")?,
-                            1,
                         ],
-                    )
+                    )?;
+                    set_bytes_f32(encoder, 7, &[learning_rate])
                 },
                 value_shape.in_features,
                 value_shape.out_features,
@@ -2303,40 +2329,29 @@ impl MetalRuntime {
             )?;
             Self::encode_tiled(
                 encoder,
-                &self.pipelines.binary_linear_weight_bwd,
-                &[&shifted_b, &g_key_b, &scale_b, &g_key_w_b],
+                &self.pipelines.binary_linear_weight_sgd,
+                &[
+                    &shifted_b,
+                    &g_key_b,
+                    &scale_b,
+                    &key_latent_b,
+                    &key_residual_b,
+                ],
                 |encoder| {
                     Self::set_u32s(
                         encoder,
-                        4,
+                        5,
                         &[
                             as_u32(key_shape.rows, "rows")?,
                             as_u32(key_shape.in_features, "in")?,
                             as_u32(key_shape.out_features, "out")?,
                         ],
-                    )
+                    )?;
+                    set_bytes_f32(encoder, 8, &[learning_rate])?;
+                    set_bytes_f32(encoder, 9, &[ste_scale])
                 },
                 key_shape.in_features,
                 key_shape.out_features,
-            )?;
-            Self::encode_clipped_sgd_fp16(
-                encoder,
-                &self.pipelines.clipped_sgd_fp16,
-                &value_w_b,
-                &value_residual_b,
-                &g_value_b,
-                learning_rate,
-                value_weights,
-            )?;
-            Self::encode_binaryconnect_sgd_fp16(
-                encoder,
-                &self.pipelines.binaryconnect_sgd_fp16,
-                &key_latent_b,
-                &key_residual_b,
-                &g_key_w_b,
-                learning_rate,
-                ste_scale,
-                key_weights,
             )?;
             Self::encode_1d(
                 encoder,
@@ -2397,6 +2412,9 @@ impl MetalRuntime {
         out: &[f32],
         gy: &[f32],
         idx: &[u8],
+        y_gpu: Option<MetalBuffer>,
+        out_gpu: Option<MetalBuffer>,
+        idx_gpu: Option<MetalBuffer>,
         o_bits: &[u32],
         o_scale: &[u16],
         o_bias: &[u16],
@@ -2408,10 +2426,20 @@ impl MetalRuntime {
         ste_scale: f32,
     ) -> Result<RosaOStopGradSgd> {
         let shape = LinearDispatchShape::new(rows, channels, channels)?;
-        self.check_binary_shape_u16(y, o_bits, o_scale, Some(o_bias), shape)?;
-        if out.len() != y.len()
-            || gy.len() != y.len()
-            || idx.len() != y.len()
+        let elements = rows.saturating_mul(channels);
+        if y_gpu.is_none() {
+            self.check_binary_shape_u16(y, o_bits, o_scale, Some(o_bias), shape)?;
+        } else if o_bits.len() != shape.packed_words()?
+            || o_scale.len() != channels
+            || o_bias.len() != channels
+        {
+            bail!("ROSA O packed shape mismatch");
+        }
+        let host_tape_ok = (y_gpu.is_some() || y.len() == elements)
+            && (out_gpu.is_some() || out.len() == elements)
+            && (idx_gpu.is_some() || idx.len() == elements);
+        if !host_tape_ok
+            || gy.len() != elements
             || latent.len() != channels.saturating_mul(channels)
             || residual.len() != latent.len()
         {
@@ -2419,17 +2447,26 @@ impl MetalRuntime {
         }
         let weights = channels.saturating_mul(channels);
         let words = weights.div_ceil(32);
-        let y_b = self.buffer_f32(y)?;
-        let out_b = self.buffer_f32(out)?;
+        let y_b = self.activation_f32(y, y_gpu)?;
+        let out_b = self.activation_f32(out, out_gpu)?;
         let gy_b = self.buffer_f32(gy)?;
-        let idx_b = self.alloc_bytes(idx.len().max(1))?;
-        idx_b.write_bytes(idx)?;
+        let idx_b = match idx_gpu {
+            Some(buffer) => self.adopt_buffer(buffer),
+            None => {
+                let buffer = self.alloc_bytes(idx.len())?;
+                buffer.write_bytes(idx)?;
+                buffer
+            }
+        };
         let bits_b = self.buffer_u32(o_bits)?;
         let scale_b = self.buffer_u16(o_scale)?;
         let bias_b = self.buffer_u16(o_bias)?;
         let latent_b = self.buffer_u16(latent)?;
         let residual_b = self.buffer_f32(residual)?;
-        let g_y_b = self.alloc_f32(y.len())?;
+        // `y` may have been released on the host after its tape was retained
+        // in a Metal buffer. The gradient shape is always the linear output,
+        // never the (optional) host mirror's current length.
+        let g_y_b = self.alloc_f32(elements)?;
         let g_scale_b = self.alloc_f32(channels)?;
         let g_bias_b = self.alloc_f32(channels)?;
         let gw_b = self.alloc_f32(weights)?;

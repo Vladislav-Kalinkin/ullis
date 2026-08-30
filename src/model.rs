@@ -1404,6 +1404,9 @@ impl RwkvRosaQkv1Bit {
                 y: fwd.y,
                 idx: fwd.idx,
                 out: fwd.out,
+                gpu_y: fwd.gpu_y,
+                gpu_idx: fwd.gpu_idx,
+                gpu_out: fwd.gpu_out,
             });
         }
         let xx = time_shift_on(x, batch, time, d, metal)?;
@@ -1423,12 +1426,22 @@ impl RwkvRosaQkv1Bit {
         let v = self.v.forward_on(&v_in, rows, metal)?;
         let (idx, y) = rosa_qkv_y(&q, &k, &v, &self.e, batch, time, d, metal)?;
         let out = self.o.forward_on(&y, rows, metal)?;
-        Ok(RosaTape { y, idx, out })
+        Ok(RosaTape {
+            y,
+            idx,
+            out,
+            #[cfg(target_os = "macos")]
+            gpu_y: None,
+            #[cfg(target_os = "macos")]
+            gpu_idx: None,
+            #[cfg(target_os = "macos")]
+            gpu_out: None,
+        })
     }
 
     fn backward_stop_grad(
         &mut self,
-        tape: &RosaTape,
+        tape: &mut RosaTape,
         gy: &[f32],
         g_w: &mut [f32],
         learning_rate: f32,
@@ -1450,6 +1463,9 @@ impl RwkvRosaQkv1Bit {
                 &tape.out,
                 gy,
                 &tape.idx,
+                tape.gpu_y.take(),
+                tape.gpu_out.take(),
+                tape.gpu_idx.take(),
                 self.o.bits(),
                 self.o.scale_bits(),
                 o_bias,
@@ -1510,6 +1526,12 @@ struct RosaTape {
     y: Vec<f32>,
     idx: Vec<u8>,
     out: Vec<f32>,
+    #[cfg(target_os = "macos")]
+    gpu_y: Option<crate::metal::ffi::MetalBuffer>,
+    #[cfg(target_os = "macos")]
+    gpu_idx: Option<crate::metal::ffi::MetalBuffer>,
+    #[cfg(target_os = "macos")]
+    gpu_out: Option<crate::metal::ffi::MetalBuffer>,
 }
 
 struct MetalTrainRuntime<'a> {
@@ -1561,8 +1583,11 @@ fn rosa_qkv_y(
     let mut idx = vec![0_u8; batch.saturating_mul(time).saturating_mul(d)];
     let mut y = vec![0.0; idx.len()];
     for b in 0..batch {
+        let mut sam = RosaSam::with_max_time(time);
         for c in 0..d {
-            let mut sam = RosaSam::with_max_time(time);
+            if c != 0 {
+                sam.reset();
+            }
             for t in 0..time {
                 let index = (b * time + t) * d + c;
                 let bit = sam.push(
@@ -2861,8 +2886,14 @@ impl UllisHeron {
             let rosa_in = block.ln3.forward_on(&x, rows, metal_ref)?;
             profile.add("fwd_ln", started);
             let started = Instant::now();
-            let rosa = block.rosa.forward_tape(&rosa_in, batch, time, metal_ref)?;
+            let mut rosa = block.rosa.forward_tape(&rosa_in, batch, time, metal_ref)?;
             add_inplace(&mut x, &rosa.out);
+            // On Metal the projection tape remains resident for backward. Its
+            // host copy was needed only for this residual add.
+            #[cfg(target_os = "macos")]
+            if rosa.gpu_out.is_some() {
+                rosa.out.clear();
+            }
             profile.add("fwd_rosa", started);
             let after_rosa = x.clone();
             let started = Instant::now();
@@ -2934,7 +2965,7 @@ impl UllisHeron {
 
             let started = Instant::now();
             flips_rosa_o += block.rosa.backward_stop_grad(
-                &tape.rosa,
+                &mut tape.rosa,
                 &g_x,
                 &mut self.g_w,
                 learning_rate,

@@ -57,6 +57,22 @@ impl RosaSam {
         }
     }
 
+    /// Clears the automaton while retaining its preallocated workspace.
+    ///
+    /// A training layer owns one SAM per `(batch, channel)` stream. Reusing a
+    /// stream's storage for the next channel avoids thousands of 80 KiB heap
+    /// allocations at a 2k context, without changing the bounded workspace or
+    /// any transition semantics.
+    pub fn reset(&mut self) {
+        self.nodes.fill(SamNode::EMPTY);
+        self.v_hist.clear();
+        self.u = 1;
+        self.g = 0;
+        self.w = 0;
+        self.h = 0;
+        self.i = 0;
+    }
+
     pub fn child(&self, p: i32, bit: u8) -> i32 {
         if p < 0 {
             return -1;
@@ -428,14 +444,15 @@ pub fn rosa_qkv_batch(
     if batch == 0 || time == 0 || channels == 0 {
         bail!("rosa_qkv_batch dimensions must be non-zero");
     }
-    rosa_qkv_jobs(
+    let channel_major = rosa_qkv_jobs(
         batch,
         time,
         channels,
         |index| q[index],
         |index| k[index],
         |index| v[index],
-    )
+    )?;
+    rosa_qkv_channel_major_to_row_major(&channel_major, batch, time, channels)
 }
 
 /// Same as [`rosa_qkv_batch`], reading LSB-packed bitplanes from `ullis_sign_pack_bits`.
@@ -458,6 +475,33 @@ pub fn rosa_qkv_batch_packed(
     if batch == 0 || time == 0 || channels == 0 {
         bail!("rosa_qkv_batch_packed dimensions must be non-zero");
     }
+    let channel_major =
+        rosa_qkv_batch_packed_channel_major(q_bits, k_bits, v_bits, batch, time, channels)?;
+    rosa_qkv_channel_major_to_row_major(&channel_major, batch, time, channels)
+}
+
+/// Packed QKV output in the stream-major `[B, C, T]` order used by the CPU
+/// SAM workers. Metal training keeps this layout through the e-gradient so it
+/// does not need an otherwise redundant transpose to `[B, T, C]`.
+pub(crate) fn rosa_qkv_batch_packed_channel_major(
+    q_bits: &[u32],
+    k_bits: &[u32],
+    v_bits: &[u32],
+    batch: usize,
+    time: usize,
+    channels: usize,
+) -> Result<Vec<u8>> {
+    let elements = batch
+        .checked_mul(time)
+        .and_then(|rows| rows.checked_mul(channels))
+        .ok_or_else(|| anyhow::anyhow!("rosa_qkv_batch shape overflow"))?;
+    let words = elements.div_ceil(32);
+    if q_bits.len() != words || k_bits.len() != words || v_bits.len() != words {
+        bail!("rosa_qkv_batch_packed word count mismatch");
+    }
+    if batch == 0 || time == 0 || channels == 0 {
+        bail!("rosa_qkv_batch dimensions must be non-zero");
+    }
     rosa_qkv_jobs(
         batch,
         time,
@@ -466,6 +510,31 @@ pub fn rosa_qkv_batch_packed(
         |index| packed_bit_at(k_bits, index),
         |index| packed_bit_at(v_bits, index),
     )
+}
+
+fn rosa_qkv_channel_major_to_row_major(
+    channel_major: &[u8],
+    batch: usize,
+    time: usize,
+    channels: usize,
+) -> Result<Vec<u8>> {
+    let elements = batch
+        .checked_mul(time)
+        .and_then(|rows| rows.checked_mul(channels))
+        .ok_or_else(|| anyhow::anyhow!("rosa_qkv_batch shape overflow"))?;
+    if channel_major.len() != elements {
+        bail!("rosa_qkv channel-major shape mismatch");
+    }
+    let mut row_major = vec![0_u8; elements];
+    for b in 0..batch {
+        for c in 0..channels {
+            let stream = (b * channels + c) * time;
+            for t in 0..time {
+                row_major[(b * time + t) * channels + c] = channel_major[stream + t];
+            }
+        }
+    }
+    Ok(row_major)
 }
 
 fn rosa_qkv_jobs(
@@ -492,11 +561,14 @@ fn rosa_qkv_jobs(
             let k_at = &k_at;
             let v_at = &v_at;
             scope.spawn(move || {
+                let mut sam = RosaSam::with_max_time(time);
                 for local in 0..job_count {
                     let job = job_start + local;
                     let b = job / channels;
                     let c = job % channels;
-                    let mut sam = RosaSam::with_max_time(time);
+                    if local != 0 {
+                        sam.reset();
+                    }
                     let idx_ch = &mut slice[local * time..(local + 1) * time];
                     for t in 0..time {
                         let index = (b * time + t) * channels + c;
@@ -506,16 +578,7 @@ fn rosa_qkv_jobs(
             });
         }
     });
-    let mut idx = vec![0_u8; batch.saturating_mul(time).saturating_mul(channels)];
-    for b in 0..batch {
-        for c in 0..channels {
-            let job = b * channels + c;
-            for t in 0..time {
-                idx[(b * time + t) * channels + c] = idx_bct[job * time + t];
-            }
-        }
-    }
-    Ok(idx)
+    Ok(idx_bct)
 }
 
 /// `out[b,t,c] = (2 * idx[b,t,c] - 1) * e[c]`.
@@ -539,6 +602,36 @@ pub fn rosa_qkv_out_batched(
             for c in 0..channels {
                 let index = (b * time + t) * channels + c;
                 out[index] = (2.0 * f32::from(idx[index]) - 1.0) * e[c];
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// Expands a stream-major `[B, C, T]` ROSA index tape into row-major
+/// activations. This is equivalent to transposing `idx` and calling
+/// [`rosa_qkv_out_batched`], without materialising the transposed tape.
+pub(crate) fn rosa_qkv_out_batched_channel_major(
+    idx: &[u8],
+    e: &[f32],
+    batch: usize,
+    time: usize,
+    channels: usize,
+) -> Result<Vec<f32>> {
+    let elements = batch
+        .checked_mul(time)
+        .and_then(|rows| rows.checked_mul(channels))
+        .ok_or_else(|| anyhow::anyhow!("rosa_qkv_out_batched shape overflow"))?;
+    if idx.len() != elements || e.len() != channels {
+        bail!("rosa_qkv_out_batched shape mismatch");
+    }
+    let mut out = vec![0.0; elements];
+    for b in 0..batch {
+        for c in 0..channels {
+            let stream = (b * channels + c) * time;
+            for t in 0..time {
+                let index = (b * time + t) * channels + c;
+                out[index] = (2.0 * f32::from(idx[stream + t]) - 1.0) * e[c];
             }
         }
     }

@@ -587,6 +587,60 @@ kernel void ullis_binary_linear_weight_bwd(
     }
 }
 
+// Tiled gW followed immediately by the exact BinaryConnect + FP16
+// error-diffusion update. The activation-gradient kernel runs before this, so
+// it still sees the pre-update bit weights.
+kernel void ullis_binary_linear_weight_sgd(
+    device const float *input [[buffer(0)]],
+    device const float *output_gradient [[buffer(1)]],
+    device const half *scale [[buffer(2)]],
+    device half *latent [[buffer(3)]],
+    device float *residual [[buffer(4)]],
+    constant uint &rows [[buffer(5)]],
+    constant uint &in_features [[buffer(6)]],
+    constant uint &out_features [[buffer(7)]],
+    constant float &learning_rate [[buffer(8)]],
+    constant float &gradient_scale [[buffer(9)]],
+    uint2 tid [[thread_position_in_threadgroup]],
+    uint2 tgid [[threadgroup_position_in_grid]]) {
+    const uint i = tgid.x * ULLIS_TILE + tid.x;
+    const uint o = tgid.y * ULLIS_TILE + tid.y;
+    const uint tg_i = tgid.x * ULLIS_TILE;
+    const uint tg_o = tgid.y * ULLIS_TILE;
+    threadgroup float a_tile[32][33];
+    threadgroup float b_tile[32][33];
+    float gw = 0.0f;
+    for (uint k0 = 0u; k0 < rows; k0 += ULLIS_TILE) {
+        const uint k = k0 + tid.x;
+        const uint load_o = tg_o + tid.y;
+        const uint load_i = tg_i + tid.y;
+        a_tile[tid.y][tid.x] = (load_o < out_features && k < rows)
+            ? output_gradient[k * out_features + load_o]
+            : 0.0f;
+        b_tile[tid.y][tid.x] = (load_i < in_features && k < rows)
+            ? input[k * in_features + load_i]
+            : 0.0f;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+#pragma unroll
+        for (uint kk = 0u; kk < ULLIS_TILE; ++kk) {
+            gw += a_tile[tid.y][kk] * b_tile[tid.x][kk];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    if (o < out_features && i < in_features) {
+        const uint index = o * in_features + i;
+        const float g = float(scale[o]) * gw * gradient_scale;
+        if (g != 0.0f && isfinite(g)) {
+            const float current = float(latent[index]);
+            const float update = learning_rate * clamp(g, -1.0f, 1.0f);
+            const float desired = clamp(current - update + residual[index], -1.0f, 1.0f);
+            const half rounded = half(desired);
+            residual[index] = desired - float(rounded);
+            latent[index] = rounded;
+        }
+    }
+}
+
 kernel void ullis_binary_linear_latent_sgd(
     device half *latent [[buffer(0)]],
     device uint *bits [[buffer(1)]],
@@ -737,6 +791,52 @@ kernel void ullis_fp16_linear_bwd(
         if (o < out_features && i < in_features) {
             weight_gradient[o * in_features + i] = gw;
         }
+    }
+}
+
+// Tiled gW and clipped FP16/error-diffusion update in one pass.
+kernel void ullis_fp16_linear_weight_sgd(
+    device const float *input [[buffer(0)]],
+    device const float *output_gradient [[buffer(1)]],
+    device half *weight [[buffer(2)]],
+    device float *residual [[buffer(3)]],
+    constant uint &rows [[buffer(4)]],
+    constant uint &in_features [[buffer(5)]],
+    constant uint &out_features [[buffer(6)]],
+    constant float &learning_rate [[buffer(7)]],
+    uint2 tid [[thread_position_in_threadgroup]],
+    uint2 tgid [[threadgroup_position_in_grid]]) {
+    const uint i = tgid.x * ULLIS_TILE + tid.x;
+    const uint o = tgid.y * ULLIS_TILE + tid.y;
+    const uint tg_i = tgid.x * ULLIS_TILE;
+    const uint tg_o = tgid.y * ULLIS_TILE;
+    threadgroup float a_tile[32][33];
+    threadgroup float b_tile[32][33];
+    float gw = 0.0f;
+    for (uint k0 = 0u; k0 < rows; k0 += ULLIS_TILE) {
+        const uint k = k0 + tid.x;
+        const uint load_o = tg_o + tid.y;
+        const uint load_i = tg_i + tid.y;
+        a_tile[tid.y][tid.x] = (load_o < out_features && k < rows)
+            ? output_gradient[k * out_features + load_o]
+            : 0.0f;
+        b_tile[tid.y][tid.x] = (load_i < in_features && k < rows)
+            ? input[k * in_features + load_i]
+            : 0.0f;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+#pragma unroll
+        for (uint kk = 0u; kk < ULLIS_TILE; ++kk) {
+            gw += a_tile[tid.y][kk] * b_tile[tid.x][kk];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    if (o < out_features && i < in_features) {
+        const uint index = o * in_features + i;
+        const float desired = float(weight[index])
+            - learning_rate * clamp(gw, -1.0f, 1.0f) + residual[index];
+        const half rounded = half(desired);
+        residual[index] = desired - float(rounded);
+        weight[index] = rounded;
     }
 }
 
@@ -1044,7 +1144,8 @@ kernel void ullis_rosa_qkv_1bit_fwd(
     }
 }
 
-// g_e[c] = Σ_{b,t} gy[b,t,c] * (2 * idx[b,t,c] - 1). No match mask.
+// g_e[c] = Σ_{b,t} gy[b,t,c] * (2 * idx[b,c,t] - 1). The CPU SAM emits
+// stream-major [B, C, T] tapes, avoiding a transpose solely for this kernel.
 kernel void ullis_rosa_qkv_1bit_bwd_e(
     device const float *output_gradient [[buffer(0)]],
     device const uchar *idx [[buffer(1)]],
@@ -1059,8 +1160,9 @@ kernel void ullis_rosa_qkv_1bit_bwd_e(
     float acc = 0.0f;
     for (uint b = 0u; b < batch; ++b) {
         for (uint t = 0u; t < time; ++t) {
-            const uint index = (b * time + t) * channels + c;
-            acc += output_gradient[index] * (2.0f * float(idx[index]) - 1.0f);
+            const uint output_index = (b * time + t) * channels + c;
+            const uint idx_index = (b * channels + c) * time + t;
+            acc += output_gradient[output_index] * (2.0f * float(idx[idx_index]) - 1.0f);
         }
     }
     e_gradient[c] = acc;

@@ -68,6 +68,26 @@ fn incremental_push_matches_one_shot() {
 }
 
 #[test]
+fn reset_reuses_workspace_without_leaking_stream_state() {
+    let mut sam = RosaSam::with_max_time(QKV_Q.len());
+    let first: Vec<u8> = QKV_Q
+        .iter()
+        .zip(QKV_K)
+        .zip(QKV_V)
+        .map(|((&q, k), v)| sam.push(q, k, v))
+        .collect();
+    sam.reset();
+    let second: Vec<u8> = QKV_Q
+        .iter()
+        .zip(QKV_K)
+        .zip(QKV_V)
+        .map(|((&q, k), v)| sam.push(q, k, v))
+        .collect();
+    assert_eq!(first, QKV_IDX);
+    assert_eq!(second, QKV_IDX);
+}
+
+#[test]
 fn qkv_same_streams_on_t5_c3_collapse_unmatched_to_zero() {
     for channel in 0..3 {
         let bits = channel_bits(channel);
